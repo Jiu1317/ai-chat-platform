@@ -131,10 +131,52 @@ class ImageRequestDetectionTests(unittest.TestCase):
             saved = workspace / "outputs" / result["path"]
             self.assertEqual(saved.read_bytes(), image_bytes)
             self.assertEqual(result["size"], len(image_bytes))
+            self.assertEqual((result["width"], result["height"]), (32, 24))
             self.assertTrue(result["previewSize"] > 0)
             schedule_variants.assert_called_once()
             timeout = async_client.call_args.kwargs["timeout"]
             self.assertEqual(timeout.read, app.IMAGE_BRIDGE_REQUEST_TIMEOUT_SECONDS)
+
+    def test_invalid_local_image_response_is_not_persisted(self) -> None:
+        invalid_bytes = b"not-an-image"
+
+        class FakeResponse:
+            status_code = 200
+            headers = {
+                "content-type": "image/png",
+                "content-length": str(len(invalid_bytes)),
+            }
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def aiter_bytes(self, _chunk_size):
+                yield invalid_bytes
+
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            def stream(self, *_args, **_kwargs):
+                return FakeResponse()
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            workspace = Path(directory)
+            with (
+                patch.object(app, "IMAGE_BRIDGE_TOKEN", "test-token"),
+                patch.object(app.httpx, "AsyncClient", return_value=FakeClient()),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "图片文件无效"):
+                    asyncio.run(app._generate_image("画一张测试图", workspace))
+
+            output_root = workspace / "outputs"
+            self.assertEqual(list(output_root.glob("*")), [])
 
     def test_image_stream_sends_heartbeat_without_cancelling_generation(self) -> None:
         payload = app.TurnRequest(
@@ -417,6 +459,52 @@ class RuntimeCleanupTests(unittest.TestCase):
 
 
 class ExternalImageTransferTests(unittest.TestCase):
+    def test_invalid_reference_image_is_rejected_before_transfer(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            upload_root = Path(directory)
+            source = upload_root / "broken.png"
+            source.write_bytes(b"not-an-image")
+
+            with self.assertRaises(app.HTTPException) as caught:
+                app._prepare_transfer_image(source, upload_root)
+
+        self.assertEqual(caught.exception.status_code, 400)
+        self.assertIn("无效或已损坏", str(caught.exception.detail))
+
+    def test_mislabeled_reference_image_is_converted_before_transfer(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            upload_root = Path(directory)
+            source = upload_root / "mislabeled.png"
+            app.Image.new("RGB", (24, 18), "white").save(source, format="JPEG")
+
+            prepared = app._prepare_transfer_image(source, upload_root)
+
+            self.assertNotEqual(prepared, source)
+            self.assertEqual(prepared.suffix, ".webp")
+            with app.Image.open(prepared) as image:
+                self.assertEqual(image.format, "WEBP")
+
+    def test_reference_image_preparation_limits_parallel_decodes(self) -> None:
+        active = 0
+        maximum_active = 0
+        paths = [Path(f"reference-{index}.png") for index in range(6)]
+
+        async def fake_to_thread(_function, source, _upload_root):
+            nonlocal active, maximum_active
+            active += 1
+            maximum_active = max(maximum_active, active)
+            try:
+                await asyncio.sleep(0.01)
+                return source
+            finally:
+                active -= 1
+
+        with patch.object(app.asyncio, "to_thread", new=fake_to_thread):
+            prepared = asyncio.run(app._prepare_transfer_images(paths, Path(".")))
+
+        self.assertEqual(prepared, paths)
+        self.assertEqual(maximum_active, 2)
+
     def test_external_image_generation_prompt_keeps_selected_external_provider(self) -> None:
         payload = app.TurnRequest(
             session_id="4" * 32,
@@ -676,6 +764,69 @@ class ExternalImageTransferTests(unittest.TestCase):
         self.assertEqual(result["mediaType"], "image/png")
         retry_sleep.assert_awaited_once()
 
+    def test_external_image_retries_empty_or_truncated_success_response(self) -> None:
+        image_buffer = io.BytesIO()
+        app.Image.new("RGB", (18, 14), "white").save(image_buffer, format="PNG")
+        image_bytes = image_buffer.getvalue()
+        url = "https://provider.example/v1/assets/abcdefghijklmnopqrstuvwx"
+
+        class FakeResponse:
+            status_code = 200
+
+            def __init__(self, body: bytes):
+                self.body = body
+                self.headers = {
+                    "content-type": "image/png",
+                    "content-length": str(len(body)),
+                }
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def aiter_bytes(self, _chunk_size):
+                yield self.body
+
+        class FakeClient:
+            def __init__(self, initial_body: bytes):
+                self.calls = 0
+                self.initial_body = initial_body
+
+            def stream(self, *_args, **_kwargs):
+                self.calls += 1
+                body = self.initial_body if self.calls == 1 else image_bytes
+                return FakeResponse(body)
+
+        for initial_body in (b"", b"truncated-image"):
+            with self.subTest(initial_body=initial_body):
+                client = FakeClient(initial_body)
+                with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+                    workspace = Path(directory)
+                    with (
+                        patch.object(
+                            app,
+                            "_validated_external_asset_url",
+                            new=AsyncMock(return_value=url),
+                        ),
+                        patch.object(app, "_schedule_image_variants"),
+                        patch.object(app.asyncio, "sleep", new=AsyncMock()) as retry_sleep,
+                    ):
+                        result = asyncio.run(
+                            app._persist_external_image(
+                                client,
+                                {"url": url, "name": "generated.png"},
+                                "https://provider.example/v1",
+                                workspace,
+                            )
+                        )
+
+                self.assertEqual(client.calls, 2)
+                self.assertEqual(result["mediaType"], "image/png")
+                self.assertEqual((result["width"], result["height"]), (18, 14))
+                retry_sleep.assert_awaited_once()
+
 
     def test_external_image_retry_budget_fits_total_deadline(self) -> None:
         retry_delays = sum(
@@ -832,6 +983,167 @@ class ExternalImageTransferTests(unittest.TestCase):
         self.assertEqual(events[1]["files"], [image_file])
         self.assertNotIn("/v1/assets/", app.json.dumps(events, ensure_ascii=False))
 
+    def test_openai_done_marker_completes_stream_without_finish_reason(self) -> None:
+        line = app.json.dumps({
+            "choices": [{"delta": {"content": "回答完成"}, "finish_reason": None}]
+        }, ensure_ascii=False)
+
+        class FakeResponse:
+            status_code = 200
+            headers = {"content-type": "text/event-stream"}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def aiter_lines(self):
+                yield f"data: {line}"
+                yield "data: [DONE]"
+
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            def stream(self, *_args, **_kwargs):
+                return FakeResponse()
+
+        payload = app.TurnRequest(
+            session_id="c" * 32,
+            message="问题",
+            model="external",
+            effort="default",
+        )
+        provider = {
+            "baseUrl": "https://provider.example/v1",
+            "protocol": "openai",
+            "apiKey": "test-key",
+            "preset": "custom",
+        }
+
+        async def scenario() -> list[dict]:
+            with (
+                tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory,
+                patch.object(
+                    app,
+                    "_validate_remote_base",
+                    new=AsyncMock(return_value=provider["baseUrl"]),
+                ),
+                patch.object(
+                    app,
+                    "_external_current_content",
+                    new=AsyncMock(return_value="问题"),
+                ),
+                patch.object(app.httpx, "AsyncClient", return_value=FakeClient()),
+            ):
+                return [
+                    app.json.loads(event.decode())
+                    async for event in app._external_response_stream(
+                        payload, Path(directory), provider, "test-model", "user-1"
+                    )
+                ]
+
+        events = asyncio.run(scenario())
+        self.assertEqual([event["type"] for event in events], ["delta", "done"])
+        self.assertEqual(events[0]["text"], "回答完成")
+
+    def test_split_markdown_image_url_is_recovered_after_stream_assembly(self) -> None:
+        url = "https://provider.example/v1/assets/abcdefghijklmnopqrstuvwx"
+        split_at = len(url) // 2
+        first_line = app.json.dumps({
+            "choices": [{
+                "delta": {"content": f"说明\n\n![生成图片]({url[:split_at]}"},
+                "finish_reason": None,
+            }]
+        }, ensure_ascii=False)
+        second_line = app.json.dumps({
+            "choices": [{
+                "delta": {"content": f"{url[split_at:]})"},
+                "finish_reason": "stop",
+            }]
+        }, ensure_ascii=False)
+        image_file = {
+            "name": "generated.png",
+            "size": 80,
+            "path": "generated.png",
+            "mediaType": "image/png",
+            "inline": True,
+        }
+
+        class FakeResponse:
+            status_code = 200
+            headers = {"content-type": "text/event-stream"}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def aiter_lines(self):
+                yield f"data: {first_line}"
+                yield f"data: {second_line}"
+                yield "data: [DONE]"
+
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            def stream(self, *_args, **_kwargs):
+                return FakeResponse()
+
+        payload = app.TurnRequest(
+            session_id="d" * 32,
+            message="生成图片",
+            model="external",
+            effort="default",
+        )
+        provider = {
+            "baseUrl": "https://provider.example/v1",
+            "protocol": "openai",
+            "apiKey": "test-key",
+            "preset": "custom",
+        }
+
+        async def scenario() -> tuple[list[dict], AsyncMock]:
+            persist_images = AsyncMock(return_value=([image_file], 0))
+            with (
+                tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory,
+                patch.object(
+                    app,
+                    "_validate_remote_base",
+                    new=AsyncMock(return_value=provider["baseUrl"]),
+                ),
+                patch.object(
+                    app,
+                    "_external_current_content",
+                    new=AsyncMock(return_value="生成图片"),
+                ),
+                patch.object(app.httpx, "AsyncClient", return_value=FakeClient()),
+                patch.object(app, "_persist_external_images", new=persist_images),
+            ):
+                events = [
+                    app.json.loads(event.decode())
+                    async for event in app._external_response_stream(
+                        payload, Path(directory), provider, "test-model", "user-1"
+                    )
+                ]
+            return events, persist_images
+
+        events, persist_images = asyncio.run(scenario())
+        candidates = persist_images.await_args.args[0]
+        self.assertEqual(candidates, [{"url": url, "name": "生成图片"}])
+        self.assertEqual(events[-2], {"type": "replace", "text": "说明"})
+        self.assertEqual(events[-1]["mode"], "image")
+        self.assertEqual(events[-1]["files"], [image_file])
+
 
 class UploadCapacityTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -848,11 +1160,55 @@ class UploadCapacityTests(unittest.TestCase):
         self.assertEqual(app.MAX_EXTERNAL_IMAGE_BYTES, 30 * 1024 * 1024)
         self.assertEqual(app.MAX_PROJECT_CONTEXT_SOURCE_BYTES, 30 * 1024 * 1024)
         self.assertEqual(app.MAX_CONTEXT_TEXT_CHARS, 150_000)
+        self.assertIn(".avif", app.IMAGE_EXTENSIONS)
+        with patch.object(app.mimetypes, "guess_type", return_value=(None, None)):
+            self.assertEqual(app._file_media_type(Path("preview.webp")), "image/webp")
+            self.assertEqual(app._file_media_type(Path("preview.avif")), "image/avif")
+            self.assertEqual(
+                app._file_media_type(Path("download.unknown")),
+                "application/octet-stream",
+            )
         self.assertEqual(app.MAX_RECENT_HISTORY_TURNS, 30)
         self.assertEqual(app.MAX_OLDER_CONTEXT_CHARS, 20_000)
         self.assertEqual(app.MAX_CLOUD_MESSAGES, 1_000)
         self.assertEqual(app.MAX_CLOUD_CONTENT_CHARS, 8_000_000)
         self.assertLess(app.MAX_CURRENT_ATTACHMENT_CONTEXT_CHARS, app.MAX_CONTEXT_TEXT_CHARS)
+
+    def test_history_budget_is_not_reserved_for_absent_or_image_only_documents(self) -> None:
+        history = [
+            app.HistoryMessage(role="user", content="之前的问题"),
+            app.HistoryMessage(role="assistant", content="之前的回答"),
+        ]
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            workspace = Path(directory)
+            upload_root = workspace / "uploads"
+            upload_root.mkdir()
+            (upload_root / "reference.png").write_bytes(b"image-placeholder")
+            cases = (
+                [],
+                [app.AttachmentRef(id="reference.png", name="reference.png")],
+            )
+            for attachments in cases:
+                with self.subTest(attachments=len(attachments)):
+                    payload = app.TurnRequest(
+                        session_id="e" * 32,
+                        message="继续回答",
+                        history=history,
+                        model="external",
+                        effort="default",
+                        attachments=attachments,
+                    )
+                    with patch.object(
+                        app, "_fit_context_window", return_value=(history, "")
+                    ) as fit_context:
+                        app._attachment_inputs(
+                            payload,
+                            workspace,
+                            max_text_chars=app.MAX_CONTEXT_TEXT_CHARS,
+                        )
+
+                    expected = app.MAX_CONTEXT_TEXT_CHARS - len(payload.message) - 96
+                    self.assertEqual(fit_context.call_args.args[1], expected)
 
     def test_chunk_upload_is_sequential_idempotent_and_complete_is_atomic(self) -> None:
         user_id = "8" * 32

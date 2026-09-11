@@ -331,3 +331,68 @@ async def test_handler_rejects_nine_images_before_starting_stream():
 
     assert response.status == 400
     server._driver.navigate_new_chat.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        ([], "Request body must be a JSON object"),
+        ({"messages": "not-an-array"}, "messages must be a non-empty array"),
+        (
+            {"model": [], "messages": [{"role": "user", "content": "hello"}]},
+            "model must be a non-empty string",
+        ),
+        (
+            {
+                "model": "auto",
+                "stream": "false",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            "stream must be a boolean",
+        ),
+        (
+            {
+                "model": "auto",
+                "metadata": ["bad"],
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            "metadata must be an object",
+        ),
+        (
+            {
+                "model": "auto",
+                "project_id": 123,
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            "project_id must be a string",
+        ),
+        (
+            {
+                "model": "auto",
+                "project_id": 0,
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            "project_id must be a string",
+        ),
+        (
+            {
+                "model": "auto",
+                "gizmo_id": [],
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            "project_id must be a string",
+        ),
+    ],
+)
+async def test_handler_rejects_malformed_request_fields_before_browser_use(
+    payload, message
+):
+    server = _server()
+
+    response = await server._handle_chat(_request(payload))
+
+    assert response.status == 400
+    assert message.encode() in response.body
+    server._driver.navigate_conversation.assert_not_awaited()
+    server._driver.navigate_new_chat.assert_not_awaited()

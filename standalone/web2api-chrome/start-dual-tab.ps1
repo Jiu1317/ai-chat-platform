@@ -7,6 +7,7 @@ $GatewayFile = Join-Path $WorkRoot 'dual_tab_gateway.py'
 $PauseFile = Join-Path $WorkRoot '.dual-tab-watchdog-paused'
 $ProcessStateFile = Join-Path $WorkRoot 'dual-tab-processes.json'
 $startedProcesses = @()
+$hasStartMutex = $false
 
 # A manual start means the service should stay available again.
 Remove-Item -LiteralPath $PauseFile -Force -ErrorAction SilentlyContinue
@@ -23,7 +24,78 @@ if (-not (Test-Path -LiteralPath $ConfigFile)) {
     throw "Configuration not found. Copy web2api-config.example.json to web2api-config.json and replace the API key."
 }
 
+function ConvertTo-NativeArgument {
+    param([string]$Value)
+
+    if ($Value.Contains('"')) { throw 'Paths containing a double quote are not supported.' }
+    if ($Value -match '\s') { return '"' + $Value + '"' }
+    return $Value
+}
+
+function Test-LocalPort {
+    param([int]$Port)
+
+    $client = $null
+    try {
+        $client = [Net.Sockets.TcpClient]::new()
+        $attempt = $client.BeginConnect('127.0.0.1', $Port, $null, $null)
+        if (-not $attempt.AsyncWaitHandle.WaitOne(1000)) { return $false }
+        $client.EndConnect($attempt)
+        return $true
+    } catch {
+        return $false
+    } finally {
+        if ($client) { $client.Close() }
+    }
+}
+
+function Get-GatewayHealth {
+    Add-Type -AssemblyName System.Net.Http
+    $handler = [Net.Http.HttpClientHandler]::new()
+    $handler.UseProxy = $false
+    $client = [Net.Http.HttpClient]::new($handler)
+    $client.Timeout = [TimeSpan]::FromSeconds(5)
+    try {
+        $response = $client.GetAsync('http://127.0.0.1:9181/health').GetAwaiter().GetResult()
+        $body = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+        return $body | ConvertFrom-Json
+    } finally {
+        $client.Dispose()
+        $handler.Dispose()
+    }
+}
+
+$createdNew = $false
+$startMutex = [Threading.Mutex]::new(
+    $false,
+    'Local\AIChatWeb2APIDualTabStart',
+    [ref]$createdNew
+)
+
 try {
+$hasStartMutex = $startMutex.WaitOne(0)
+if (-not $hasStartMutex) {
+    Write-Output 'Another ChatGPT Web2API start or recovery is already running.'
+    return
+}
+
+# A second Start click while the complete stack is healthy must not interrupt
+# an in-flight request. Stop first when an intentional restart is required.
+$runtimePorts = @(9181, 9182, 9183, 9325)
+if (($runtimePorts | Where-Object { -not (Test-LocalPort -Port $_) }).Count -eq 0) {
+    try {
+        $existingHealth = Get-GatewayHealth
+        if ($existingHealth.mode -eq 'dual-tab' -and
+            [int]$existingHealth.ready_backends -eq 2) {
+            Write-Output 'ChatGPT Web2API is already running with two ready workers.'
+            return
+        }
+    } catch {
+        # Continue into exact module-process cleanup when this is not a readable
+        # gateway health response.
+    }
+}
+
 $existing = Get-CimInstance Win32_Process | Where-Object {
     $_.CommandLine -and (
         $_.CommandLine -like "*$GatewayFile*" -or
@@ -36,7 +108,7 @@ foreach ($process in $existing) {
 Start-Sleep -Seconds 2
 
 $worker1 = Start-Process -FilePath $PythonExe -ArgumentList @(
-    '-m', 'chatgpt_web2api', '--config', $ConfigFile,
+    '-m', 'chatgpt_web2api', '--config', (ConvertTo-NativeArgument $ConfigFile),
     '--port', '9182', '--cdp-port', '9325'
 ) -WindowStyle Hidden -RedirectStandardOutput (Join-Path $WorkRoot 'dual-worker-1.stdout.log') -RedirectStandardError (Join-Path $WorkRoot 'dual-worker-1.stderr.log') -PassThru
 $startedProcesses += $worker1
@@ -52,7 +124,7 @@ if (-not $worker1Ready) {
 }
 
 $worker2 = Start-Process -FilePath $PythonExe -ArgumentList @(
-    '-m', 'chatgpt_web2api', '--config', $ConfigFile,
+    '-m', 'chatgpt_web2api', '--config', (ConvertTo-NativeArgument $ConfigFile),
     '--port', '9183', '--cdp-port', '9325'
 ) -WindowStyle Hidden -RedirectStandardOutput (Join-Path $WorkRoot 'dual-worker-2.stdout.log') -RedirectStandardError (Join-Path $WorkRoot 'dual-worker-2.stderr.log') -PassThru
 $startedProcesses += $worker2
@@ -69,7 +141,7 @@ if (-not ($ready1 -and $ready2)) {
 }
 
 $gateway = Start-Process -FilePath $PythonExe -ArgumentList @(
-    $GatewayFile, '--host', '127.0.0.1', '--port', '9181',
+    (ConvertTo-NativeArgument $GatewayFile), '--host', '127.0.0.1', '--port', '9181',
     '--backends', 'http://127.0.0.1:9182', 'http://127.0.0.1:9183'
 ) -WindowStyle Hidden -RedirectStandardOutput (Join-Path $WorkRoot 'dual-gateway.stdout.log') -RedirectStandardError (Join-Path $WorkRoot 'dual-gateway.stderr.log') -PassThru
 $startedProcesses += $gateway
@@ -99,4 +171,9 @@ Write-Output "Dual-tab gateway ready: gateway=$($gateway.Id), workers=$($worker1
     }
     Remove-Item -LiteralPath $ProcessStateFile -Force -ErrorAction SilentlyContinue
     throw
+} finally {
+    if ($hasStartMutex) {
+        try { $startMutex.ReleaseMutex() } catch {}
+    }
+    $startMutex.Dispose()
 }

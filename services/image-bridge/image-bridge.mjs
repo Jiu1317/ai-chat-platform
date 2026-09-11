@@ -251,6 +251,7 @@ async function safeImage(candidate, startedAt) {
   const extension = path.extname(resolved).toLowerCase();
   const contentType = extension === ".jpg" || extension === ".jpeg" ? "image/jpeg"
     : extension === ".webp" ? "image/webp"
+      : extension === ".avif" ? "image/avif"
       : extension === ".png" ? "image/png"
         : "";
   if (!contentType) return null;
@@ -279,7 +280,7 @@ async function recentCodexImages(startedAt, directory = codexImageRoot, depth = 
       candidates.push(...await recentCodexImages(startedAt, candidate, depth + 1));
       continue;
     }
-    if (!entry.isFile() || !/\.(?:png|jpe?g|webp)$/i.test(entry.name)) continue;
+    if (!entry.isFile() || !/\.(?:avif|png|jpe?g|webp)$/i.test(entry.name)) continue;
     const stat = await fs.stat(candidate);
     if (stat.mtimeMs + 5_000 >= startedAt) candidates.push({ path: candidate, mtimeMs: stat.mtimeMs });
   }
@@ -326,6 +327,15 @@ async function generatedImage(result, sessionKey, startedAt, signal) {
     throwIfAborted(signal);
     const image = await safeImage(candidate, startedAt);
     if (image) return image;
+  }
+  try {
+    for (const candidate of await completedSessionCandidates(sessionKey)) {
+      throwIfAborted(signal);
+      const image = await safeImage(candidate, startedAt);
+      if (image) return image;
+    }
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
   }
   for (const candidate of await recentCodexImages(startedAt)) {
     throwIfAborted(signal);
@@ -390,6 +400,7 @@ const server = http.createServer(async (request, response) => {
   };
   request.once("aborted", cancelRequest);
   response.once("close", cancelOnResponseClose);
+  let sessionKey = "";
   try {
     const payload = JSON.parse(await readBody(request));
     const requestId = String(payload.requestId || "");
@@ -397,10 +408,9 @@ const server = http.createServer(async (request, response) => {
     if (!/^[a-f0-9]{32}$/.test(requestId)) throw new Error("任务标识无效");
     if (!prompt || prompt.length > 6000) throw new Error("图片描述应为 1–6000 个字符");
     const startedAt = Date.now();
-    const sessionKey = `agent:${imageAgent}:web-${requestId}`;
+    sessionKey = `agent:${imageAgent}:web-${requestId}`;
     const result = await runAgent(requestId, prompt, controller.signal);
     const image = await generatedImage(result, sessionKey, startedAt, controller.signal);
-    cleanupSessionLater(sessionKey);
     response.writeHead(200, {
       "content-type": image.contentType,
       "content-length": image.size,
@@ -414,6 +424,7 @@ const server = http.createServer(async (request, response) => {
     } else if (response.headersSent) response.destroy(error);
     else replyJson(response, 502, { error: String(error?.message || "图片生成失败").slice(0, 500) });
   } finally {
+    if (sessionKey) cleanupSessionLater(sessionKey);
     request.removeListener("aborted", cancelRequest);
     response.removeListener("close", cancelOnResponseClose);
     activeControllers.delete(controller);

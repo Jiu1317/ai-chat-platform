@@ -4,6 +4,7 @@ $WorkRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ConfigFile = Join-Path $WorkRoot 'web2api-config.json'
 $GatewayFile = Join-Path $WorkRoot 'dual_tab_gateway.py'
 $PauseFile = Join-Path $WorkRoot '.dual-tab-watchdog-paused'
+$ProcessStateFile = Join-Path $WorkRoot 'dual-tab-processes.json'
 
 # Prevent the watchdog from treating an intentional stop as a crash.
 Set-Content -LiteralPath $PauseFile -Value (Get-Date).ToString('o') -Encoding ASCII
@@ -27,5 +28,7 @@ $browserTargets = Get-CimInstance Win32_Process | Where-Object {
 foreach ($process in $browserTargets) {
     Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
 }
+
+Remove-Item -LiteralPath $ProcessStateFile -Force -ErrorAction SilentlyContinue
 
 Write-Output "Stopped $($targets.Count) API process(es) and $($browserTargets.Count) dedicated browser process(es)."

@@ -30,6 +30,7 @@ services/web2api/        修改后的 ChatGPT 网页 API 适配器
 services/image-bridge/   可选图片生成桥接
 bridge/windows/          Windows 双标签页网关与 Tunnel 启动脚本
 standalone/web2api-chrome/  可脱离网站单独使用的 Web2API + Chrome 模块
+standalone/deepseek-web2api/ 可脱离网站单独使用的 DeepSeek Web2API + Chrome 自用实验模块
 deploy/nginx/            Nginx 示例配置
 deploy/systemd/          Ubuntu 服务配置
 deploy/env/              不含真实密钥的环境变量示例
@@ -68,6 +69,10 @@ docs/                    从零部署和日常管理教程
 ```
 
 Web2API 不会生成 OpenAI 官方 API 密钥。它通过 Chrome DevTools Protocol（CDP）操作已登录的真实 ChatGPT 网页：写入提问、点击发送、等待网页完成回答，再把结果整理成 OpenAI 兼容 JSON 或流式响应。两个工作进程分别占用一个专用标签页，因此最多同时处理两个聊天请求；更多请求会排队。
+
+### 独立 DeepSeek Web2API + Chrome（自用实验）
+
+如果只想用自己的 DeepSeek 网页账号进行个人实验，请进入[DeepSeek Web2API + Chrome 独立模块](standalone/deepseek-web2api/README.md)。它使用完全独立的端口、两个 Chrome 登录目录和工作进程，不会与上面的 ChatGPT 桥接混用；本机 OpenAI 兼容入口为 `http://127.0.0.1:9191/v1`。第一版实验支持文字、流式回答和思考模式，不承诺附件、图片理解或生图。
 
 ## Web2API + Chrome：从这里开始
 

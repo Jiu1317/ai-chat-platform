@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -13,8 +15,8 @@ import pytest
 def _load_gateway_module():
     path = (
         Path(__file__).resolve().parents[3]
-        / "standalone"
-        / "web2api-chrome"
+        / "bridge"
+        / "windows"
         / "dual_tab_gateway.py"
     )
     spec = importlib.util.spec_from_file_location("tested_dual_tab_gateway", path)
@@ -42,11 +44,40 @@ class _Context:
 
 
 class _Session:
-    def __init__(self, contexts):
+    def __init__(self, contexts=(), health_contexts=()):
         self.contexts = list(contexts)
+        self.health_contexts = list(health_contexts)
+        self.requests: list[tuple[tuple, dict]] = []
+        self.health_requests: list[tuple[tuple, dict]] = []
 
-    def request(self, *_args, **_kwargs):
+    def request(self, *args, **kwargs):
+        self.requests.append((args, kwargs))
         return self.contexts.pop(0)
+
+    def get(self, *args, **kwargs):
+        self.health_requests.append((args, kwargs))
+        return self.health_contexts.pop(0)
+
+
+class _HangingContext:
+    async def __aenter__(self):
+        await asyncio.Event().wait()
+
+    async def __aexit__(self, *_args):
+        return False
+
+
+def _health_response(*, status="healthy", chrome=True, cdp=True, http_status=200):
+    return SimpleNamespace(
+        status=http_status,
+        json=AsyncMock(
+            return_value={
+                "status": status,
+                "chrome_running": chrome,
+                "cdp_connected": cdp,
+            }
+        ),
+    )
 
 
 def _request(path: str):
@@ -114,6 +145,23 @@ class _FailingContent:
         raise RuntimeError("upstream disconnected")
 
 
+class _Content:
+    def __init__(self, chunks):
+        self.chunks = iter(chunks)
+
+    def iter_chunked(self, _size):
+        return self
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self.chunks)
+        except StopIteration:
+            raise StopAsyncIteration from None
+
+
 class _Downstream:
     def __init__(self, *, status, reason, headers):
         self.status = status
@@ -145,6 +193,7 @@ async def test_started_sse_stream_finishes_with_error_instead_of_second_response
         content=_FailingContent(),
     )
     gateway.session = _Session([_Context(response=upstream)])
+    gateway.session.health_contexts.append(_Context(response=_health_response()))
     monkeypatch.setattr(gateway_module.web, "StreamResponse", _Downstream)
 
     downstream = await gateway.proxy(_request("/v1/chat/completions"))
@@ -173,6 +222,104 @@ async def test_busy_gateway_queue_has_bounded_readable_timeout():
     assert b"both Web2API workers are busy" in response.body
     assert b"capacity_timeout" in response.body
     assert gateway.available.qsize() == 0
+
+
+@pytest.mark.asyncio
+async def test_health_probe_has_bounded_read_timeout():
+    gateway = gateway_module.DualTabGateway(
+        ["http://one", "http://two"], health_timeout_seconds=0.01
+    )
+    gateway.session = _Session(
+        health_contexts=[
+            _HangingContext(),
+            _Context(response=_health_response()),
+        ]
+    )
+
+    response = await asyncio.wait_for(gateway.health(_request("/health")), timeout=0.2)
+    payload = json.loads(response.body)
+
+    assert response.status == 200
+    assert payload["ready_backends"] == 1
+    assert payload["backends"][0]["error"] == "TimeoutError"
+
+
+@pytest.mark.asyncio
+async def test_gateway_rejects_immediately_when_waiting_queue_is_full():
+    gateway = gateway_module.DualTabGateway(
+        ["http://one", "http://two"], max_queued_requests=0
+    )
+    gateway.session = object()
+    await gateway.available.get()
+    await gateway.available.get()
+
+    response = await gateway.proxy(_request("/v1/chat/completions"))
+
+    assert response.status == 429
+    assert response.headers["Retry-After"] == "1"
+    assert b"queue_full" in response.body
+    assert gateway.queued_requests == 0
+
+
+@pytest.mark.asyncio
+async def test_proxy_avoids_worker_recently_observed_as_unhealthy(monkeypatch):
+    gateway = gateway_module.DualTabGateway(["http://one", "http://two"])
+    gateway.remember_backend_health(0, {"ready": False})
+    upstream = SimpleNamespace(
+        status=200,
+        reason="OK",
+        headers={"Content-Type": "application/json"},
+        content=_Content([b'{}']),
+    )
+    gateway.session = _Session(
+        contexts=[_Context(response=upstream)],
+        health_contexts=[_Context(response=_health_response())],
+    )
+    monkeypatch.setattr(gateway_module.web, "StreamResponse", _Downstream)
+
+    response = await gateway.proxy(_request("/v1/chat/completions"))
+
+    assert response.status == 200
+    assert gateway.session.requests[0][0][1].startswith("http://two/")
+    assert len(gateway.session.health_requests) == 1
+    assert gateway.available.qsize() == 2
+
+
+@pytest.mark.asyncio
+async def test_proxy_does_not_send_to_two_unready_workers():
+    gateway = gateway_module.DualTabGateway(["http://one", "http://two"])
+    gateway.session = _Session(
+        health_contexts=[
+            _Context(response=_health_response(status="degraded")),
+            _Context(response=_health_response(chrome=False, cdp=False)),
+        ]
+    )
+
+    response = await gateway.proxy(_request("/v1/chat/completions"))
+
+    assert response.status == 503
+    assert b"no_ready_worker" in response.body
+    assert gateway.session.requests == []
+    assert gateway.available.qsize() == 2
+
+
+def test_worker_readiness_accepts_starting_but_rejects_failure_status():
+    assert gateway_module.worker_is_ready(
+        {
+            "status": "starting",
+            "chrome_running": True,
+            "cdp_connected": True,
+        },
+        200,
+    ) is True
+    assert gateway_module.worker_is_ready(
+        {
+            "status": "login_required",
+            "chrome_running": True,
+            "cdp_connected": True,
+        },
+        200,
+    ) is False
 
 
 def test_gateway_copies_are_identical():

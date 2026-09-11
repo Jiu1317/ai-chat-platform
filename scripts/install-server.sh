@@ -24,8 +24,9 @@ if ! id "${service_user}" >/dev/null 2>&1; then
 fi
 
 install -d -o "${service_user}" -g "${service_user}" -m 0750 \
-  "${install_root}/current" "${install_root}/data" "${install_root}/workspaces" \
-  "${install_root}/state" /etc/ai-chat
+  "${install_root}/current" "${install_root}/current/services" \
+  "${install_root}/data" "${install_root}/workspaces" "${install_root}/state" \
+  /etc/ai-chat
 
 rsync -a --delete \
   --exclude data --exclude workspaces --exclude __pycache__ --exclude '*.pyc' \

@@ -164,12 +164,15 @@ class Config:
         import logging
         log = logging.getLogger("chatgpt_web2api.config")
         cfg = cls()
-        if path and Path(path).exists():
-            with open(path) as f:
+        if path is not None:
+            config_path = Path(path).expanduser()
+            if not config_path.is_file():
+                raise FileNotFoundError(f"Config file not found: {config_path}")
+            with config_path.open() as f:
                 data = json.load(f)
             cfg._apply_dict(data)
-            log.info("Loaded config from %s", path)
-        elif path is None:
+            log.info("Loaded config from %s", config_path)
+        else:
             # Auto-discover the documented default config location.
             default_path = Path.home() / ".chatgpt_web2api" / "config.json"
             if default_path.exists():

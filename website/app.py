@@ -103,7 +103,15 @@ SESSION_RE = re.compile(r"^[a-f0-9]{32}$")
 UPLOAD_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_\-\u4e00-\u9fff]{2,32}$")
 SAFE_FILE_RE = re.compile(r"[^\w.()\-\u4e00-\u9fff]+", re.UNICODE)
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif"}
+IMAGE_MEDIA_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".avif": "image/avif",
+}
 IMAGE_CACHE_DIR = ".image-cache"
 IMAGE_PREVIEW_MAX_EDGE = 960
 IMAGE_PREVIEW_QUALITY = 76
@@ -1012,6 +1020,14 @@ def _safe_filename(name: str) -> str:
     return clean[:120] or "file"
 
 
+def _file_media_type(target: Path) -> str:
+    return (
+        IMAGE_MEDIA_TYPES.get(target.suffix.lower())
+        or mimetypes.guess_type(target.name)[0]
+        or "application/octet-stream"
+    )
+
+
 def _transfer_secret_bytes() -> bytes:
     return TRANSFER_SECRET.encode("utf-8")
 
@@ -1130,14 +1146,37 @@ def _prepare_transfer_image(source: Path, upload_root: Path) -> Path:
     if source.parent != upload_root or not source.is_file():
         raise HTTPException(400, "参考图片不存在")
     try:
+        with Image.open(source) as probe:
+            image_format = str(probe.format or "").upper()
+            width, height = probe.size
+            if width <= 0 or height <= 0 or max(width, height) > 16_384 or width * height > 64_000_000:
+                raise HTTPException(400, "参考图片尺寸过大")
+            probe.verify()
+    except HTTPException:
+        raise
+    except (OSError, SyntaxError) as exc:
+        raise HTTPException(400, "参考图片文件无效或已损坏") from exc
+
+    expected_format = {
+        ".png": "PNG",
+        ".jpg": "JPEG",
+        ".jpeg": "JPEG",
+        ".webp": "WEBP",
+        ".gif": "GIF",
+        ".avif": "AVIF",
+    }.get(source.suffix.lower())
+    # AVIF is accepted at upload but converted to WebP for broad upstream API support.
+    source_format_matches = image_format == expected_format and image_format != "AVIF"
+    try:
         with Image.open(source) as opened:
             image = ImageOps.exif_transpose(opened)
             image.load()
             width, height = image.size
             if width <= 0 or height <= 0 or max(width, height) > 16_384 or width * height > 64_000_000:
-                raise ValueError("参考图片尺寸过大")
+                raise HTTPException(400, "参考图片尺寸过大")
             if (
-                source.stat().st_size <= TRANSFER_IMAGE_COMPRESS_MIN_BYTES
+                source_format_matches
+                and source.stat().st_size <= TRANSFER_IMAGE_COMPRESS_MIN_BYTES
                 and max(width, height) <= TRANSFER_IMAGE_MAX_EDGE
             ):
                 return source
@@ -1155,14 +1194,32 @@ def _prepare_transfer_image(source: Path, upload_root: Path) -> Path:
                     Image.Resampling.LANCZOS,
                 )
                 _save_webp(compressed, target, TRANSFER_IMAGE_QUALITY)
-            if target.stat().st_size >= source.stat().st_size and max(width, height) <= TRANSFER_IMAGE_MAX_EDGE:
+            if (
+                source_format_matches
+                and target.stat().st_size >= source.stat().st_size
+                and max(width, height) <= TRANSFER_IMAGE_MAX_EDGE
+            ):
                 return source
             return target
     except HTTPException:
         raise
     except Exception as exc:
         LOG.warning("Unable to optimize transfer image %s: %s", source.name, exc)
-        return source
+        if source_format_matches:
+            return source
+        raise HTTPException(400, "参考图片扩展名与实际格式不一致，且转换失败") from exc
+
+
+async def _prepare_transfer_images(
+    sources: list[Path], upload_root: Path
+) -> list[Path]:
+    semaphore = asyncio.Semaphore(2)
+
+    async def prepare(source: Path) -> Path:
+        async with semaphore:
+            return await asyncio.to_thread(_prepare_transfer_image, source, upload_root)
+
+    return await asyncio.gather(*(prepare(source) for source in sources))
 
 
 def _transfer_image_url(
@@ -1575,6 +1632,7 @@ external_conversation_locks: dict[tuple[str, str], asyncio.Lock] = {}
 external_conversation_states: dict[tuple[str, str], dict[str, str]] = {}
 image_turns: dict[str, tuple[str, asyncio.Task[Any]]] = {}
 image_variant_lock = asyncio.Lock()
+attachment_extract_semaphore = asyncio.Semaphore(2)
 image_variant_tasks: set[asyncio.Task[Any]] = set()
 
 
@@ -2973,7 +3031,7 @@ async def transfer_image(token: str):
         raise HTTPException(404, "临时图片不存在或已经失效")
     return FileResponse(
         target,
-        media_type=mimetypes.guess_type(target.name)[0] or "application/octet-stream",
+        media_type=_file_media_type(target),
         headers={
             "Cache-Control": "private, no-store, max-age=0",
             "Pragma": "no-cache",
@@ -3604,9 +3662,20 @@ def _attachment_inputs(
         )
     if include_history and not payload.thread_id and payload.history:
         context_limit = max_text_chars if max_text_chars is not None else MAX_CONTEXT_TEXT_CHARS
+        current_ids = {item.id for item in payload.attachments}
+        has_current_documents = any(
+            Path(item.id).suffix.lower() not in IMAGE_EXTENSIONS
+            for item in payload.attachments
+        )
+        has_project_documents = include_project_context and any(
+            item.id not in current_ids
+            and Path(item.id).suffix.lower() not in IMAGE_EXTENSIONS
+            for item in payload.project_attachments
+        )
         attachment_reserve = min(
             context_limit,
-            MAX_CURRENT_ATTACHMENT_CONTEXT_CHARS + MAX_PROJECT_ATTACHMENT_CONTEXT_CHARS,
+            (MAX_CURRENT_ATTACHMENT_CONTEXT_CHARS if has_current_documents else 0)
+            + (MAX_PROJECT_ATTACHMENT_CONTEXT_CHARS if has_project_documents else 0),
         )
         history_budget = max(0, context_limit - len(message) - attachment_reserve - 96)
         recent_history, older_excerpt = _fit_context_window(payload.history, history_budget)
@@ -3720,6 +3789,20 @@ def _attachment_inputs(
             inputs[0]["text"] += notice
             used_text_chars += len(notice)
     return inputs
+
+
+async def _attachment_inputs_async(
+    payload: TurnRequest,
+    workspace: Path,
+    **options: Any,
+) -> list[dict[str, Any]]:
+    async with attachment_extract_semaphore:
+        return await asyncio.to_thread(
+            _attachment_inputs,
+            payload,
+            workspace,
+            **options,
+        )
 
 
 def _payload_has_images(payload: TurnRequest, workspace: Path) -> bool:
@@ -3905,6 +3988,21 @@ def _schedule_image_variants(source: Path, output_root: Path) -> None:
     task.add_done_callback(image_variant_tasks.discard)
 
 
+def _inspect_image_file(target: Path) -> tuple[str, int, int]:
+    with Image.open(target) as opened:
+        image_format = str(opened.format or "").upper()
+        width, height = opened.size
+        if (
+            width <= 0
+            or height <= 0
+            or max(width, height) > 16_384
+            or width * height > 64_000_000
+        ):
+            raise RuntimeError("生成图片尺寸无效")
+        opened.verify()
+    return image_format, width, height
+
+
 def _is_image_generation_request(message: str) -> bool:
     text = message.strip()
     if not text or IMAGE_DISCUSSION_RE.search(text):
@@ -3923,6 +4021,8 @@ async def _generate_image(prompt: str, workspace: Path) -> dict[str, Any]:
     temporary: Path | None = None
     media_type = ""
     size = 0
+    width = 0
+    height = 0
     async with httpx.AsyncClient(timeout=timeout) as client:
         async with client.stream(
             "POST",
@@ -3940,7 +4040,12 @@ async def _generate_image(prompt: str, workspace: Path) -> dict[str, Any]:
                     pass
                 raise RuntimeError(detail)
             media_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
-            extensions = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"}
+            extensions = {
+                "image/png": ".png",
+                "image/jpeg": ".jpg",
+                "image/webp": ".webp",
+                "image/avif": ".avif",
+            }
             extension = extensions.get(media_type)
             if not extension:
                 raise RuntimeError("图片服务返回了不支持的格式")
@@ -3964,6 +4069,20 @@ async def _generate_image(prompt: str, workspace: Path) -> dict[str, Any]:
                         output.write(chunk)
                 if size == 0:
                     raise RuntimeError("生成图片为空")
+                try:
+                    image_format, width, height = await asyncio.to_thread(
+                        _inspect_image_file, temporary
+                    )
+                except (OSError, SyntaxError) as exc:
+                    raise RuntimeError("图片服务返回的图片文件无效") from exc
+                actual_media_type = {
+                    "PNG": "image/png",
+                    "JPEG": "image/jpeg",
+                    "WEBP": "image/webp",
+                    "AVIF": "image/avif",
+                }.get(image_format)
+                if actual_media_type != media_type:
+                    raise RuntimeError("图片服务返回的格式与文件内容不一致")
                 os.replace(temporary, target)
             finally:
                 temporary.unlink(missing_ok=True)
@@ -3984,6 +4103,8 @@ async def _generate_image(prompt: str, workspace: Path) -> dict[str, Any]:
         "path": filename,
         "mediaType": media_type,
         "inline": True,
+        "width": width,
+        "height": height,
     }
     for key in ("width", "height", "previewSize", "compressedSize"):
         if variants.get(key):
@@ -4223,7 +4344,7 @@ async def _external_current_content(
     include_project_images: bool = True,
     max_text_chars: int = MAX_CONTEXT_TEXT_CHARS,
 ) -> str | list[dict[str, Any]]:
-    inputs = _attachment_inputs(
+    inputs = await _attachment_inputs_async(
         payload,
         workspace,
         include_history=False,
@@ -4240,19 +4361,10 @@ async def _external_current_content(
 
     if protocol == "anthropic":
         upload_root = (workspace / "uploads").resolve()
-        optimized_paths = await asyncio.gather(*[
-            asyncio.to_thread(_prepare_transfer_image, path, upload_root)
-            for path in image_paths
-        ])
+        optimized_paths = await _prepare_transfer_images(image_paths, upload_root)
         content: list[dict[str, Any]] = [{"type": "text", "text": text}]
         for path in optimized_paths:
-            media_type = {
-                ".png": "image/png",
-                ".jpg": "image/jpeg",
-                ".jpeg": "image/jpeg",
-                ".webp": "image/webp",
-                ".gif": "image/gif",
-            }.get(path.suffix.lower()) or mimetypes.guess_type(path.name)[0] or "image/png"
+            media_type = _file_media_type(path)
             content.append({
                 "type": "image",
                 "source": {
@@ -4266,10 +4378,7 @@ async def _external_current_content(
     transfer_base_url = _require_external_transfer_base_url()
     if transfer_base_url:
         upload_root = (workspace / "uploads").resolve()
-        optimized_paths = await asyncio.gather(*[
-            asyncio.to_thread(_prepare_transfer_image, path, upload_root)
-            for path in image_paths
-        ])
+        optimized_paths = await _prepare_transfer_images(image_paths, upload_root)
         content: list[dict[str, Any]] = [{"type": "text", "text": text}]
         for target in optimized_paths:
             content.append({
@@ -4527,23 +4636,27 @@ async def _persist_external_image(
                                 raise RuntimeError("生成图片超过 30 MB")
                             output.write(chunk)
                 if size == 0:
-                    raise RuntimeError("生成图片为空")
-                with Image.open(temporary) as opened:
-                    image_format = str(opened.format or "").upper()
-                    width, height = opened.size
-                    if (
-                        width <= 0
-                        or height <= 0
-                        or max(width, height) > 16_384
-                        or width * height > 64_000_000
-                    ):
-                        raise RuntimeError("生成图片尺寸无效")
-                    opened.verify()
+                    last_error = RuntimeError("生成图片为空")
+                    if attempt + 1 < EXTERNAL_ASSET_DOWNLOAD_ATTEMPTS:
+                        await asyncio.sleep(0.5 * (2 ** attempt))
+                        continue
+                    break
+                try:
+                    image_format, width, height = await asyncio.to_thread(
+                        _inspect_image_file, temporary
+                    )
+                except (OSError, SyntaxError) as exc:
+                    last_error = exc
+                    if attempt + 1 < EXTERNAL_ASSET_DOWNLOAD_ATTEMPTS:
+                        await asyncio.sleep(0.5 * (2 ** attempt))
+                        continue
+                    break
                 formats = {
                     "PNG": (".png", "image/png"),
                     "JPEG": (".jpg", "image/jpeg"),
                     "WEBP": (".webp", "image/webp"),
                     "GIF": (".gif", "image/gif"),
+                    "AVIF": (".avif", "image/avif"),
                 }
                 if image_format not in formats:
                     raise RuntimeError("图片服务返回了不支持的格式")
@@ -4767,6 +4880,8 @@ async def _external_response_stream(
                         if not raw_data:
                             continue
                         if raw_data == "[DONE]":
+                            if protocol != "anthropic":
+                                terminal_success = True
                             break
                         try:
                             data = json.loads(raw_data)
@@ -4781,10 +4896,14 @@ async def _external_response_stream(
                                 yield _ndjson({"type": "error", "message": stream_error})
                                 return
                             if protocol != "anthropic":
+                                incoming_conversation_id = _valid_external_conversation_id(
+                                    data.get("conversation_id")
+                                )
+                                if incoming_conversation_id:
+                                    captured_conversation_id = incoming_conversation_id
                                 finish_reason = _openai_finish_reason(data).lower()
                                 if finish_reason not in {"", "error"}:
                                     terminal_success = True
-                                    captured_conversation_id = _valid_external_conversation_id(data.get("conversation_id"))
                             else:
                                 delta = data.get("delta") if isinstance(data.get("delta"), dict) else {}
                                 if (
@@ -4809,6 +4928,14 @@ async def _external_response_stream(
                 if not terminal_success:
                     yield _ndjson({"type": "error", "message": "API 回答连接意外中断，请重试"})
                     return
+                if protocol != "anthropic" and response_parts:
+                    complete_response = {
+                        "choices": [{"message": {"content": "".join(response_parts)}}]
+                    }
+                    for candidate in _openai_image_candidates(
+                        complete_response, str(provider["baseUrl"])
+                    ):
+                        asset_candidates.setdefault(candidate["url"], candidate)
                 candidates = list(asset_candidates.values())
                 files: list[dict[str, Any]] = []
                 failed_assets = 0
@@ -4996,7 +5123,7 @@ async def turn(request: Request, payload: TurnRequest):
     if payload.model in _read_disabled_codex_models():
         raise HTTPException(400, "该 Codex 模型已被管理员关闭，请选择其他模型")
     await _clear_external_conversation_state(user["id"], payload.client_conversation_id)
-    inputs = _attachment_inputs(
+    inputs = await _attachment_inputs_async(
         payload,
         workspace,
         max_text_chars=MAX_CONTEXT_TEXT_CHARS,
@@ -5119,7 +5246,7 @@ async def download_file(
     is_image = target.suffix.lower() in IMAGE_EXTENSIONS
     selected = target
     download_name = target.name
-    media_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+    media_type = _file_media_type(target)
     if variant != "original":
         if not is_image:
             raise HTTPException(415, "该文件没有图片预览版本")

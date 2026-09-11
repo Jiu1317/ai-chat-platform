@@ -104,3 +104,117 @@ for (const [label, sourcePath] of sources) {
     assert.match(html, /最多 5 个，单个不超过 30 MB；文字与附件合计不超过 30 MB/);
   });
 }
+
+const publicSource = fs.readFileSync(sources[0][1], "utf8");
+const publicHtml = fs.readFileSync(
+  path.resolve(testDirectory, "../templates/index.html"),
+  "utf8",
+);
+
+test("public: assistant image files remain visible outside dedicated image mode", () => {
+  assert.match(publicSource, /const isImage = isImageFile/);
+  assert.doesNotMatch(publicSource, /if \(isImageFile && message\.mode !== "image"\) continue/);
+});
+
+test("public: rapid stream deltas are rendered at most once per animation frame", () => {
+  const body = { innerHTML: "" };
+  const article = {
+    dataset: { messageId: "message-1" },
+    classList: { remove() {} },
+    querySelector() { return body; },
+  };
+  const callbacks = [];
+  const stats = { renders: 0, scrolls: 0 };
+  const context = vm.createContext({
+    callbacks,
+    globalElements: {
+      messageList: {
+        querySelector(selector) {
+          return selector.includes(article.dataset.messageId) ? article : null;
+        },
+      },
+    },
+    requestAnimationFrame(callback) { callbacks.push(callback); },
+    stats,
+    window: { scrollTo() { stats.scrolls += 1; } },
+    document: { documentElement: { scrollHeight: 0 } },
+  });
+  vm.runInContext(`
+    let pendingStreamingMessage = null;
+    let streamingRenderScheduled = false;
+    let autoScrollEnabled = true;
+    const elements = globalElements;
+    function renderMarkdown(value) {
+      stats.renders += 1;
+      return String(value);
+    }
+    ${functionSource(publicSource, "updateStreamingMessage")}
+  `, context);
+
+  context.updateStreamingMessage({ id: "message-1", content: "第一段" });
+  context.updateStreamingMessage({ id: "message-1", content: "第二段" });
+  assert.equal(callbacks.length, 1);
+  callbacks.shift()();
+  assert.equal(stats.renders, 1);
+  assert.equal(stats.scrolls, 1);
+  assert.equal(callbacks.length, 0);
+  assert.equal(body.innerHTML, "第二段");
+});
+
+test("public: stream chunks are appended without rescanning the whole answer", () => {
+  const consume = functionSource(publicSource, "consumeStream");
+  assert.match(consume, /assistantMessage\.content \+= String\(event\.text \|\| ""\)/);
+  assert.doesNotMatch(
+    consume,
+    /stripInternalAnnotations\(assistantMessage\.content \+ String\(event\.text/,
+  );
+});
+
+test("public: both upload pickers expose the supported GIF and AVIF formats", () => {
+  const accepts = [...publicHtml.matchAll(/<input[^>]+(?:file-input|project-file-input)[^>]+accept="([^"]+)"/g)]
+    .map((match) => match[1]);
+  assert.equal(accepts.length, 2);
+  accepts.forEach((accept) => {
+    assert.match(accept, /(?:^|,)\.gif(?:,|$)/);
+    assert.match(accept, /(?:^|,)\.avif(?:,|$)/);
+  });
+});
+
+test("public: long lists are assembled off-DOM and committed once", () => {
+  for (const name of ["renderProjects", "renderHistory", "renderMessages"]) {
+    const render = functionSource(publicSource, name);
+    assert.match(render, /document\.createDocumentFragment\(\)/, name);
+    assert.match(render, /fragment\.append\(/, name);
+    assert.match(render, /replaceChildren\(fragment\)/, name);
+    assert.ok(
+      render.indexOf("fragment.append(") < render.indexOf("replaceChildren(fragment)"),
+      `${name} should commit after building`,
+    );
+  }
+});
+
+test("public: routine message renders avoid forced composer layout reads", () => {
+  const render = functionSource(publicSource, "renderMessages");
+  assert.match(render, /const composerWrap = animateComposer \?/);
+  assert.match(render, /const previousComposerTop = composerWrap\?\.getBoundingClientRect\(\)\.top \|\| 0/);
+  assert.doesNotMatch(render, /const composerWrap = elements\.composer\.closest/);
+});
+
+test("public: cloud sync reuses its serialized snapshot", () => {
+  const sync = functionSource(publicSource, "syncCloudConversations");
+  assert.match(sync, /body: outgoingSignature/);
+  assert.match(sync, /lastCloudSignature = changed \? cloudSignature\(\) : outgoingSignature/);
+  assert.doesNotMatch(sync, /body: JSON\.stringify\(outgoing\)/);
+});
+
+test("public: model refresh and theme changes avoid redundant full work", () => {
+  assert.match(publicSource, /updateEfforts\(\{ persist: false \}\)/);
+  const efforts = functionSource(publicSource, "updateEfforts");
+  assert.match(efforts, /if \(persist\) saveState\(\)/);
+  const themeStart = publicSource.indexOf('elements.themeButton.addEventListener("click"');
+  const themeEnd = publicSource.indexOf('elements.settingsButton.addEventListener("click"', themeStart);
+  assert.ok(themeStart >= 0 && themeEnd > themeStart);
+  const themeHandler = publicSource.slice(themeStart, themeEnd);
+  assert.match(themeHandler, /document\.documentElement\.dataset\.theme = state\.theme/);
+  assert.doesNotMatch(themeHandler, /renderAll\(\)/);
+});

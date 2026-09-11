@@ -157,6 +157,8 @@ let autoScrollEnabled = true;
 let hasRenderedMessages = false;
 let renderedConversationId = null;
 let renderedMessageIds = new Set();
+let pendingStreamingMessage = null;
+let streamingRenderScheduled = false;
 let sidebarCloseTimer = null;
 let quotaLastFetched = 0;
 let latencyLastFetched = 0;
@@ -486,7 +488,7 @@ async function syncCloudConversations({ force = false, initial = false } = {}) {
     const response = await api("/api/conversations/sync", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(outgoing),
+      body: outgoingSignature,
     });
     const result = await response.json();
     const deleted = new Set(Array.isArray(result.deleted) ? result.deleted : []);
@@ -529,7 +531,7 @@ async function syncCloudConversations({ force = false, initial = false } = {}) {
       changed = true;
     }
     persistLocalState();
-    lastCloudSignature = cloudSignature();
+    lastCloudSignature = changed ? cloudSignature() : outgoingSignature;
     cloudSyncReady = true;
     cloudSyncFailureShown = false;
     setCloudSyncStatus("synced", "已同步");
@@ -650,8 +652,16 @@ function renderAll() {
 }
 
 function renderProjects() {
-  elements.projectList.replaceChildren();
   const projects = [...state.projects].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  const conversationCounts = new Map();
+  for (const conversation of state.conversations) {
+    if (!conversation.projectId) continue;
+    conversationCounts.set(
+      conversation.projectId,
+      (conversationCounts.get(conversation.projectId) || 0) + 1,
+    );
+  }
+  const fragment = document.createDocumentFragment();
   elements.projectsEmpty.hidden = projects.length > 0;
   elements.allChats.classList.toggle("is-active", !state.activeProjectId);
   for (const project of projects) {
@@ -664,14 +674,15 @@ function renderProjects() {
     const copy = document.createElement("span");
     const name = document.createElement("strong");
     name.textContent = project.name;
-    const count = state.conversations.filter((item) => item.projectId === project.id).length;
+    const count = conversationCounts.get(project.id) || 0;
     const meta = document.createElement("small");
     meta.textContent = `${count} 个聊天 · ${project.files.length} 个文件`;
     copy.append(name, meta);
     button.append(copy);
     button.addEventListener("click", () => selectProject(project.id));
-    elements.projectList.append(button);
+    fragment.append(button);
   }
+  elements.projectList.replaceChildren(fragment);
 }
 
 function renderProjectContext() {
@@ -689,9 +700,9 @@ function renderProjectContext() {
 }
 
 function renderHistory() {
-  elements.historyList.replaceChildren();
   const sorted = sortedConversations();
   const project = activeProject();
+  const fragment = document.createDocumentFragment();
   elements.historyTitle.textContent = project ? "项目聊天" : "最近";
   elements.historyEmpty.hidden = sorted.length > 0;
   elements.historyEmpty.textContent = project
@@ -729,7 +740,7 @@ function renderHistory() {
         }, 0);
       });
       row.append(form);
-      elements.historyList.append(row);
+      fragment.append(row);
       requestAnimationFrame(() => {
         input.focus();
         input.select();
@@ -790,8 +801,9 @@ function renderHistory() {
       openHistoryMenu(conversation, event.clientX, event.clientY);
     });
     row.append(button, trigger);
-    elements.historyList.append(row);
+    fragment.append(row);
   }
+  elements.historyList.replaceChildren(fragment);
 }
 
 function commitConversationRename(conversationId, rawTitle) {
@@ -906,13 +918,16 @@ async function deleteConversation(conversationId) {
 
 function renderMessages() {
   const conversation = activeConversation();
-  elements.messageList.replaceChildren();
   const messages = conversation?.messages || [];
   const conversationChanged = renderedConversationId !== null && conversation?.id !== renderedConversationId;
   const hadMessages = document.body.classList.contains("has-messages");
   const willHaveMessages = messages.length > 0;
-  const composerWrap = elements.composer.closest(".composer-wrap");
-  const previousComposerTop = composerWrap.getBoundingClientRect().top;
+  const animateComposer = hasRenderedMessages
+    && hadMessages !== willHaveMessages
+    && !prefersReducedMotion();
+  const composerWrap = animateComposer ? elements.composer.closest(".composer-wrap") : null;
+  const previousComposerTop = composerWrap?.getBoundingClientRect().top || 0;
+  const fragment = document.createDocumentFragment();
   document.body.classList.toggle("has-messages", willHaveMessages);
   elements.emptyState.hidden = messages.length > 0;
   messages.forEach((message, index) => {
@@ -921,15 +936,16 @@ function renderMessages() {
       node.classList.add("is-entering");
       node.style.setProperty("--enter-delay", `${conversationChanged ? Math.min(index * 24, 96) : 0}ms`);
     }
-    elements.messageList.append(node);
+    fragment.append(node);
   });
+  elements.messageList.replaceChildren(fragment);
   if (hasRenderedMessages && conversationChanged && !willHaveMessages && !prefersReducedMotion()) {
     elements.emptyState.animate(
       [{ opacity: 0.45, filter: "blur(1px)" }, { opacity: 1, filter: "blur(0)" }],
       { duration: 220, easing: "cubic-bezier(.16,1,.3,1)" },
     );
   }
-  if (hasRenderedMessages && hadMessages !== willHaveMessages && !prefersReducedMotion()) {
+  if (animateComposer && composerWrap) {
     const nextComposerTop = composerWrap.getBoundingClientRect().top;
     composerWrap.animate(
       [{ transform: `translateY(${previousComposerTop - nextComposerTop}px)` }, { transform: "translateY(0)" }],
@@ -970,6 +986,7 @@ function buildMessage(message, workspaceId) {
   const node = elements.messageTemplate.content.firstElementChild.cloneNode(true);
   const isThinking = message.role === "assistant" && Boolean(message.streaming) && !String(message.content || "").trim();
   node.dataset.role = message.role;
+  node.dataset.messageId = message.id;
   node.classList.toggle("is-streaming", Boolean(message.streaming));
   node.classList.toggle("is-thinking", isThinking);
   node.classList.toggle("is-error", Boolean(message.error));
@@ -1073,8 +1090,7 @@ function buildMessage(message, workspaceId) {
     const fileUrl = `/api/files/${workspaceId}/${encodedPath}`;
     const isImageFile = String(file.mediaType || "").startsWith("image/")
       || /\.(?:avif|gif|jpe?g|png|webp)$/i.test(String(file.name || file.path || ""));
-    if (isImageFile && message.mode !== "image") continue;
-    const isImage = message.mode === "image" && isImageFile;
+    const isImage = isImageFile;
     if (isImage) {
       const figure = document.createElement("figure");
       figure.className = "generated-image";
@@ -2613,7 +2629,7 @@ async function loadModels(includeCodex = accountConnected) {
     if (selectedModel) {
       elements.modelSelect.value = selectedModel.id;
       state.model = selectedModel.id;
-      updateEfforts();
+      updateEfforts({ persist: false });
     } else {
       const option = document.createElement("option");
       option.textContent = includeCodex ? "暂无可用模型" : "请连接账户或添加 API";
@@ -2628,7 +2644,7 @@ async function loadModels(includeCodex = accountConnected) {
     elements.modelDescription.textContent = `模型列表加载失败：${error.message}`;
   }
 }
-function updateEfforts() {
+function updateEfforts({ persist = true } = {}) {
   const model = models.find((item) => item.id === elements.modelSelect.value);
   if (!model) return;
   state.model = model.id;
@@ -2646,7 +2662,7 @@ function updateEfforts() {
   const preferred = allowed.some((item) => item.id === state.effort) ? state.effort : model.defaultEffort;
   elements.effortSelect.value = preferred || allowed[0].id;
   state.effort = elements.effortSelect.value;
-  saveState();
+  if (persist) saveState();
 }
 
 async function uploadSelectedFiles(fileList) {
@@ -3017,10 +3033,10 @@ async function consumeStream(response, conversation, assistantMessage) {
         if (event.mode) assistantMessage.mode = event.mode;
         activeTurn = { threadId: event.threadId, turnId: event.turnId };
       } else if (event.type === "delta") {
-        assistantMessage.content = stripInternalAnnotations(assistantMessage.content + String(event.text || ""));
+        assistantMessage.content += String(event.text || "");
         updateStreamingMessage(assistantMessage);
       } else if (event.type === "replace") {
-        assistantMessage.content = stripInternalAnnotations(event.text || "");
+        assistantMessage.content = String(event.text || "");
         updateStreamingMessage(assistantMessage);
       } else if (event.type === "done") {
         if (event.mode) assistantMessage.mode = event.mode;
@@ -3053,14 +3069,24 @@ async function consumeStream(response, conversation, assistantMessage) {
 }
 
 function updateStreamingMessage(message) {
-  const articles = [...elements.messageList.querySelectorAll(".message")];
-  const article = articles.at(-1);
-  if (!article) return;
-  article.classList.remove("is-thinking");
-  article.querySelector(".message-body").innerHTML = renderMarkdown(message.content);
-  if (autoScrollEnabled) {
-    requestAnimationFrame(() => window.scrollTo({ top: document.documentElement.scrollHeight, behavior: "auto" }));
-  }
+  pendingStreamingMessage = message;
+  if (streamingRenderScheduled) return;
+  streamingRenderScheduled = true;
+  requestAnimationFrame(() => {
+    streamingRenderScheduled = false;
+    const latest = pendingStreamingMessage;
+    pendingStreamingMessage = null;
+    if (!latest) return;
+    const article = elements.messageList.querySelector(
+      `.message[data-message-id="${latest.id}"]`,
+    );
+    if (!article) return;
+    article.classList.remove("is-thinking");
+    article.querySelector(".message-body").innerHTML = renderMarkdown(latest.content);
+    if (autoScrollEnabled) {
+      window.scrollTo({ top: document.documentElement.scrollHeight, behavior: "auto" });
+    }
+  });
 }
 
 async function stopCurrentTurn() {
@@ -3146,7 +3172,7 @@ elements.themeButton.addEventListener("click", () => {
   const applyTheme = () => {
     state.theme = state.theme === "dark" ? "light" : "dark";
     saveState();
-    renderAll();
+    document.documentElement.dataset.theme = state.theme;
   };
   if (document.startViewTransition && !prefersReducedMotion()) document.startViewTransition(applyTheme);
   else applyTheme();

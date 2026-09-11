@@ -228,7 +228,10 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--user-data-dir", help="Chrome user data directory")
     parser.add_argument("--headless", action="store_true", help="Run Chrome headless")
     parser.add_argument(
-        "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"]
+        "--log-level",
+        default=None,
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Override log level (default: config value or INFO)",
     )
 
 

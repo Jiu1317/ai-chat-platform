@@ -212,12 +212,12 @@ public final class MainActivity extends ComponentActivity {
 
     private void share(String title, String text, String url) {
         StringBuilder body = new StringBuilder();
-        if (title != null && !title.isBlank()) body.append(title.trim());
-        if (text != null && !text.isBlank()) {
+        if (!isBlank(title)) body.append(title.trim());
+        if (!isBlank(text)) {
             if (body.length() > 0) body.append("\n\n");
             body.append(text.trim());
         }
-        if (url != null && !url.isBlank()) {
+        if (!isBlank(url)) {
             if (body.length() > 0) body.append("\n");
             body.append(url.trim());
         }
@@ -373,10 +373,10 @@ public final class MainActivity extends ComponentActivity {
             request.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, source.fileName);
             request.setAllowedOverMetered(true);
             request.setAllowedOverRoaming(false);
-            if (source.mimeType != null && !source.mimeType.isBlank()) request.setMimeType(source.mimeType);
-            if (source.userAgent != null && !source.userAgent.isBlank()) request.addRequestHeader("User-Agent", source.userAgent);
+            if (!isBlank(source.mimeType)) request.setMimeType(source.mimeType);
+            if (!isBlank(source.userAgent)) request.addRequestHeader("User-Agent", source.userAgent);
             String cookie = CookieManager.getInstance().getCookie(source.url);
-            if (cookie != null && !cookie.isBlank()) request.addRequestHeader("Cookie", cookie);
+            if (!isBlank(cookie)) request.addRequestHeader("Cookie", cookie);
             ((DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE)).enqueue(request);
             Toast.makeText(this, R.string.download_started, Toast.LENGTH_SHORT).show();
         } catch (RuntimeException error) {
@@ -426,7 +426,7 @@ public final class MainActivity extends ComponentActivity {
                     }
                     byte[] bytes = android.util.Base64.decode(payload, android.util.Base64.DEFAULT);
                     if (bytes.length > MAX_BRIDGE_DOWNLOAD_BYTES) throw new IllegalArgumentException("File is too large");
-                    String resolvedMime = mimeType == null || mimeType.isBlank()
+                    String resolvedMime = isBlank(mimeType)
                             ? dataUrl.substring(5, dataUrl.indexOf(';'))
                             : mimeType;
                     saveBytes(bytes, safeFilename(addExtensionIfNeeded(fileName, resolvedMime)), resolvedMime);
@@ -444,7 +444,7 @@ public final class MainActivity extends ComponentActivity {
     }
 
     private String addExtensionIfNeeded(String fileName, String mimeType) {
-        String name = fileName == null || fileName.isBlank() ? "AI-Download" : fileName;
+        String name = isBlank(fileName) ? "AI-Download" : fileName;
         if (name.contains(".")) return name;
         String extension = MimeTypeMap.getSingleton().getExtensionFromMimeType(mimeType);
         return extension == null ? name : name + "." + extension;
@@ -476,6 +476,10 @@ public final class MainActivity extends ComponentActivity {
                 output.write(bytes);
             }
         }
+    }
+
+    private static boolean isBlank(String value) {
+        return value == null || value.trim().isEmpty();
     }
 
     private static final class DownloadRequest {

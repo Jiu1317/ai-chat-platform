@@ -2,6 +2,7 @@ $ErrorActionPreference = 'Continue'
 
 $WorkRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $WatchScript = Join-Path $WorkRoot 'watch-dual-tab.ps1'
+$ExitSignalFile = Join-Path $WorkRoot '.dual-tab-tray-exit'
 $CdpPort = 9325
 
 Add-Type -AssemblyName System.Windows.Forms
@@ -74,38 +75,72 @@ public static class AIChatWeb2APITrayWindowApi
 }
 "@
 
-function Get-DedicatedBrowserProcess {
-    Get-CimInstance Win32_Process | Where-Object {
-        $_.Name -match 'chrome|msedge' -and
-        $_.CommandLine -and
-        $_.CommandLine -match "--remote-debugging-port=$CdpPort(?:\s|$)"
-    } | Select-Object -First 1
+function Get-DedicatedBrowserProcessIds {
+    $processIds = @()
+
+    try {
+        $processIds += @(
+            Get-NetTCPConnection -State Listen -LocalPort $CdpPort -ErrorAction Stop |
+                Select-Object -ExpandProperty OwningProcess
+        )
+    } catch {
+        # Fall back to the browser command line when the TCP table is unavailable.
+    }
+
+    $portPattern = '--remote-debugging-port(?:=|\s+)' +
+        [regex]::Escape([string]$CdpPort) + '(?:\s|$)'
+    $processIds += @(
+        Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+            $_.Name -match 'chrome|msedge' -and
+            $_.CommandLine -and
+            $_.CommandLine -match $portPattern -and
+            $_.CommandLine -notmatch '(?:^|\s)--type='
+        } | Select-Object -ExpandProperty ProcessId
+    )
+
+    return @(
+        $processIds |
+            Where-Object { [int]$_ -gt 0 } |
+            ForEach-Object { [int]$_ } |
+            Sort-Object -Unique
+    )
+}
+
+function ConvertTo-NativeArgument {
+    param([string]$Value)
+
+    if ($Value.Contains('"')) { throw 'Paths containing a double quote are not supported.' }
+    if ($Value -match '\s') { return '"' + $Value + '"' }
+    return $Value
 }
 
 function Hide-DedicatedBrowser {
-    $browser = Get-DedicatedBrowserProcess
-    if ($browser) {
-        [void][AIChatWeb2APITrayWindowApi]::HideForProcess([int]$browser.ProcessId)
+    foreach ($processId in @(Get-DedicatedBrowserProcessIds)) {
+        [void][AIChatWeb2APITrayWindowApi]::HideForProcess($processId)
     }
 }
 
 function Show-DedicatedBrowser {
-    $browser = Get-DedicatedBrowserProcess
-    if ($browser) {
-        [void][AIChatWeb2APITrayWindowApi]::ShowForProcess([int]$browser.ProcessId)
+    foreach ($processId in @(Get-DedicatedBrowserProcessIds)) {
+        [void][AIChatWeb2APITrayWindowApi]::ShowForProcess($processId)
     }
 }
 
 function Ensure-Watchdog {
+    # Older copies may live in a different folder but monitor the same fixed
+    # 9181/9182/9183/9325 stack. Recognize the script name as well as this
+    # exact path so installing a newer tray does not create two recoverers.
+    $watchdogCommandPattern = '(?i)(?:^|[\\/])watch-dual-tab\.ps1(?:"|\s|$)'
     $existing = Get-CimInstance Win32_Process | Where-Object {
         $_.CommandLine -and
-        $_.CommandLine -like "*$WatchScript*" -and
+        ($_.CommandLine.Contains($WatchScript) -or
+            $_.CommandLine -match $watchdogCommandPattern) -and
         $_.ProcessId -ne $PID
     }
     if (-not $existing) {
         Start-Process -FilePath 'powershell.exe' -ArgumentList @(
             '-NoProfile', '-WindowStyle', 'Hidden',
-            '-ExecutionPolicy', 'Bypass', '-File', $WatchScript
+            '-ExecutionPolicy', 'Bypass', '-File', (ConvertTo-NativeArgument $WatchScript)
         ) -WindowStyle Hidden
     }
 }
@@ -117,11 +152,32 @@ if (-not $createdNew) {
     exit 0
 }
 
+if (Test-Path -LiteralPath $ExitSignalFile) {
+    try {
+        Remove-Item -LiteralPath $ExitSignalFile -Force -ErrorAction SilentlyContinue
+        Show-DedicatedBrowser
+    } finally {
+        try { $mutex.ReleaseMutex() } catch {}
+        $mutex.Dispose()
+    }
+    exit 0
+}
 Ensure-Watchdog
 
-$browserProcess = Get-DedicatedBrowserProcess
+$browserProcess = $null
+foreach ($processId in @(Get-DedicatedBrowserProcessIds)) {
+    try {
+        $candidate = Get-CimInstance Win32_Process -Filter "ProcessId = $processId" -ErrorAction Stop
+        if ($candidate.ExecutablePath) {
+            $browserProcess = $candidate
+            break
+        }
+    } catch {
+        # The default icon is sufficient when the executable path is unavailable.
+    }
+}
 $trayIcon = [System.Windows.Forms.NotifyIcon]::new()
-$trayIcon.Text = 'AI Chat Web2API dedicated browser'
+$trayIcon.Text = 'ChatGPT Web2API dedicated browser'
 if ($browserProcess -and $browserProcess.ExecutablePath) {
     try {
         $trayIcon.Icon = [System.Drawing.Icon]::ExtractAssociatedIcon($browserProcess.ExecutablePath)
@@ -158,6 +214,8 @@ $trayIcon.add_DoubleClick({
 
 $context = [System.Windows.Forms.ApplicationContext]::new()
 $exitItem.add_Click({
+    $script:keepHidden = $false
+    Show-DedicatedBrowser
     $trayIcon.Visible = $false
     $context.ExitThread()
 })
@@ -165,6 +223,15 @@ $exitItem.add_Click({
 $timer = [System.Windows.Forms.Timer]::new()
 $timer.Interval = 2000
 $timer.add_Tick({
+    if (Test-Path -LiteralPath $ExitSignalFile) {
+        Remove-Item -LiteralPath $ExitSignalFile -Force -ErrorAction SilentlyContinue
+        $script:keepHidden = $false
+        Show-DedicatedBrowser
+        $trayIcon.Visible = $false
+        $context.ExitThread()
+        return
+    }
+
     Ensure-Watchdog
     if ($script:keepHidden) {
         Hide-DedicatedBrowser
@@ -177,6 +244,8 @@ try {
 } finally {
     $timer.Stop()
     $timer.Dispose()
+    Show-DedicatedBrowser
+    Remove-Item -LiteralPath $ExitSignalFile -Force -ErrorAction SilentlyContinue
     $trayIcon.Visible = $false
     $trayIcon.Dispose()
     $menu.Dispose()

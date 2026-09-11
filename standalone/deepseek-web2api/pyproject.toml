@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "deepseek-web2api"
+version = "0.1.0"
+description = "A local, self-use OpenAI-compatible bridge for the DeepSeek web app"
+requires-python = ">=3.11"
+dependencies = [
+    "aiohttp>=3.9,<4",
+    "websockets>=12,<18",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+deepseek-web2api = "deepseek_web2api.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/deepseek_web2api"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+# ASYNC109 is intentionally ignored: CDP commands and model generation expose
+# explicit caller-controlled time budgets and enforce them internally.
+ignore = ["E501", "ASYNC109"]

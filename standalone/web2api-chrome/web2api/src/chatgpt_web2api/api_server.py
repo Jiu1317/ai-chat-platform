@@ -743,27 +743,88 @@ class APIServer:
 
         try:
             body = await request.json()
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, UnicodeDecodeError):
             return web.json_response(
                 {"error": {"message": "Invalid JSON", "type": "invalid_request_error"}},
                 status=400,
             )
 
-        messages = body.get("messages", [])
-        if not messages:
+        if not isinstance(body, dict):
             return web.json_response(
-                {"error": {"message": "No messages provided", "type": "invalid_request_error"}},
+                {
+                    "error": {
+                        "message": "Request body must be a JSON object",
+                        "type": "invalid_request_error",
+                    }
+                },
+                status=400,
+            )
+
+        messages = body.get("messages", [])
+        if not isinstance(messages, list) or not messages:
+            return web.json_response(
+                {
+                    "error": {
+                        "message": "messages must be a non-empty array",
+                        "type": "invalid_request_error",
+                    }
+                },
                 status=400,
             )
 
         model = body.get("model", self._config.chatgpt.default_model)
+        if not isinstance(model, str) or not model.strip():
+            return web.json_response(
+                {
+                    "error": {
+                        "message": "model must be a non-empty string",
+                        "type": "invalid_request_error",
+                    }
+                },
+                status=400,
+            )
+        model = model.strip()
         stream = body.get("stream", False)
-        project_id = (
-            body.get("project_id")
-            or body.get("gizmo_id")
-            or (body.get("metadata", {}) or {}).get("project_id")
-            or self._config.chatgpt.default_project_id
-        )
+        if not isinstance(stream, bool):
+            return web.json_response(
+                {
+                    "error": {
+                        "message": "stream must be a boolean",
+                        "type": "invalid_request_error",
+                    }
+                },
+                status=400,
+            )
+        metadata = body.get("metadata")
+        if metadata is None:
+            metadata = {}
+        elif not isinstance(metadata, dict):
+            return web.json_response(
+                {
+                    "error": {
+                        "message": "metadata must be an object",
+                        "type": "invalid_request_error",
+                    }
+                },
+                status=400,
+            )
+        project_id = body.get("project_id")
+        if project_id is None or project_id == "":
+            project_id = body.get("gizmo_id")
+        if project_id is None or project_id == "":
+            project_id = metadata.get("project_id")
+        if project_id is None or project_id == "":
+            project_id = self._config.chatgpt.default_project_id
+        if project_id is not None and not isinstance(project_id, str):
+            return web.json_response(
+                {
+                    "error": {
+                        "message": "project_id must be a string",
+                        "type": "invalid_request_error",
+                    }
+                },
+                status=400,
+            )
         raw_conversation_id = body.get("conversation_id")
         if raw_conversation_id is None or raw_conversation_id == "":
             conversation_id = None

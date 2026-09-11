@@ -100,13 +100,9 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\start-dual-tab.ps1
 ```
 
-第一次会打开独立 Chrome 窗口和两个专用标签页。请手动登录你自己的 ChatGPT 账号；不要把账号密码写进脚本。完成登录后，再执行一次：
+第一次会打开独立 Chrome 窗口和两个专用标签页。请手动登录你自己的 ChatGPT 账号；不要把账号密码写进脚本。工作进程会实时识别登录状态，登录完成后直接进行下一步健康检查即可，以后也会复用这份独立登录资料。
 
-```powershell
-.\start-dual-tab.ps1
-```
-
-以后会复用这个独立登录资料。
+服务已经正常运行时，再执行一次 `start-dual-tab.ps1` 只会显示当前状态，不会重启进程，也不会打断正在生成或传输的内容。确实需要重启时，先执行 `stop-dual-tab.ps1`，等当前请求结束后再执行启动脚本。
 
 ### 6. 检查双路状态
 
@@ -183,6 +179,14 @@ $body = @{
 
 专用浏览器会隐藏到右下角系统托盘，不再占用任务栏。双击托盘图标可显示浏览器；右键可选择显示或隐藏。误关浏览器后，守护程序会检测并自动恢复。
 
+只想取消登录自启动并退出托盘图标时，执行：
+
+```powershell
+.\install-background.ps1 -Uninstall
+```
+
+退出托盘时，专用浏览器窗口会自动恢复到任务栏；API 和守护程序不会因此停止。
+
 ### 9. 正常停止
 
 ```powershell
@@ -216,7 +220,7 @@ Copy-Item .\cloudflared-config.example.yml .\cloudflared-config.yml
 web2api/                       Web2API Python 源码与许可证
 dual_tab_gateway.py            双路请求分配网关
 setup-windows.ps1              首次安装
-start-dual-tab.ps1             启动两个工作进程和网关
+start-dual-tab.ps1             启动两个工作进程和网关；健康运行时重复执行不会重启
 stop-dual-tab.ps1              主动停止并暂停自动恢复
 watch-dual-tab.ps1             意外关闭检测与自动恢复
 dual-tab-tray.ps1              系统托盘显示/隐藏控制

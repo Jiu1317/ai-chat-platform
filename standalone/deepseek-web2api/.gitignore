@@ -1,0 +1,29 @@
+# Local configuration and secrets
+config.json
+config.local.json
+.env
+*.env
+!*env.example
+*credentials*.json
+*cookies*
+*token*
+
+# Dedicated browser profiles and runtime state
+runtime/
+profiles/
+.deepseek-watchdog-paused
+.deepseek-tray-exit
+*.pid
+*processes.json
+*.log
+
+# Python and test artifacts
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/

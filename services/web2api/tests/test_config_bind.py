@@ -49,6 +49,13 @@ def test_config_explicit_path_overrides_default(tmp_path, monkeypatch):
     assert cfg.server.port == 6666  # explicit wins
 
 
+def test_config_explicit_missing_path_fails_clearly(tmp_path):
+    """A mistyped --config path must not silently start with defaults."""
+    missing = tmp_path / "missing.json"
+    with pytest.raises(FileNotFoundError, match="Config file not found"):
+        Config.load(str(missing))
+
+
 def test_config_malformed_default_does_not_crash(tmp_path, monkeypatch):
     """A malformed default config is warned about, not crashed on — fall back
     to built-in defaults rather than preventing startup."""

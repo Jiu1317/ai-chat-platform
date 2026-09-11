@@ -292,10 +292,16 @@ test("systemd and the updater preserve the bridge graceful-stop window", async (
   );
   const daemonReload = update.indexOf("systemctl daemon-reload", installUnit);
   const stopWebsite = update.indexOf("systemctl stop ai-chat.service", daemonReload);
-  const restartBridge = update.indexOf("systemctl restart ai-chat-image-bridge.service", stopWebsite);
+  const stopBridge = update.indexOf("systemctl stop ai-chat-image-bridge.service", stopWebsite);
+  const copyBridge = update.indexOf('"${project_root}/services/image-bridge/"', stopBridge);
+  const startBridge = update.indexOf("systemctl start ai-chat-image-bridge.service", copyBridge);
+  const startWebsite = update.indexOf("systemctl start ai-chat.service", startBridge);
   assert.ok(installUnit >= 0);
   assert.ok(installUnit < daemonReload);
   assert.ok(daemonReload < stopWebsite);
-  assert.ok(daemonReload < restartBridge);
+  assert.ok(stopWebsite < stopBridge);
+  assert.ok(stopBridge < copyBridge);
+  assert.ok(copyBridge < startBridge);
+  assert.ok(startBridge < startWebsite);
   assert.match(update, /systemctl start ai-chat-image-bridge\.service \|\| true/);
 });
