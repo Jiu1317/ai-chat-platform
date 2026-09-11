@@ -1,0 +1,21 @@
+{
+  "host": "127.0.0.1",
+  "port": 9182,
+  "cdp_port": 9325,
+  "chrome_path": "auto",
+  "user_data_dir": "~/.ai-chat/chrome-profile",
+  "headless": false,
+  "default_model": "gpt-5-5",
+  "tab_mode": "owned",
+  "parallel_tabs": true,
+  "api_keys": [
+    "CHANGE_ME_TO_A_LONG_RANDOM_VALUE"
+  ],
+  "request_timeout": 420,
+  "detector_reasoning_first_content_timeout_seconds": 300,
+  "detector_reasoning_stream_idle_timeout_seconds": 120,
+  "detector_default_first_content_timeout_seconds": 90,
+  "detector_default_stream_idle_timeout_seconds": 90,
+  "detector_hard_timeout_seconds": 900,
+  "log_level": "INFO"
+}

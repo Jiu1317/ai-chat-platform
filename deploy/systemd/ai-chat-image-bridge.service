@@ -1,0 +1,19 @@
+[Unit]
+Description=AI Chat image generation bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ai-chat
+Group=ai-chat
+WorkingDirectory=/srv/ai-chat/current/services/image-bridge
+EnvironmentFile=/etc/ai-chat/image-bridge.env
+ExecStart=/usr/bin/node /srv/ai-chat/current/services/image-bridge/image-bridge.mjs
+Restart=on-failure
+RestartSec=3
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

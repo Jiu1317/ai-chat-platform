@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">AI Chat</string>
+    <!-- Replace both example values with the host used by your own deployment. -->
+    <string name="home_url" translatable="false">https://chat.example.com/</string>
+    <string name="allowed_host" translatable="false">chat.example.com</string>
+    <string name="offline_icon">☁</string>
+    <string name="offline_title">暂时无法连接</string>
+    <string name="offline_message">请检查网络后重试。</string>
+    <string name="offline_message_with_detail">%1$s\n%2$s</string>
+    <string name="http_error">HTTP %1$d</string>
+    <string name="https_error">HTTPS 证书校验失败</string>
+    <string name="retry">重新加载</string>
+    <string name="download_started">已开始下载</string>
+    <string name="download_saved">文件已保存到下载目录</string>
+    <string name="download_failed">下载失败</string>
+    <string name="no_app">没有找到可以打开此链接的应用</string>
+</resources>

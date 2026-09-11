@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#ffffff">
+  <meta name="robots" content="noindex,nofollow">
+  <title>访问 AI Chat</title>
+  <link rel="icon" href="/static/favicon.ico?v=2" sizes="any">
+  <link rel="icon" href="/static/app-icon-64.png?v=2" type="image/png" sizes="64x64">
+  <link rel="apple-touch-icon" href="/static/apple-touch-icon-180.png?v=2" sizes="180x180">
+  <link rel="stylesheet" href="/static/styles.css?v=32">
+</head>
+<body class="login-page">
+  <main class="login-shell">
+    <section class="login-panel" aria-labelledby="login-title">
+      <div class="wordmark"><img src="/static/app-icon-64.png?v=2" width="30" height="30" alt="">AI Chat</div>
+      <div>
+        <h1 id="login-title">进入你的私人 AI 空间</h1>
+        <p>使用分配给你的账户登录。你的聊天、项目和文件与其他账户完全隔离。</p>
+      </div>
+      <form method="post" action="/login">
+        <label for="username">用户名</label>
+        <input id="username" name="username" type="text" value="{{ username }}" maxlength="32" autocomplete="username" autocapitalize="none" spellcheck="false" required autofocus>
+        <label for="password">密码</label>
+        <input id="password" name="password" type="password" maxlength="128" autocomplete="current-password" required>
+        {% if error %}<p class="form-error" role="alert">{{ error }}</p>{% endif %}
+        <button class="primary-button" type="submit">进入网站</button>
+      </form>
+      <p class="login-footnote">网站管理员负责配置可用模型。本站不会读取你的 ChatGPT 密码。</p>
+    </section>
+  </main>
+</body>
+</html>

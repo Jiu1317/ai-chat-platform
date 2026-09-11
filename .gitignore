@@ -1,0 +1,48 @@
+# Secrets and live configuration
+.env
+*.env
+!*.env.example
+**/web2api-config.json
+**/cloudflared-config.yml
+**/*credentials*.json
+**/*token*.json
+**/*cookies*.txt
+**/.auth_token
+
+# User content and account data
+**/data/
+**/workspaces/
+**/uploads/
+**/backups/
+**/releases/
+**/*.sqlite
+**/*.sqlite3
+**/*.db
+**/.openclaw/
+**/.codex/
+**/.chrome-profile/
+**/chrome-profile/
+
+# Runtime files
+**/.venv/
+**/.test-venv/
+**/venv/
+**/__pycache__/
+**/*.py[cod]
+**/*.log
+**/*.pid
+**/*processes.json
+**/.dual-tab-watchdog-paused
+.pytest_cache/
+.ruff_cache/
+node_modules/
+dist/
+build/
+
+# Local packages and archives
+*.zip
+*.tar
+*.tar.gz
+*.7z
+*.apk
+*.ipa

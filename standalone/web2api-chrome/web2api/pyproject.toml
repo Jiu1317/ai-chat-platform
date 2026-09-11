@@ -1,0 +1,84 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "chatgpt-web2api"
+version = "0.2.0"
+description = "OpenAI-compatible API proxy and MCP server for ChatGPT web — drives Chrome via CDP"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    {name = "Elephant Rock Lab"},
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Internet :: WWW/HTTP",
+]
+keywords = ["chatgpt", "openai", "mcp", "cdp", "proxy", "api"]
+dependencies = [
+    "websockets>=12.0",
+    "aiohttp>=3.9",
+    # 1.26+: ServerSession.send_progress_notification is the real impl (the
+    # base Session has a no-op stub in older 1.x), and Server.request_context
+    # (contextvar-backed) exists. Cap at <2.0 pending a compat audit.
+    "mcp>=1.26,<2.0",
+    # Cross-platform file lock for serializing mutating ops across MCP/REST
+    # processes that share one Chrome tab.
+    "portalocker>=2.7",
+]
+
+[project.urls]
+Homepage = "https://github.com/Octo-Lex/ChatGPT-Web2API"
+Repository = "https://github.com/Octo-Lex/ChatGPT-Web2API"
+Issues = "https://github.com/Octo-Lex/ChatGPT-Web2API/issues"
+Changelog = "https://github.com/Elephant-Rock-Lab/ChatGPT-Web2API/blob/master/CHANGELOG.md"
+
+[project.scripts]
+chatgpt-web2api = "chatgpt_web2api.__main__:main"
+chatgpt-web2api-mcp = "chatgpt_web2api.mcp_server:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.6",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/chatgpt_web2api"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+# Starter set: pycodestyle errors, pyflakes, isort, pyupgrade. Bugbear (B)
+# is a valuable follow-up once the repo is green — it adds judgment-call
+# rules that create churn. E501 (line-length) is ignored: the codebase
+# consistently uses long descriptive strings/asserts and enforcing 100
+# everywhere is cosmetic noise. E402 (module-import-not-at-top) is ignored:
+# several modules deliberately defer imports to break circular dependencies.
+select = ["E", "F", "I", "UP"]
+ignore = ["E501", "E402"]
+
+[tool.ruff.lint.per-file-ignores]
+# ToolName uses str+Enum (pre-StrEnum idiom) — UP042 would force a refactor
+# of the enum's serialization; out of scope for a lint-gate commit.
+"src/chatgpt_web2api/mcp_server.py" = ["UP042"]
+# conftest redefines event_loop for pytest-asyncio — intentional fixture override.
+"tests/conftest.py" = ["F811"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "e2e: end-to-end tests against a real ChatGPT account (opt-in via W2A_E2E_RUN=1; mutates the account)",
+]

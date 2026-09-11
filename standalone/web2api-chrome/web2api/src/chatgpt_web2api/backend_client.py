@@ -1,0 +1,1101 @@
+"""Backend client — ChatGPT backend-api fetch helpers extracted from CDPDriver.
+
+Phase 5 PR1 extraction (no behavior change). Owns the method bodies that talk
+to ChatGPT's backend-api over HTTP via ``Runtime.evaluate``:
+
+  - token / session lifecycle (``_refresh_token``, ``ensure_token``, ``recover_auth``)
+  - conversation fetch (``_fetch_text_for_turn`` /
+    ``_fetch_end_turn_for_turn`` / ``_fetch_recent_conversation_projection``,
+    conversation-id resolution, ``_check_auth_in_raw``)
+  - backend-api read/mutate (models, projects, conversations, memories, gpts)
+
+The driver-reference collaborator seam: ``BackendClient`` holds a reference to
+its owning ``CDPDriver`` and reaches through it for the live CDP transport
+(``_js`` / ``_js_strict`` / ``_js_with_data`` / ``_js_with_data_strict``) and
+for shared mutable state (``_access_token``, ``_breakers``, ``_current_conv_id``,
+``_user_name``, ``_token_fetched_at``). None of that state migrates into this
+module — it stays on the driver so external attribute reads and test stubs keep
+working unchanged.
+
+Call-rule inside BackendClient method bodies:
+
+  transport calls:        self._driver._js_with_data_strict(...)
+                          self._driver._js_strict(...)
+  driver-owned state:     self._driver._access_token
+                          self._driver._breakers
+                          self._driver._current_conv_id
+  moved backend peers:    self.ensure_token(...)
+                          self._refresh_token(...)
+                          self._check_auth_in_raw(...)
+
+Internal backend-to-backend calls stay on ``self`` (not ``self._driver``) to
+avoid recursing through the driver delegator.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import logging
+import time
+
+from .breakers import BreakerKind
+from .multimodal import _download_remote_image
+
+logger = logging.getLogger(__name__)
+
+
+class _Transient404(Exception):
+    """Sentinel raised by ``_fetch_recent_conversation_projection`` on a backend 404.
+
+    Internal to this module — caught and swallowed by the
+    ``_fetch_text_for_turn`` / ``_fetch_end_turn_for_turn`` wrappers, so it
+    never escapes. The 404 is a transient race (conversation not yet
+    persisted immediately after a send), NOT an auth failure or persistent
+    backend fault, so it is deliberately not modeled as a breaker signal.
+    """
+
+
+# Re-check the access token if it's older than this. The observed ChatGPT
+# JWT has a ~10-day lifetime, so 1h is a conservative refresh interval: it
+# avoids unnecessary refetches on the happy path while guaranteeing a stale
+# token is refreshed well before its real expiry.
+#
+# Canonical home moved here from cdp_driver.py in Phase 5 PR1; cdp_driver
+# re-exports it for back-compat.
+TOKEN_TTL_SECONDS = 3600
+DIRECT_ASSET_DOWNLOAD_TIMEOUT_SECONDS = 45
+MAX_BROWSER_ASSET_BYTES = 30 * 1024 * 1024
+
+
+class BackendClient:
+    """Backend-api fetch helpers, composed by ``CDPDriver``.
+
+    Constructed once in ``CDPDriver.__init__`` and stored as
+    ``self._backend_client``. The driver keeps thin delegating methods for
+    every method here so its public/private API surface is byte-identical to
+    pre-extraction.
+    """
+
+    def __init__(self, driver) -> None:
+        self._driver = driver
+
+    # ── Token Management ──────────────────────────────────────
+
+    async def _refresh_token(self) -> None:
+        """Get a fresh access token from /api/auth/session, with retry.
+
+        The fetch can transiently return an empty accessToken when the page
+        hasn't fully settled (cold tab after createTarget, or a navigation in
+        flight). Retrying a few times with a short backoff lets the page catch
+        up rather than failing the whole connect/reconnect/ensure_token path.
+        This is the single chokepoint for all three callers, so the retry
+        covers startup and mid-session refresh alike.
+
+        On final failure raises the same RuntimeError every existing caller
+        already handles — error semantics are unchanged.
+        """
+        d = self._driver
+        last_error: Exception | None = None
+        for attempt in range(1, 4):
+            d._last_refresh_attempt_at = time.time()
+            try:
+                raw = await d._js(
+                    "(async () => {"
+                    "  const r = await fetch('/api/auth/session', {credentials:'include'});"
+                    "  const d = await r.json();"
+                    "  return JSON.stringify({token: d.accessToken || '', user: d.user?.name || ''});"
+                    "})()"
+                )
+                # _js may return a dict (CDP returnByValue parsed the JSON
+                # object) or a string (the JSON.stringify result). Handle both.
+                if isinstance(raw, dict):
+                    data = raw
+                elif isinstance(raw, str):
+                    data = json.loads(raw)
+                else:
+                    data = {"token": ""}
+                # Parse into locals FIRST. Only commit to instance state after
+                # a non-empty token is observed — a transient empty fetch (cold
+                # tab, navigation in flight, CDP blip) must not clobber a
+                # previously-valid token. The exception path already avoided
+                # clobbering; this closes the empty-SUCCESS path too. A real
+                # auth expiry surfaces as a typed 401 on the next backend call.
+                new_token = data.get("token", "")
+                new_user = data.get("user", "")
+                if new_token:
+                    d._access_token = new_token
+                    d._user_name = new_user
+                    d._token_fetched_at = time.time()
+                    logger.info(
+                        "Auth: %d chars, user: %s (attempt %d)",
+                        len(d._access_token),
+                        d._user_name,
+                        attempt,
+                    )
+                    return
+                last_error = RuntimeError("No access token — not logged into ChatGPT")
+            except Exception as e:
+                # JSON parse error, CDP blip, etc. — record and retry. Don't
+                # clobber a partial _access_token from a prior good fetch.
+                last_error = e
+            if attempt < 3:
+                await asyncio.sleep(0.5)
+        raise (
+            last_error if last_error else RuntimeError("No access token — not logged into ChatGPT")
+        )
+
+    async def ensure_token(self) -> str:
+        """Ensure a non-stale access token, refreshing if empty OR older than TTL.
+
+        Returns the token. The TTL guard (TOKEN_TTL_SECONDS) catches expiry
+        well before the real JWT lifetime; callers should invoke this before
+        any /backend-api/* fetch so a stale session surfaces as
+        AuthExpiredError (via ``_fetch_recent_conversation_projection`` and
+        the other /backend-api fetchers) rather than silent empty data.
+
+        Reaches ``_refresh_token`` through the driver delegator so test
+        monkeypatches of ``driver._refresh_token`` intercept. This is NOT
+        recursive: ``_refresh_token`` is a leaf that does not call
+        ``ensure_token``.
+        """
+        d = self._driver
+        stale = not d._access_token or time.time() - d._token_fetched_at > TOKEN_TTL_SECONDS
+        if stale:
+            await d._refresh_token()
+        return d._access_token
+
+    async def recover_auth(self) -> bool:
+        """Probe whether the ChatGPT session is valid again, and if so reset
+        the AUTH_EXPIRED breaker.
+
+        Called by the REST/MCP fail-fast preflight when AUTH_EXPIRED is the open
+        breaker — a user may have logged back in via the browser since the trip.
+        This refreshes the access token (a lightweight ``/api/auth/session``
+        fetch, NOT a chat send): a non-empty token means auth is restored, so we
+        reset the breaker and return True. A failure or empty token leaves the
+        breaker open and returns False (caller proceeds to fail-fast).
+
+        Does NOT touch ``record_success`` — auth recovery is an explicit
+        ``reset()``, matching the indefinite-auth semantics (auth is not a
+        rolling-window breaker).
+        """
+        d = self._driver
+        if d._breakers is None or not d._breakers.is_open(BreakerKind.AUTH_EXPIRED):
+            return True  # nothing to recover
+        try:
+            await d._refresh_token()
+        except Exception as e:
+            logger.info("Auth recovery probe failed: %s", e)
+            return False
+        # _refresh_token only returns on a non-empty token (it raises on failure).
+        logger.info("Auth recovered — resetting AUTH_EXPIRED breaker")
+        d._breakers.reset(BreakerKind.AUTH_EXPIRED)
+        return True
+
+    # ── Auth detection in raw responses ───────────────────────
+
+    def _check_auth_in_raw(self, raw: str) -> None:
+        """#20: Detect auth failure in raw response text and raise.
+
+        Most read methods' JS doesn't check r.ok or r.status — a 401 returns
+        the HTML login page body. This helper catches that case in Python so
+        a stale token surfaces as AuthExpiredError instead of empty data.
+        Called after _js_with_data_strict returns, before json.loads.
+        """
+        # Imported lazily to avoid a module-load circular dependency
+        # (cdp_driver imports backend_client at CDPDriver.__init__ time).
+        from .cdp_driver import AuthExpiredError
+
+        if not raw:
+            return
+        # Login pages contain these markers
+        lower = raw[:500].lower()
+        if "sign in" in lower and "chatgpt" in lower and "<html" in lower:
+            if self._driver._breakers:
+                self._driver._breakers.trip(
+                    BreakerKind.AUTH_EXPIRED, "login page returned instead of data"
+                )
+            raise AuthExpiredError("Session expired — read returned login page instead of data")
+
+    # ── Conversation fetch ────────────────────────────────────
+
+    async def _conversation_id_from_url(self) -> str:
+        """Parse the conversation id from the live tab's ``location.href``.
+
+        Returns ``""`` when the URL is not yet a conversation URL (e.g. still
+        on the composer/new-chat page before the first send resolves) or when
+        the JS evaluation fails. Best-effort — callers retry on empty.
+        """
+        from .cdp_driver import CDPJSError
+
+        try:
+            url = await self._driver._js_strict("window.location.href")
+        except (CDPJSError, TypeError):
+            return ""
+        if not url or "/c/" not in url:
+            return ""
+        conversation_id = url.split("/c/")[1].split("/")[0].split("?")[0]
+        # The current web client can expose a temporary client-side route.
+        # It is not accepted by /backend-api/conversation/{id}.
+        if conversation_id.startswith("WEB:"):
+            return ""
+        return conversation_id
+
+
+    async def _get_live_conversation_id_best_effort(self) -> str:
+        """Resolve the in-flight conversation id by cheapest available source.
+
+        Ordered for a new-chat poll loop where ``_current_conv_id`` is still
+        None (it is only set AFTER the loop, from the URL — see
+        ``send_and_stream``):
+
+        1. ``self._driver._current_conv_id`` — populated on continued
+           conversations (REST path) and after the first completed send.
+        2. ``location.href`` ``/c/{id}`` — available within ~1s of send, once
+           ChatGPT navigates to the new conversation.
+
+        Deliberately does NOT consult the conversation backend API: that is an
+        expensive fetch, and this helper is called every ~1s during polling.
+        Returns ``""`` if no source has a usable id yet.
+        """
+        if self._driver._current_conv_id:
+            return self._driver._current_conv_id
+        return await self._conversation_id_from_url()
+
+    # ── A2: Anchored turn-correlation fetchers ─────────────────
+    #
+    # The projection JS (``backend_projection.CONVERSATION_PROJECTION_JS``)
+    # fetches the conversation mapping and projects it to a compact skeleton
+    # schema; the pure-Python selectors (``turn_anchor.select_*``) correlate
+    # against the anchor captured by the driver/IdentityListener.
+    #
+    # Status-decode convention: 401 → AuthExpiredError+trip, 404 →
+    # _Transient404 (transient race, swallowed by the wrappers below),
+    # other non-OK → RuntimeError, transport failure → fetch_failed status.
+
+    async def _fetch_recent_conversation_projection(
+        self, conversation_id: str
+    ) -> dict:
+        """Fetch and project the recent conversation mapping.
+
+        Executes ``CONVERSATION_PROJECTION_JS`` via the driver's
+        ``_js_with_data_strict``. Returns the projected dict
+        (``{"nodes": {...}, "current_node": ...}``). Raises ``AuthExpiredError``
+        on 401 (with breaker trip), ``_Transient404`` on 404, ``RuntimeError``
+        on other non-OK status, and ``CDPJSError`` on transport failure.
+        """
+        from .backend_projection import CONVERSATION_PROJECTION_JS, TURN_PROJECTION_LIMIT
+        from .cdp_driver import AuthExpiredError, CDPJSError
+
+        d = self._driver
+        await self._driver.ensure_token()
+        raw = await d._js_with_data_strict(
+            CONVERSATION_PROJECTION_JS,
+            {
+                "conv_id": conversation_id,
+                "token": d._access_token,
+                "limit": TURN_PROJECTION_LIMIT,
+            },
+            timeout=15,
+        )
+        if not raw:
+            raise CDPJSError("projection returned empty")
+        # Status-decode (the ``__status`` blob shape).
+        if raw.startswith('{"__status"') or raw.startswith('{ "__status"'):
+            try:
+                payload = json.loads(raw)
+                status = payload.get("__status")
+            except (json.JSONDecodeError, TypeError):
+                status = None
+            if status == 401:
+                if d._breakers:
+                    d._breakers.trip(BreakerKind.AUTH_EXPIRED, "HTTP 401 from backend-api")
+                raise AuthExpiredError()
+            if status == 404:
+                raise _Transient404(conversation_id)
+            if status is not None:
+                raise RuntimeError(f"projection HTTP {status} for {conversation_id}")
+        # Decode projection JS errors (the JS catches exceptions and returns
+        # {"__error": "..."}). Without this, a projection error would reach
+        # the selector as an empty mapping → not_ready → the detector would
+        # NOT unlock DOM fallback → reconciliation timeout instead of
+        # fetch_failed. (PR #39 review finding #1.)
+        if raw.startswith('{"__error"') or raw.startswith('{ "__error"'):
+            try:
+                payload = json.loads(raw)
+                err_msg = payload.get("__error", "unknown projection error")
+            except (json.JSONDecodeError, TypeError):
+                err_msg = "projection returned unparseable error blob"
+            raise CDPJSError(f"projection JS error for {conversation_id}: {err_msg}")
+        # Parse the projected mapping.
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, TypeError) as e:
+            raise CDPJSError(f"projection returned unparseable JSON: {e}") from e
+
+    async def _fetch_text_for_turn(
+        self, conversation_id: str, anchor
+    ):
+        """Anchored final-text fetch for one turn.
+
+        Fetches the projected mapping and runs ``select_text_for_turn`` to
+        resolve the terminal assistant text for the submitted turn. Returns a
+        ``TurnTextResult`` with rich status for diagnostics.
+
+        Transport failures map to ``fetch_failed`` (caller keeps polling);
+        auth failures propagate as ``AuthExpiredError`` (never degrades).
+        """
+        from .cdp_driver import AuthExpiredError, CDPJSError
+        from .turn_anchor import TurnTextResult, select_text_for_turn
+
+        try:
+            mapping = await self._fetch_recent_conversation_projection(conversation_id)
+            return select_text_for_turn(mapping, anchor)
+        except AuthExpiredError:
+            raise  # hard fail — never degrade on auth
+        except _Transient404:
+            # Transient race — mapping not yet propagated. Treat as not_ready.
+            return TurnTextResult("not_ready", diagnostic={"reason": "transient_404"})
+        except (CDPJSError, RuntimeError) as e:
+            # Transport/backend failure — caller keeps polling.
+            return TurnTextResult("fetch_failed", diagnostic={"error": str(e)})
+
+    async def _fetch_end_turn_for_turn(
+        self, conversation_id: str, anchor, *, had_non_text_content: bool
+    ):
+        """Anchored completion-status fetch for one turn.
+
+        Returns a ``TurnEndResult`` with internal status. The caller (detector)
+        collapses to tri-state via ``collapse_to_end_turn_status``.
+
+        ``had_non_text_content`` is the DOM-derived flag passed IN so the
+        content-guard decision lives in the selector where the correlated
+        node identity is known (ChatGPT round 4 refinement).
+        """
+        from .cdp_driver import AuthExpiredError, CDPJSError
+        from .turn_anchor import TurnEndResult, select_end_turn_for_turn
+
+        try:
+            mapping = await self._fetch_recent_conversation_projection(conversation_id)
+            return select_end_turn_for_turn(
+                mapping, anchor, had_non_text_content=had_non_text_content
+            )
+        except AuthExpiredError:
+            raise  # hard fail — never degrade on auth
+        except _Transient404:
+            return TurnEndResult("not_ready", diagnostic={"reason": "transient_404"})
+        except (CDPJSError, RuntimeError) as e:
+            return TurnEndResult("fetch_failed", diagnostic={"error": str(e)})
+
+    # ── Backend API: Models & Projects ─────────────────────────
+
+    async def get_models(self) -> list[dict]:
+        """List available models.
+
+        The ChatGPT API returns ``{"title":..., "models":[{"slug":..., ...}]}``
+        as a JSON string. Parse it and return just the models array so callers
+        get the ``list[dict]`` the signature promises (each with ``slug`` and
+        ``title``). Earlier this returned the raw string, which made
+        ``do_list_models`` crash on ``m.get('slug')`` — only live testing
+        caught it, since the mocked unit tests returned dicts.
+        """
+        from .cdp_driver import CDPJSError
+
+        d = self._driver
+        await self._driver.ensure_token()
+        try:
+            raw = await d._js_with_data_strict(
+                "(async () => {"
+                "  var r = await fetch('/backend-api/models?iim=false&is_gizmo=false', {"
+                "    headers: {'Authorization': 'Bearer ' + __D.token}"
+                "  });"
+                "  return await r.text();"
+                "})()",
+                {"token": d._access_token},
+            )
+            self._check_auth_in_raw(raw)
+            data = json.loads(raw)
+        except (CDPJSError, json.JSONDecodeError, TypeError) as e:
+            logger.warning("get_models failed: %s", e)
+            return []
+        if isinstance(data, dict):
+            return data.get("models", [])
+        if isinstance(data, list):
+            return data
+        return []
+
+    async def get_projects(self) -> list[dict]:
+        d = self._driver
+        from .cdp_driver import CDPJSError
+
+        await self._driver.ensure_token()
+        try:
+            raw = await d._js_with_data_strict(
+                "(async () => {"
+                "  var r = await fetch('/backend-api/gizmos/snorlax/sidebar?owned_only=true&conversations_per_gizmo=5&limit=50', {"
+                "    headers: {'Authorization': 'Bearer ' + __D.token}"
+                "  });"
+                "  var data = await r.json();"
+                "  return JSON.stringify((data.items || []).map(function(i) {"
+                "    var g = (i.gizmo || {}).gizmo || {};"
+                "    return {id: g.id, name: (g.display || {}).name || '', memory_scope: g.memory_scope || '', short_url: g.short_url || ''};"
+                "  }));"
+                "})()",
+                {"token": d._access_token},
+            )
+            self._check_auth_in_raw(raw)
+            return json.loads(raw)
+        except (CDPJSError, json.JSONDecodeError) as e:
+            logger.warning("get_projects failed: %s", e)
+            return []
+    async def download_response_asset(self, asset: dict) -> dict:
+        """Download a model-generated file through the authenticated page."""
+        await self._driver.ensure_token()
+        file_id = str(asset.get("file_id") or "")
+        source_url = str(asset.get("source_url") or "")
+        if not file_id and not source_url:
+            raise ValueError("Asset has no file id or source URL")
+        try:
+            resolved = await self._resolve_response_asset_url(asset)
+            data, content_type, _ = await asyncio.wait_for(
+                _download_remote_image(resolved["url"]),
+                timeout=DIRECT_ASSET_DOWNLOAD_TIMEOUT_SECONDS,
+            )
+            return {
+                "data": data,
+                "content_type": content_type,
+                "content_disposition": "",
+                "filename": resolved.get("filename") or asset.get("name") or "",
+            }
+        except Exception as exc:
+            logger.info("Direct binary asset download unavailable; using browser fallback: %s", exc)
+        return await self._download_response_asset_via_browser(asset)
+
+    async def _resolve_response_asset_url(self, asset: dict) -> dict:
+        """Resolve an authenticated file id to a short-lived public CDN URL."""
+        d = self._driver
+        source_url = str(asset.get("source_url") or "")
+        if source_url and not source_url.startswith(
+            ("https://chatgpt.com/", "https://chat.openai.com/")
+        ):
+            return {"url": source_url, "filename": asset.get("name") or ""}
+        raw = await d._js_with_data_strict(
+            "(async () => {"
+            " var url=__D.source_url || ('/backend-api/files/' + encodeURIComponent(__D.file_id) + '/download');"
+            " var opts={};"
+            " if(url.startsWith(location.origin) || url.startsWith('/'))"
+            "   opts.headers={'Authorization':'Bearer ' + __D.token};"
+            " var r=await fetch(url,opts);"
+            " if(!r.ok)return JSON.stringify({status:r.status,error:'download resolution failed'});"
+            " var responseType=(r.headers.get('content-type')||'').toLowerCase();"
+            " if(responseType.includes('application/json')){"
+            "   var meta=await r.json();"
+            "   if(!meta.download_url)return JSON.stringify({status:502,error:'no download url'});"
+            "   return JSON.stringify({status:200,url:meta.download_url,filename:meta.file_name||''});"
+            " }"
+            " return JSON.stringify({status:200,url:r.url,filename:''});"
+            "})()",
+            {
+                "token": d._access_token,
+                "file_id": str(asset.get("file_id") or ""),
+                "source_url": source_url,
+            },
+            timeout=30,
+        )
+        self._check_auth_in_raw(raw)
+        payload = json.loads(raw)
+        url = str(payload.get("url") or "")
+        if payload.get("status") != 200 or not url.startswith(("http://", "https://")):
+            raise RuntimeError(
+                f"ChatGPT asset URL resolution failed (HTTP {payload.get('status', 'unknown')})"
+            )
+        return {"url": url, "filename": payload.get("filename") or ""}
+
+    async def _download_response_asset_via_browser(self, asset: dict) -> dict:
+        """Compatibility path for assets that cannot be fetched from their signed URL."""
+        d = self._driver
+        file_id = str(asset.get("file_id") or "")
+        source_url = str(asset.get("source_url") or "")
+        raw = await d._js_with_data_strict(
+            "(async () => {"
+            " var url=__D.source_url || ('/backend-api/files/' + encodeURIComponent(__D.file_id) + '/download');"
+            " var opts={};"
+            " if(!__D.source_url || url.startsWith(location.origin) || url.startsWith('/'))"
+            "   opts.headers={'Authorization':'Bearer ' + __D.token};"
+            " var r=await fetch(url,opts),filename='';"
+            " if(!r.ok)return JSON.stringify({status:r.status,error:'download failed'});"
+            " var responseType=(r.headers.get('content-type')||'').toLowerCase();"
+            " if(responseType.includes('application/json')){"
+            "   var meta=await r.json();"
+            "   if(!meta.download_url)return JSON.stringify({status:502,error:'no download url'});"
+            "   filename=meta.file_name||'';r=await fetch(meta.download_url);"
+            "   if(!r.ok)return JSON.stringify({status:r.status,error:'signed download failed'});"
+            " }"
+            " var b=await r.arrayBuffer();"
+            f" if(b.byteLength>{MAX_BROWSER_ASSET_BYTES})"
+            "return JSON.stringify({status:413,error:'asset too large'});"
+            " var u=new Uint8Array(b),chunks=[];"
+            " for(var i=0;i<u.length;i+=32768)"
+            "   chunks.push(String.fromCharCode.apply(null,u.subarray(i,i+32768)));"
+            " return JSON.stringify({status:200,content_type:r.headers.get('content-type')||"
+            "   __D.mime_type||'application/octet-stream',disposition:"
+            "   r.headers.get('content-disposition')||'',filename:filename,data:btoa(chunks.join(''))});"
+            "})()",
+            {
+                "token": d._access_token,
+                "file_id": file_id,
+                "source_url": source_url,
+                "mime_type": asset.get("mime_type") or "",
+            },
+            timeout=90,
+        )
+        self._check_auth_in_raw(raw)
+        payload = json.loads(raw)
+        if payload.get("status") != 200 or not payload.get("data"):
+            raise RuntimeError(
+                f"ChatGPT asset download failed (HTTP {payload.get('status', 'unknown')})"
+            )
+        try:
+            data = base64.b64decode(payload["data"], validate=True)
+        except (ValueError, TypeError) as exc:
+            raise RuntimeError("ChatGPT returned invalid asset data") from exc
+        if len(data) > MAX_BROWSER_ASSET_BYTES:
+            raise RuntimeError("ChatGPT asset exceeds the 30 MiB limit")
+        return {
+            "data": data,
+            "content_type": payload.get("content_type") or "application/octet-stream",
+            "content_disposition": payload.get("disposition") or "",
+            "filename": payload.get("filename") or "",
+        }
+
+
+    # ── Conversation Management ──────────────────────────────
+
+    async def get_conversations(
+        self,
+        offset: int = 0,
+        limit: int = 28,
+        order: str = "updated",
+    ) -> list[dict]:
+        """List recent conversations."""
+        from .cdp_driver import CDPJSError
+
+        d = self._driver
+        await self._driver.ensure_token()
+        try:
+            raw = await d._js_with_data_strict(
+                "(async () => {"
+                "  var r = await fetch('/backend-api/conversations?offset=' + __D.offset + '&limit=' + __D.limit + '&order=' + __D.order, {"
+                "    headers: {'Authorization': 'Bearer ' + __D.token}"
+                "  });"
+                "  var data = await r.json();"
+                "  return JSON.stringify((data.items || []).map(function(c) {"
+                "    return {id: c.id, title: c.title || 'Untitled', "
+                "      update_time: c.update_time, create_time: c.create_time,"
+                "      is_archived: !!c.is_archived, gizmo_id: c.gizmo_id || null};"
+                "  }));"
+                "})()",
+                {
+                    "token": d._access_token,
+                    "offset": str(offset),
+                    "limit": str(limit),
+                    "order": order,
+                },
+            )
+            self._check_auth_in_raw(raw)
+            return json.loads(raw)
+        except (CDPJSError, json.JSONDecodeError) as e:
+            logger.warning("get_conversations failed: %s", e)
+            return []
+
+    async def get_conversation(self, conversation_id: str) -> dict:
+        """Get full conversation detail with message mapping."""
+        from .cdp_driver import CDPJSError
+
+        d = self._driver
+        await self._driver.ensure_token()
+        try:
+            raw = await d._js_with_data_strict(
+                "(async () => {"
+                "  var r = await fetch('/backend-api/conversation/' + __D.conv_id, {"
+                "    headers: {'Authorization': 'Bearer ' + __D.token}"
+                "  });"
+                "  return await r.text();"
+                "})()",
+                {"conv_id": conversation_id, "token": d._access_token},
+                timeout=30,
+            )
+            self._check_auth_in_raw(raw)
+            return json.loads(raw)
+        except (CDPJSError, json.JSONDecodeError) as e:
+            logger.warning("get_conversation failed: %s", e)
+            return {}
+
+    async def delete_conversation(self, conversation_id: str) -> bool:
+        """Delete a conversation. Returns True on success."""
+        from .cdp_driver import CDPJSError
+
+        d = self._driver
+        await self._driver.ensure_token()
+        try:
+            result = await d._js_with_data_strict(
+                "(async () => {"
+                "  try {"
+                "    var r = await fetch('/backend-api/conversation/' + __D.conv_id, {"
+                "      method: 'PATCH',"
+                "      headers: {'Authorization': 'Bearer ' + __D.token, 'Content-Type': 'application/json'},"
+                "      body: JSON.stringify({is_visible: false})"
+                "    });"
+                "    return r.ok ? 'true' : 'false';"
+                "  } catch(e) { return 'error:' + e.message; }"
+                "})()",
+                {"conv_id": conversation_id, "token": d._access_token},
+            )
+        except CDPJSError as e:
+            logger.warning("delete_conversation JS failed: %s", e)
+            result = "false"
+        if result == "true":
+            logger.info("Deleted conversation: %s", conversation_id)
+            if d._current_conv_id == conversation_id:
+                d._current_conv_id = None
+            return True
+        logger.warning("Failed to delete conversation %s: %s", conversation_id, result)
+        return False
+
+    async def rename_conversation(self, conversation_id: str, title: str) -> bool:
+        """Rename a conversation. Returns True on success."""
+        from .cdp_driver import CDPJSError
+
+        d = self._driver
+        await self._driver.ensure_token()
+        try:
+            result = await d._js_with_data_strict(
+                "(async () => {"
+                "  try {"
+                "    var r = await fetch('/backend-api/conversation/' + __D.conv_id, {"
+                "      method: 'PATCH',"
+                "      headers: {'Authorization': 'Bearer ' + __D.token, 'Content-Type': 'application/json'},"
+                "      body: JSON.stringify({title: __D.title})"
+                "    });"
+                "    return r.ok ? 'true' : 'false';"
+                "  } catch(e) { return 'error:' + e.message; }"
+                "})()",
+                {"conv_id": conversation_id, "token": d._access_token, "title": title},
+            )
+        except CDPJSError as e:
+            logger.warning("rename_conversation JS failed: %s", e)
+            result = "false"
+        if result == "true":
+            logger.info("Renamed conversation %s to: %s", conversation_id, title)
+            return True
+        logger.warning("Failed to rename conversation: %s", result)
+        return False
+
+    # ── Project Management ────────────────────────────────────
+
+    async def create_project(
+        self,
+        name: str,
+        instructions: str = "",
+        memory_scope: str = "project_v2",
+    ) -> dict:
+        """Create a new ChatGPT project.
+
+        Args:
+            name: Project display name
+            instructions: Custom instructions for the project
+            memory_scope: 'project_v2' (Project-only — isolated memory, the
+                dedicated scope) or 'global' (Default — shares memory with
+                outside chats, mapped to the API's 'unset' value).
+
+        Returns:
+            Created project dict with id (g-p-...), name, memory_scope, etc.
+
+        Note: Projects and Custom GPTs are now separate endpoints. Projects
+        live at ``/backend-api/projects`` and create a ``snorlax`` gizmo (id
+        prefix ``g-p-``); the legacy ``/backend-api/gizmos`` endpoint creates a
+        ``gpt`` gizmo instead. The payload + endpoint here were captured from
+        ChatGPT's own UI via browser automation (Super-Browser network capture).
+        """
+        # The UI sends "unset" for the Default (shared) memory option and
+        # "project_v2" for Project-only. Map our public values accordingly.
+        api_memory_scope = "project_v2" if memory_scope == "project_v2" else "unset"
+        d = self._driver
+        await self._driver.ensure_token()
+        raw = await d._js_with_data(
+            "(async () => {"
+            "  try {"
+            "    var body = {"
+            "      name: __D.name,"
+            "      instructions: __D.instructions,"
+            "      memory_scope: __D.api_memory_scope"
+            "    };"
+            "    var r = await fetch('/backend-api/projects', {"
+            "      method: 'POST',"
+            "      headers: {'Authorization': 'Bearer ' + __D.token, 'Content-Type': 'application/json'},"
+            "      body: JSON.stringify(body)"
+            "    });"
+            "    if (!r.ok) return JSON.stringify({error: 'HTTP ' + r.status, body: await r.text()});"
+            "    var data = await r.json();"
+            "    var g = ((data.resource || {}).gizmo) || data.gizmo || data;"
+            "    return JSON.stringify({"
+            "      id: g.id,"
+            "      name: (g.display || {}).name || '',"
+            "      memory_scope: g.memory_scope || '',"
+            "      instructions: g.instructions || '',"
+            "      gizmo_type: g.gizmo_type || ''"
+            "    });"
+            "  } catch(e) { return JSON.stringify({error: e.message}); }"
+            "})()",
+            {
+                "token": d._access_token,
+                "name": name,
+                "instructions": instructions,
+                "api_memory_scope": api_memory_scope,
+            },
+            timeout=20,
+        )
+        try:
+            self._check_auth_in_raw(raw)
+            result = json.loads(raw)
+            if "error" in result:
+                logger.error("Create project failed: %s", result["error"])
+                return result
+            logger.info("Created project: %s (%s)", result.get("name"), result.get("id"))
+            return result
+        except json.JSONDecodeError:
+            return {"error": "Invalid response"}
+
+    async def update_project_instructions(
+        self,
+        project_id: str,
+        instructions: str,
+    ) -> bool:
+        """Update a project's custom instructions. Returns True on success.
+
+        Projects are mutated via PATCH /backend-api/projects/{id} with a flat
+        body. The API requires the current ``name`` in the body (it's a full
+        project-shape PATCH, not a partial), so we fetch the project's name
+        first and include it alongside the new instructions. Captured from
+        ChatGPT's own UI via Super-Browser network capture.
+        """
+        from .cdp_driver import CDPJSError
+
+        d = self._driver
+        await self._driver.ensure_token()
+        try:
+            result = await d._js_with_data_strict(
+                "(async () => {"
+                "  try {"
+                "    var r0 = await fetch('/backend-api/gizmos/' + __D.project_id, {"
+                "      headers: {'Authorization': 'Bearer ' + __D.token}"
+                "    });"
+                "    var d0 = await r0.json();"
+                "    var g0 = d0.gizmo || d0;"
+                "    var name = ((g0.display) || {}).name || '';"
+                "    var emoji = ((g0.display) || {}).emoji || null;"
+                "    var theme = ((g0.display) || {}).theme || null;"
+                "    var body = {name: name, instructions: __D.instructions, emoji: emoji, theme: theme};"
+                "    var r = await fetch('/backend-api/projects/' + __D.project_id, {"
+                "      method: 'PATCH',"
+                "      headers: {'Authorization': 'Bearer ' + __D.token, 'Content-Type': 'application/json'},"
+                "      body: JSON.stringify(body)"
+                "    });"
+                "    return r.ok ? 'true' : 'false';"
+                "  } catch(e) { return 'error:' + e.message; }"
+                "})()",
+                {
+                    "token": d._access_token,
+                    "project_id": project_id,
+                    "instructions": instructions,
+                },
+                timeout=20,
+            )
+        except CDPJSError as e:
+            logger.warning("update_project_instructions JS failed: %s", e)
+            result = "false"
+        if result == "true":
+            logger.info("Updated instructions for project: %s", project_id)
+            return True
+        logger.warning("Failed to update project instructions: %s", result)
+        return False
+
+    async def get_project_detail(self, project_id: str) -> dict:
+        """Get full project/gizmo detail."""
+        d = self._driver
+        raw = await d._js_with_data(
+            "(async () => {"
+            "  var r = await fetch('/backend-api/gizmos/' + __D.project_id, {"
+            "    headers: {'Authorization': 'Bearer ' + __D.token}"
+            "  });"
+            "  return await r.text();"
+            "})()",
+            {"token": d._access_token, "project_id": project_id},
+            timeout=15,
+        )
+        try:
+            self._check_auth_in_raw(raw)
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+
+    # ── Archive Conversation ────────────────────────────────
+
+    async def archive_conversation(self, conversation_id: str, archive: bool = True) -> bool:
+        """Archive or unarchive a conversation. Returns True on success."""
+        from .cdp_driver import CDPJSError
+
+        d = self._driver
+        await self._driver.ensure_token()
+        try:
+            result = await d._js_with_data_strict(
+                "(async () => {"
+                "  try {"
+                "    var r = await fetch('/backend-api/conversation/' + __D.conv_id, {"
+                "      method: 'PATCH',"
+                "      headers: {'Authorization': 'Bearer ' + __D.token, 'Content-Type': 'application/json'},"
+                "      body: JSON.stringify({is_archived: __D.archive})"
+                "    });"
+                "    return r.ok ? 'true' : 'false';"
+                "  } catch(e) { return 'error:' + e.message; }"
+                "})()",
+                {"conv_id": conversation_id, "token": d._access_token, "archive": archive},
+            )
+        except CDPJSError as e:
+            logger.warning("archive_conversation JS failed: %s", e)
+            result = "false"
+        if result == "true":
+            logger.info(
+                "%s conversation: %s", "Archived" if archive else "Unarchived", conversation_id
+            )
+            return True
+        logger.warning("Failed to archive conversation: %s", result)
+        return False
+
+    # ── Memory Management ─────────────────────────────────────
+
+    async def get_memories(self) -> list[dict]:
+        """List all ChatGPT memories."""
+        from .cdp_driver import CDPJSError
+
+        d = self._driver
+        await self._driver.ensure_token()
+        try:
+            raw = await d._js_with_data_strict(
+                "(async () => {"
+                "  try {"
+                "    var r = await fetch('/backend-api/memories', {"
+                "      headers: {'Authorization': 'Bearer ' + __D.token}"
+                "    });"
+                "    if (!r.ok) return JSON.stringify({error: 'HTTP ' + r.status});"
+                "    var data = await r.json();"
+                "    return JSON.stringify(data);"
+                "  } catch(e) { return JSON.stringify({error: e.message}); }"
+                "})()",
+                {"token": d._access_token},
+                timeout=15,
+            )
+            self._check_auth_in_raw(raw)
+            data = json.loads(raw)
+            if isinstance(data, dict) and "error" in data:
+                logger.error("Get memories failed: %s", data["error"])
+                return []
+            if isinstance(data, list):
+                return data
+            for key in ("memories", "items", "data"):
+                if key in data and isinstance(data[key], list):
+                    return data[key]
+            return []
+        except (CDPJSError, json.JSONDecodeError) as e:
+            logger.warning("get_memories failed: %s", e)
+            return []
+
+    async def create_memory(self, content: str) -> dict:
+        """Create a memory by sending a chat message asking ChatGPT to remember.
+
+        The POST /backend-api/memories endpoint returns 405 — ChatGPT only
+        creates memories through conversation. This method sends a message
+        asking ChatGPT to remember the content, which triggers the memory
+        system automatically.
+
+        Note: ``navigate_new_chat`` and ``send_and_stream`` are driver-owned
+        (DOM/send concerns, not backend-fetch concerns), so they are reached
+        through the driver reference rather than as moved peers.
+        """
+        d = self._driver
+        memory_prompt = f"Please remember this for all future conversations: {content}"
+
+        # Navigate to a fresh chat for memory creation
+        await d.navigate_new_chat()
+
+        # Send and collect the response
+        full_response = ""
+        async for chunk in d.send_and_stream(memory_prompt, timeout=60):
+            if chunk.delta:
+                full_response += chunk.delta
+
+        conv_id = d._current_conv_id or ""
+
+        logger.info("Memory creation request sent via chat (conv: %s)", conv_id)
+
+        # #17: Check if the memory was actually created by looking for it
+        # in the memories list. ChatGPT may refuse or paraphrase — without
+        # this check the caller can't tell success from failure.
+        memory_created = False
+        try:
+            memories = await d.get_memories()
+            memory_created = any(
+                content[:30].lower() in (m.get("content", "")[:50].lower()) for m in memories
+            )
+        except Exception:
+            pass  # best-effort verification
+
+        return {
+            "content": content,
+            "method": "chat",
+            "conversation_id": conv_id,
+            "response": full_response[:200],
+            "success": memory_created,
+            "note": (
+                "Memory creation happens via chat — ChatGPT may paraphrase "
+                "or decline. Verified via list_memories."
+            ),
+        }
+
+    async def delete_memory(self, memory_id: str) -> bool:
+        """Delete a ChatGPT memory by ID. Returns True on success."""
+        from .cdp_driver import CDPJSError
+
+        d = self._driver
+        await self._driver.ensure_token()
+        try:
+            result = await d._js_with_data_strict(
+                "(async () => {"
+                "  try {"
+                "    var r = await fetch('/backend-api/memories/' + __D.memory_id, {"
+                "      method: 'DELETE',"
+                "      headers: {'Authorization': 'Bearer ' + __D.token}"
+                "    });"
+                "    return r.ok ? 'true' : 'false';"
+                "  } catch(e) { return 'error:' + e.message; }"
+                "})()",
+                {"memory_id": memory_id, "token": d._access_token},
+                timeout=15,
+            )
+        except CDPJSError as e:
+            logger.warning("delete_memory JS failed: %s", e)
+            result = "false"
+        if result == "true":
+            logger.info("Deleted memory: %s", memory_id)
+            return True
+        logger.warning("Failed to delete memory %s: %s", memory_id, result)
+        return False
+
+    async def delete_project(self, project_id: str) -> dict:
+        """Delete a ChatGPT project by ID. Returns {success, project_id}.
+
+        Projects are deleted via DELETE /backend-api/gizmos/{id} (the gizmos
+        endpoint serves both Projects (g-p-) and Custom GPTs (g-) for deletion;
+        creation is split across /projects and /gizmos, but deletion is shared).
+        Verified to return 200 against a live account.
+        """
+        from .cdp_driver import CDPJSError
+
+        d = self._driver
+        await self._driver.ensure_token()
+        try:
+            result = await d._js_with_data_strict(
+                "(async () => {"
+                "  try {"
+                "    var r = await fetch('/backend-api/gizmos/' + __D.project_id, {"
+                "      method: 'DELETE',"
+                "      headers: {'Authorization': 'Bearer ' + __D.token}"
+                "    });"
+                "    return r.ok ? 'true' : 'false';"
+                "  } catch(e) { return 'error:' + e.message; }"
+                "})()",
+                {"project_id": project_id, "token": d._access_token},
+                timeout=15,
+            )
+        except CDPJSError as e:
+            logger.warning("delete_project JS failed: %s", e)
+            result = "false"
+        success = result == "true"
+        if success:
+            logger.info("Deleted project: %s", project_id)
+        else:
+            logger.warning("Failed to delete project %s: %s", project_id, result)
+        return {"success": success, "project_id": project_id}
+
+    # ── Custom GPTs ─────────────────────────────────────────
+
+    async def list_gpts(self) -> list[dict]:
+        """List Custom GPTs (non-project gizmos).
+
+        Projects (gizmo_type='snorlax') are excluded — use get_projects()
+        for those.  Only marketplace or user-created non-project GPTs
+        are returned.
+        """
+        from .cdp_driver import CDPJSError
+
+        d = self._driver
+        await self._driver.ensure_token()
+        try:
+            raw = await d._js_with_data_strict(
+                "(async () => {"
+                "  var r = await fetch('/backend-api/gizmos/snorlax/sidebar?owned_only=false&conversations_per_gizmo=0&limit=100', {"
+                "    headers: {'Authorization': 'Bearer ' + __D.token}"
+                "  });"
+                "  var data = await r.json();"
+                "  return JSON.stringify((data.items || []).map(function(i) {"
+                "    var g = (i.gizmo || {}).gizmo || {};"
+                "    if (g.gizmo_type === 'snorlax' && g.memory_scope) return null;"
+                "    return {id: g.id, name: (g.display || {}).name || '', "
+                "      description: (g.display || {}).description || '',"
+                "      gizmo_type: g.gizmo_type || ''};"
+                "  }).filter(Boolean));"
+                "})()",
+                {"token": d._access_token},
+                timeout=20,
+            )
+            self._check_auth_in_raw(raw)
+            return json.loads(raw)
+        except (CDPJSError, json.JSONDecodeError) as e:
+            logger.warning("list_gpts failed: %s", e)
+            return []
+
+    # ── Project Files ─────────────────────────────────────────
+
+    async def get_project_files(self, project_id: str) -> list[dict]:
+        """List files attached to a ChatGPT project."""
+        from .cdp_driver import CDPJSError
+
+        d = self._driver
+        await self._driver.ensure_token()
+        try:
+            raw = await d._js_with_data_strict(
+                "(async () => {"
+                "  try {"
+                "    var r = await fetch('/backend-api/gizmos/' + __D.project_id, {"
+                "      headers: {'Authorization': 'Bearer ' + __D.token}"
+                "    });"
+                "    if (!r.ok) return '[]';"
+                "    var data = await r.json();"
+                "    var gizmo = data.gizmo || data;"
+                "    var files = gizmo.files || [];"
+                "    return JSON.stringify(files.map(function(f) {"
+                "      return {id: f.id || '', name: f.file_name || f.name || '', "
+                "        size: f.size || 0, mime_type: f.mime_type || ''};"
+                "    }));"
+                "  } catch(e) { return '[]'; }"
+                "})()",
+                {"token": d._access_token, "project_id": project_id},
+                timeout=15,
+            )
+            self._check_auth_in_raw(raw)
+            return json.loads(raw)
+        except (CDPJSError, json.JSONDecodeError) as e:
+            logger.warning("get_project_files failed: %s", e)
+            return []

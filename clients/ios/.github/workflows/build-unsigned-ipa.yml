@@ -1,0 +1,37 @@
+name: Build unsigned iOS IPA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build app without signing
+        run: |
+          xcodebuild \
+            -project AIChat.xcodeproj \
+            -scheme AIChat \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath "$RUNNER_TEMP/AIDerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            clean build
+
+      - name: Package unsigned IPA
+        run: |
+          mkdir -p "$RUNNER_TEMP/Payload"
+          cp -R "$RUNNER_TEMP/AIDerivedData/Build/Products/Release-iphoneos/AIChat.app" "$RUNNER_TEMP/Payload/"
+          cd "$RUNNER_TEMP"
+          zip -qry "AI-Chat-iOS-v1.0.3-unsigned.ipa" Payload
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: AI-Chat-iOS-v1.0.3-unsigned
+          path: ${{ runner.temp }}/AI-Chat-iOS-v1.0.3-unsigned.ipa
+          if-no-files-found: error
