@@ -1812,7 +1812,7 @@ class CDPDriver:
             try:
                 raw_asset_ids = await self._js_strict(
                     "(function(){var seen={},ids=[];"
-                    "document.querySelectorAll('[data-testid^=\"conversation-turn-\"] img, section[data-turn=\"assistant\"] img').forEach(function(img){"
+                    "document.querySelectorAll('[data-message-author-role=\"assistant\"] img, section[data-turn=\"assistant\"] img').forEach(function(img){"
                     " var src=img.currentSrc||img.src||'';"
                     " if(src.indexOf('/backend-api/estuary/content')<0 && src.indexOf('/backend-api/files/')<0)return;"
                     " try{var u=new URL(src,location.href),id=u.searchParams.get('id')||u.pathname;"

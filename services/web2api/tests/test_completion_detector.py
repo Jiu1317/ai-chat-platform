@@ -731,6 +731,7 @@ async def test_expected_image_completes_from_new_lazy_asset_and_action_without_a
                         "identity": "file_new",
                         "source_url": "https://chatgpt.com/backend-api/estuary/content?id=file_new",
                         "loaded": False,
+                        "turnRole": "assistant",
                     }
                 ],
             })
@@ -773,6 +774,7 @@ async def test_expected_image_completes_from_new_loaded_estuary_asset():
                         "identity": "file_new",
                         "source_url": "https://chatgpt.com/backend-api/estuary/content?id=file_new",
                         "loaded": True,
+                        "turnRole": "assistant",
                     }
                 ],
             })
@@ -805,6 +807,61 @@ async def test_expected_image_completes_from_new_loaded_estuary_asset():
         "source_url": "https://chatgpt.com/backend-api/estuary/content?id=file_new",
     }]
     driver._fetch_end_turn_for_turn.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_image_probe_excludes_two_user_references_and_keeps_assistant_result():
+    """Two newly submitted references must not become generated outputs."""
+    detector, driver = _make_detector()
+
+    async def fake_js(expr):
+        assert '[data-testid^="conversation-turn-"] img' not in expr
+        assert '[data-message-author-role="assistant"] img' in expr
+        return json.dumps({
+            "generationActive": False,
+            "actionCount": 1,
+            "assets": [
+                {
+                    "identity": "file_reference_1",
+                    "source_url": "https://chatgpt.com/backend-api/estuary/content?id=file_reference_1",
+                    "loaded": True,
+                    "turnRole": "user",
+                },
+                {
+                    "identity": "file_reference_2",
+                    "source_url": "https://chatgpt.com/backend-api/estuary/content?id=file_reference_2",
+                    "loaded": True,
+                    "turnRole": "user",
+                },
+                {
+                    "identity": "file_generated",
+                    "source_url": "https://chatgpt.com/backend-api/estuary/content?id=file_generated",
+                    "loaded": True,
+                    "turnRole": "assistant",
+                },
+            ],
+        })
+
+    driver._js_strict = fake_js
+    state = await detector._probe_non_text_dom_state(driver)
+    new_assets, completed_assets, action_increased = (
+        detector._select_new_non_text_dom_assets(
+            state,
+            initial_action_count=0,
+            initial_asset_ids=(),
+        )
+    )
+
+    assert action_increased is True
+    assert [asset["identity"] for asset in new_assets] == ["file_generated"]
+    assert [asset["identity"] for asset in completed_assets] == ["file_generated"]
+    assert detector._format_non_text_dom_assets(completed_assets) == [{
+        "type": "image",
+        "name": "generated-image-1.png",
+        "mime_type": "image/png",
+        "file_id": "file_generated",
+        "source_url": "https://chatgpt.com/backend-api/estuary/content?id=file_generated",
+    }]
 
 
 # ── 5. Detector routes through self._driver (the seam) ───────────────

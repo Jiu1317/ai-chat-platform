@@ -656,17 +656,25 @@ class ExternalImageTransferTests(unittest.TestCase):
                 "content-type": "image/png",
                 "content-length": str(len(image_bytes)),
             }
+            active = False
 
             async def __aenter__(self):
+                self.active = True
                 return self
 
             async def __aexit__(self, *_args):
+                self.active = False
                 return False
 
             async def aiter_bytes(self, _chunk_size):
+                self.assert_response_open()
                 midpoint = len(image_bytes) // 2
                 yield image_bytes[:midpoint]
                 yield image_bytes[midpoint:]
+
+            def assert_response_open(self):
+                if not self.active:
+                    raise AssertionError("response body read after stream context closed")
 
         class FakeClient:
             def stream(self, *_args, **_kwargs):
@@ -693,6 +701,9 @@ class ExternalImageTransferTests(unittest.TestCase):
 
             saved = workspace / "outputs" / result["path"]
             self.assertEqual(saved.read_bytes(), image_bytes)
+            digest = app.hashlib.sha256(image_bytes).hexdigest()
+            self.assertEqual(result["path"], f"external-{digest}.png")
+            self.assertEqual(result["name"], f"generated-{digest[:10]}.png")
             self.assertEqual(result["mediaType"], "image/png")
             self.assertEqual((result["width"], result["height"]), (28, 20))
             self.assertNotIn("previewSize", result)
@@ -883,6 +894,98 @@ class ExternalImageTransferTests(unittest.TestCase):
         self.assertEqual(saved, [])
         self.assertEqual(failed, len(candidates))
         self.assertEqual(cancelled, 2)
+
+
+    def test_external_image_batch_deduplicates_content_and_preserves_candidate_order(self) -> None:
+        first_buffer = io.BytesIO()
+        second_buffer = io.BytesIO()
+        app.Image.new("RGB", (20, 12), "white").save(first_buffer, format="PNG")
+        app.Image.new("RGB", (20, 12), "black").save(second_buffer, format="PNG")
+        first_bytes = first_buffer.getvalue()
+        second_bytes = second_buffer.getvalue()
+        urls = [
+            f"https://provider.example/v1/assets/{index:024d}"
+            for index in range(3)
+        ]
+        candidates = [
+            {"url": urls[0], "name": "first.png"},
+            {"url": urls[1], "name": "second.png"},
+            {"url": urls[2], "name": "duplicate.png"},
+        ]
+        bodies = {
+            urls[0]: first_bytes,
+            urls[1]: second_bytes,
+            urls[2]: first_bytes,
+        }
+        delays = {urls[0]: 0.03, urls[1]: 0.01, urls[2]: 0.0}
+
+        class FakeResponse:
+            status_code = 200
+
+            def __init__(self, url: str):
+                self.body = bodies[url]
+                self.delay = delays[url]
+                self.headers = {
+                    "content-type": "image/png",
+                    "content-length": str(len(self.body)),
+                }
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def aiter_bytes(self, _chunk_size):
+                await asyncio.sleep(self.delay)
+                yield self.body
+
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            def stream(self, _method, url, **_kwargs):
+                return FakeResponse(url)
+
+        async def validate(url: str, _provider_base: str) -> str:
+            return url
+
+        with (
+            tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory,
+            patch.object(app.httpx, "AsyncClient", return_value=FakeClient()),
+            patch.object(app, "_validated_external_asset_url", new=validate),
+            patch.object(app, "_schedule_image_variants") as schedule_variants,
+        ):
+            workspace = Path(directory)
+            saved, failed = asyncio.run(
+                app._persist_external_images(
+                    candidates,
+                    "https://provider.example/v1",
+                    workspace,
+                )
+            )
+            output_root = workspace / "outputs"
+            output_files = sorted(
+                path for path in output_root.iterdir() if path.is_file()
+            )
+
+            first_digest = app.hashlib.sha256(first_bytes).hexdigest()
+            second_digest = app.hashlib.sha256(second_bytes).hexdigest()
+            self.assertEqual(
+                [item["path"] for item in saved],
+                [f"external-{first_digest}.png", f"external-{second_digest}.png"],
+            )
+            self.assertEqual([item["name"] for item in saved], [
+                f"first-{first_digest[:10]}.png",
+                f"second-{second_digest[:10]}.png",
+            ])
+            self.assertEqual(failed, 0)
+            self.assertEqual(len(output_files), 2)
+            self.assertEqual(list(output_root.glob("*.part")), [])
+            self.assertEqual(schedule_variants.call_count, 2)
 
 
     def test_external_image_stream_returns_local_file_and_image_mode(self) -> None:

@@ -12,7 +12,7 @@ import re
 import socket
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import unquote_to_bytes, urljoin, urlparse
+from urllib.parse import parse_qs, unquote_to_bytes, urljoin, urlparse
 
 import aiohttp
 
@@ -351,6 +351,46 @@ def _asset_from_dict(value: dict) -> dict | None:
     return result if result.get("file_id") or result.get("source_url") else None
 
 
+def _asset_identity_keys(asset: dict) -> set[str]:
+    """Return stable cross-shape identities for one response asset.
+
+    The same ChatGPT file can be represented as an ``asset_pointer``/``file_id``
+    on one node and as an estuary or files URL on another. Keep exact values
+    while also extracting the conservative file identifiers used by those URLs.
+    """
+    keys: set[str] = set()
+
+    def remember_id(value) -> None:
+        candidate = str(value or "").strip()
+        if not candidate:
+            return
+        match = _FILE_ID_RE.search(candidate)
+        if match:
+            candidate = match.group(1).replace("file-", "file_")
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{7,255}", candidate):
+            keys.add(f"id:{candidate}")
+
+    file_id = str(asset.get("file_id") or "").strip()
+    if file_id:
+        keys.add(f"raw:{file_id}")
+        remember_id(file_id)
+
+    source_url = str(asset.get("source_url") or "").strip()
+    if source_url:
+        keys.add(f"raw:{source_url}")
+        try:
+            parsed = urlparse(source_url)
+            for value in parse_qs(parsed.query).get("id", []):
+                remember_id(value)
+            match = re.search(r"/files/([^/?#]+)", parsed.path)
+            if match:
+                remember_id(match.group(1))
+        except ValueError:
+            pass
+        remember_id(source_url)
+    return keys
+
+
 def extract_response_assets(conversation: dict, anchor) -> list[dict]:
     """Extract file/image descriptors from the assistant turn matching *anchor*."""
     from .turn_anchor import _resolve_user_node
@@ -362,14 +402,37 @@ def extract_response_assets(conversation: dict, anchor) -> list[dict]:
     if not user_nid:
         return []
 
+    # ChatGPT can repeat the user's uploaded reference images inside descendant
+    # tool/assistant metadata. Those records are inputs, not generated output.
+    # Remember every stable identity present on the anchored user node so the
+    # descendant walk cannot publish the references back to the API caller.
+    input_asset_identities: set[str] = set()
+
+    def remember_input_assets(value) -> None:
+        if isinstance(value, dict):
+            asset = _asset_from_dict(value)
+            if asset:
+                input_asset_identities.update(_asset_identity_keys(asset))
+            for child in value.values():
+                remember_input_assets(child)
+        elif isinstance(value, list):
+            for child in value:
+                remember_input_assets(child)
+
+    user_message = (mapping.get(user_nid) or {}).get("message") or {}
+    remember_input_assets(user_message.get("content") or {})
+    remember_input_assets(user_message.get("metadata") or {})
+
     # Generated images are often stored on a tool node before the final assistant.
-    descendant_ids: set[str] = set()
+    descendant_ids: list[str] = []
+    seen_descendant_ids: set[str] = set()
     queue = list((mapping.get(user_nid) or {}).get("children") or [])
     while queue:
         node_id = queue.pop(0)
-        if node_id in descendant_ids:
+        if node_id in seen_descendant_ids:
             continue
-        descendant_ids.add(node_id)
+        seen_descendant_ids.add(node_id)
+        descendant_ids.append(node_id)
         queue.extend((mapping.get(node_id) or {}).get("children") or [])
     if not descendant_ids:
         for node_id, node in mapping.items():
@@ -377,7 +440,9 @@ def extract_response_assets(conversation: dict, anchor) -> list[dict]:
             seen_parents: set[str] = set()
             while parent and parent not in seen_parents:
                 if parent == user_nid:
-                    descendant_ids.add(node_id)
+                    if node_id not in seen_descendant_ids:
+                        seen_descendant_ids.add(node_id)
+                        descendant_ids.append(node_id)
                     break
                 seen_parents.add(parent)
                 parent = (mapping.get(parent) or {}).get("parent")
@@ -390,8 +455,12 @@ def extract_response_assets(conversation: dict, anchor) -> list[dict]:
         if isinstance(value, dict):
             asset = _asset_from_dict(value)
             if asset:
+                identities = _asset_identity_keys(asset)
                 identity = str(asset.get("file_id") or asset.get("source_url"))
-                if identity not in seen:
+                if (
+                    identity not in seen
+                    and identities.isdisjoint(input_asset_identities)
+                ):
                     seen.add(identity)
                     assets.append(asset)
             for child in value.values():

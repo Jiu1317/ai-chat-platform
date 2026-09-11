@@ -334,12 +334,13 @@ class CompletionDetector:
     async def _probe_non_text_dom_state(self, d) -> dict:
         """Read global image completion evidence for either detector phase.
 
-        ChatGPT may remove the short-lived ``data-message-author-role``
-        wrapper before an image turn finishes.  The durable surfaces are the
-        global conversation-turn image URLs, the per-image feedback-action
-        count, and the visible Stop button.  Keep this single probe shared by
-        Phase 1 and Phase 2 so both apply identical identity and completion
-        rules.
+        ChatGPT may remove the short-lived ordinary assistant message wrapper
+        before an image turn finishes.  The durable surfaces are assistant-turn
+        image URLs, the per-image feedback-action count, and the visible Stop
+        button.  Keep this single probe shared by Phase 1 and Phase 2 so both
+        apply identical identity and completion rules.  User-turn images are
+        deliberately excluded because newly submitted reference images are not
+        present in the pre-send baseline and must never be returned as output.
         """
         from .cdp_driver import CDPJSError
 
@@ -350,11 +351,11 @@ class CompletionDetector:
                 " var stop=[].slice.call(document.querySelectorAll('[data-testid=\"stop-button\"], button[aria-label*=\"Stop\" i], button[aria-label*=\"停止\"]')).find(visible);"
                 " var actionCount=document.querySelectorAll('[data-testid=\"good-image-turn-action-button\"], [data-testid=\"bad-image-turn-action-button\"]').length;"
                 " var seen={},assets=[];"
-                " document.querySelectorAll('[data-testid^=\"conversation-turn-\"] img, section[data-turn=\"assistant\"] img').forEach(function(img){"
+                " document.querySelectorAll('[data-message-author-role=\"assistant\"] img, section[data-turn=\"assistant\"] img').forEach(function(img){"
                 "   var src=img.currentSrc||img.src||'';"
                 "   if(src.indexOf('/backend-api/estuary/content')<0 && src.indexOf('/backend-api/files/')<0)return;"
                 "   try{var u=new URL(src,location.href),id=u.searchParams.get('id')||u.pathname;"
-                "     if(id&&!seen[id]){seen[id]=true;assets.push({identity:id,source_url:u.href,loaded:!!(img.complete&&img.naturalWidth>0)});}}catch(e){}"
+                "     if(id&&!seen[id]){seen[id]=true;assets.push({identity:id,source_url:u.href,loaded:!!(img.complete&&img.naturalWidth>0),turnRole:'assistant'});}}catch(e){}"
                 " });"
                 " return JSON.stringify({generationActive:!!stop,actionCount:actionCount,assets:assets});"
                 "})()"
@@ -365,6 +366,10 @@ class CompletionDetector:
             assets = state.get("assets", [])
             if not isinstance(assets, list):
                 assets = []
+            assets = [
+                asset for asset in assets
+                if isinstance(asset, dict) and asset.get("turnRole") == "assistant"
+            ]
             return {
                 "generation_active": state.get("generationActive") is True,
                 "action_count": int(state.get("actionCount", -1)),

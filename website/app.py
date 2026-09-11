@@ -4629,12 +4629,14 @@ async def _persist_external_image(
                     if content_length > MAX_OUTPUT_FILE_BYTES:
                         raise RuntimeError("生成图片超过 30 MB")
                     size = 0
+                    content_hash = hashlib.sha256()
                     with temporary.open("wb") as output:
                         async for chunk in response.aiter_bytes(64 * 1024):
                             size += len(chunk)
                             if size > MAX_OUTPUT_FILE_BYTES:
                                 raise RuntimeError("生成图片超过 30 MB")
                             output.write(chunk)
+                            content_hash.update(chunk)
                 if size == 0:
                     last_error = RuntimeError("生成图片为空")
                     if attempt + 1 < EXTERNAL_ASSET_DOWNLOAD_ATTEMPTS:
@@ -4662,17 +4664,22 @@ async def _persist_external_image(
                     raise RuntimeError("图片服务返回了不支持的格式")
                 extension, media_type = formats[image_format]
                 stem = Path(_safe_filename(candidate.get("name") or "image")).stem[:80]
-                filename = f"{stem or 'image'}-{uuid.uuid4().hex[:10]}{extension}"
-                target = (output_root / filename).resolve()
+                digest = content_hash.hexdigest()
+                filename = f"{stem or 'image'}-{digest[:10]}{extension}"
+                storage_name = f"external-{digest}{extension}"
+                target = (output_root / storage_name).resolve()
                 if target.parent != output_root:
                     raise RuntimeError("图片输出路径无效")
-                os.replace(temporary, target)
+                created = not target.is_file()
+                if created:
+                    os.replace(temporary, target)
                 target.chmod(0o600)
-                _schedule_image_variants(target, output_root)
+                if created:
+                    _schedule_image_variants(target, output_root)
                 return {
                     "name": filename,
                     "size": size,
-                    "path": filename,
+                    "path": storage_name,
                     "mediaType": media_type,
                     "inline": True,
                     "width": width,
@@ -4729,8 +4736,17 @@ async def _persist_external_images(
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    saved = [result for result in results if result is not None]
-    failed = len(candidates) - len(saved)
+    successful = [result for result in results if result is not None]
+    saved: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+    for result in successful:
+        path = str(result.get("path") or "")
+        if path and path in seen_paths:
+            continue
+        if path:
+            seen_paths.add(path)
+        saved.append(result)
+    failed = len(candidates) - len(successful)
     return saved, failed
 
 

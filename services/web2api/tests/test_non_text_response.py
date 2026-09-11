@@ -133,6 +133,7 @@ async def test_phase2_new_image_survives_projection_429(monkeypatch):
                                 "?id=file_old"
                             ),
                             "loaded": False,
+                            "turnRole": "assistant",
                         },
                         {
                             "identity": "file_new",
@@ -141,6 +142,7 @@ async def test_phase2_new_image_survives_projection_429(monkeypatch):
                                 "?id=file_new"
                             ),
                             "loaded": False,
+                            "turnRole": "assistant",
                         },
                     ],
                 }
@@ -255,6 +257,7 @@ async def test_phase2_old_image_cannot_override_projection_429(monkeypatch):
                                 "?id=file_old"
                             ),
                             "loaded": False,
+                            "turnRole": "assistant",
                         }
                     ],
                 }
@@ -345,6 +348,7 @@ async def test_phase2_unloaded_new_image_without_new_action_cannot_complete(monk
                                 "?id=file_new"
                             ),
                             "loaded": False,
+                            "turnRole": "assistant",
                         }
                     ],
                 }
@@ -432,6 +436,7 @@ async def test_phase2_image_does_not_swallow_asset_fetch_auth_failure(monkeypatc
                                 "?id=file_new"
                             ),
                             "loaded": False,
+                            "turnRole": "assistant",
                         }
                     ],
                 }

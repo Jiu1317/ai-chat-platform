@@ -594,3 +594,186 @@ def test_extract_generated_image_from_tool_node():
         sent_text="draw", mode="captured_id", captured_user_message_id="user-tool"
     )
     assert extract_response_assets(conversation, anchor)[0]["file_id"] == "file_tool123"
+
+
+def test_extract_response_assets_excludes_user_reference_images_repeated_by_tool():
+    conversation = {
+        "mapping": {
+            "u": {
+                "children": ["tool"],
+                "message": {
+                    "id": "user-with-references",
+                    "author": {"role": "user"},
+                    "content": {
+                        "content_type": "multimodal_text",
+                        "parts": [
+                            {
+                                "content_type": "image_asset_pointer",
+                                "asset_pointer": "sediment://file_reference_1",
+                            },
+                            {
+                                "content_type": "image_asset_pointer",
+                                "asset_pointer": "sediment://file_reference_2",
+                            },
+                            "draw something new",
+                        ],
+                    },
+                },
+            },
+            "tool": {
+                "parent": "u",
+                "children": ["a"],
+                "message": {
+                    "author": {"role": "tool"},
+                    "content": {
+                        "content_type": "multimodal_text",
+                        "parts": [
+                            {
+                                "content_type": "image_asset_pointer",
+                                "asset_pointer": "sediment://file_reference_1",
+                            },
+                            {
+                                "content_type": "image_asset_pointer",
+                                "asset_pointer": "sediment://file_reference_2",
+                            },
+                            {
+                                "content_type": "image_asset_pointer",
+                                "asset_pointer": "sediment://file_generated",
+                                "name": "result.png",
+                            },
+                        ],
+                    },
+                },
+            },
+            "a": {
+                "parent": "tool",
+                "message": {
+                    "author": {"role": "assistant"},
+                    "end_turn": True,
+                    "content": {"content_type": "text", "parts": ["Here it is"]},
+                },
+            },
+        }
+    }
+    anchor = TurnAnchor(
+        sent_text="draw something new",
+        mode="captured_id",
+        captured_user_message_id="user-with-references",
+    )
+
+    assert extract_response_assets(conversation, anchor) == [{
+        "type": "image",
+        "name": "result.png",
+        "mime_type": "image/png",
+        "file_id": "file_generated",
+    }]
+
+
+@pytest.mark.parametrize(
+    "reference_url",
+    [
+        "https://chatgpt.com/backend-api/estuary/content?id=file_reference_url",
+        "https://chatgpt.com/backend-api/files/file_reference_url/download",
+    ],
+)
+def test_extract_response_assets_matches_user_url_to_tool_asset_pointer(reference_url):
+    conversation = {
+        "mapping": {
+            "u": {
+                "children": ["tool"],
+                "message": {
+                    "id": "user-url-reference",
+                    "author": {"role": "user"},
+                    "content": {
+                        "content_type": "multimodal_text",
+                        "parts": [{
+                            "content_type": "image",
+                            "image_url": reference_url,
+                        }],
+                    },
+                },
+            },
+            "tool": {
+                "parent": "u",
+                "children": [],
+                "message": {
+                    "author": {"role": "tool"},
+                    "content": {
+                        "content_type": "multimodal_text",
+                        "parts": [
+                            {
+                                "content_type": "image_asset_pointer",
+                                "asset_pointer": "sediment://file_reference_url",
+                            },
+                            {
+                                "content_type": "image_asset_pointer",
+                                "asset_pointer": "sediment://file_generated_url_case",
+                                "name": "result.png",
+                            },
+                        ],
+                    },
+                },
+            },
+        }
+    }
+    anchor = TurnAnchor(
+        sent_text="draw",
+        mode="captured_id",
+        captured_user_message_id="user-url-reference",
+    )
+
+    assert extract_response_assets(conversation, anchor) == [{
+        "type": "image",
+        "name": "result.png",
+        "mime_type": "image/png",
+        "file_id": "file_generated_url_case",
+    }]
+
+
+def test_extract_response_assets_preserves_descendant_breadth_first_order():
+    conversation = {
+        "mapping": {
+            "u": {
+                "children": ["tool-first", "assistant-second"],
+                "message": {
+                    "id": "user-multiple-results",
+                    "author": {"role": "user"},
+                    "content": {"content_type": "text", "parts": ["draw two"]},
+                },
+            },
+            "tool-first": {
+                "parent": "u",
+                "children": [],
+                "message": {
+                    "author": {"role": "tool"},
+                    "content": {
+                        "content_type": "image_asset_pointer",
+                        "asset_pointer": "sediment://file_generated_first",
+                        "name": "first.png",
+                    },
+                },
+            },
+            "assistant-second": {
+                "parent": "u",
+                "children": [],
+                "message": {
+                    "author": {"role": "assistant"},
+                    "end_turn": True,
+                    "content": {
+                        "content_type": "image_asset_pointer",
+                        "asset_pointer": "sediment://file_generated_second",
+                        "name": "second.png",
+                    },
+                },
+            },
+        }
+    }
+    anchor = TurnAnchor(
+        sent_text="draw two",
+        mode="captured_id",
+        captured_user_message_id="user-multiple-results",
+    )
+
+    assert [
+        asset["file_id"] for asset in extract_response_assets(conversation, anchor)
+    ] == ["file_generated_first", "file_generated_second"]
