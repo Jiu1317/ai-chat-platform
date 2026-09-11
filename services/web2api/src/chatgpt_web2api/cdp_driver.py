@@ -79,6 +79,7 @@ _CONNECT_READY_TIMEOUT = 10
 # back-compat (tests import these from cdp_driver, and the navigation methods
 # that stay here still reference them).
 from .chatgpt_dom import (  # noqa: E402,F401
+    ATTACHMENT_SEND_BUTTON_MAX_WAIT_S,
     COMPOSER_FALLBACK_SELECTOR,
     COMPOSER_SELECTOR,
     SEND_BUTTON_FALLBACK_SELECTOR,
@@ -518,12 +519,12 @@ class CDPDriver:
         ws_url = None
         if self._target_id:
             # Reuse the tab we already attached to on a prior connect attempt.
-            ws_url = self._find_owned_tab_ws()
+            ws_url = await asyncio.to_thread(self._find_owned_tab_ws)
             if ws_url:
                 logger.info("Reusing tab: %s", self._target_id)
         if not ws_url and self.tab_mode == "adopt":
             # Single-process compat: try to adopt an existing chatgpt.com tab.
-            ws_url = self._adopt_existing_chatgpt_tab()
+            ws_url = await asyncio.to_thread(self._adopt_existing_chatgpt_tab)
         if not ws_url:
             # Registry reclaim (R3): before creating a new tab, check if THIS
             # instance owned a tab in a prior run that's still alive. Reclaim
@@ -536,7 +537,7 @@ class CDPDriver:
                     if reclaimed:
                         self._target_id = reclaimed
                         self._owns_target = True
-                        ws_url = self._find_owned_tab_ws()
+                        ws_url = await asyncio.to_thread(self._find_owned_tab_ws)
                         if ws_url:
                             logger.info(
                                 "Reclaimed owned tab from registry: %s (instance %s)",
@@ -669,23 +670,26 @@ class CDPDriver:
 
     async def _live_target_ids(self) -> set[str]:
         """Return the set of currently-live page target IDs from /json/list."""
-        import urllib.request
-
         try:
-            loop = asyncio.get_event_loop()
-
-            def _fetch():
-                with urllib.request.urlopen(
-                    f"http://localhost:{self.port}/json", timeout=5
-                ) as resp:
-                    import json as _json
-
-                    targets = _json.loads(resp.read())
-                return {t.get("id") for t in targets if t.get("type") == "page"}
-
-            return await loop.run_in_executor(None, _fetch)
+            targets = await self._fetch_cdp_json("/json", timeout=5)
+            return {t.get("id") for t in targets if t.get("type") == "page"}
         except Exception:
             return set()
+
+    def _fetch_cdp_json_sync(self, path: str, *, timeout: float) -> object:
+        """Read one bounded Chrome debugging JSON endpoint synchronously.
+
+        Keep the blocking ``urllib`` operation isolated here. Async callers use
+        :meth:`_fetch_cdp_json`, while the two synchronous lookup helpers are
+        themselves dispatched with ``asyncio.to_thread`` by connect/reconnect.
+        """
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read())
+
+    async def _fetch_cdp_json(self, path: str, *, timeout: float) -> object:
+        """Read a Chrome debugging JSON endpoint without blocking the loop."""
+        return await asyncio.to_thread(self._fetch_cdp_json_sync, path, timeout=timeout)
 
     def tab_status(self) -> dict:
         """Snapshot of this driver's tab/session state (R6 observability).
@@ -749,11 +753,11 @@ class CDPDriver:
                 # _target_id (both modes), then honor tab_mode for the
                 # create-vs-adopt decision.
                 if self._target_id:
-                    ws_url = self._find_owned_tab_ws()
+                    ws_url = await asyncio.to_thread(self._find_owned_tab_ws)
                     if ws_url:
                         logger.info("Re-finding tab: %s", self._target_id)
                 if not ws_url and self.tab_mode == "adopt":
-                    ws_url = self._adopt_existing_chatgpt_tab()
+                    ws_url = await asyncio.to_thread(self._adopt_existing_chatgpt_tab)
                 if not ws_url:
                     logger.info("No reusable tab — creating new one")
                     try:
@@ -839,9 +843,7 @@ class CDPDriver:
 
     async def _find_page_ws(self) -> str:
         """Find a suitable page's websocket URL."""
-        req = urllib.request.Request(f"http://127.0.0.1:{self.port}/json/list")
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            targets = json.loads(resp.read())
+        targets = await self._fetch_cdp_json("/json/list", timeout=5)
 
         pages = [t for t in targets if t.get("type") == "page"]
         if not pages:
@@ -863,11 +865,7 @@ class CDPDriver:
                 continue
             try:
                 # Quick HTTP check that the page target is alive
-                check_url = f"http://127.0.0.1:{self.port}/json"
-                with urllib.request.urlopen(
-                    urllib.request.Request(check_url), timeout=3
-                ) as check_resp:
-                    _alive = json.loads(check_resp.read())
+                await self._fetch_cdp_json("/json", timeout=3)
                 # If we can reach /json and the target has a WS URL, it's alive
                 logger.info("Using page: %s", target.get("title", "")[:60])
                 return ws_url
@@ -888,12 +886,7 @@ class CDPDriver:
         page-level _cdp/_reader_loop machinery — those are for the persistent
         page WS only.
         """
-        version = json.loads(
-            urllib.request.urlopen(
-                urllib.request.Request(f"http://127.0.0.1:{self.port}/json/version"),
-                timeout=5,
-            ).read()
-        )
+        version = await self._fetch_cdp_json("/json/version", timeout=5)
         browser_ws_url = version["webSocketDebuggerUrl"]
         mid = self._msg_id + 100000  # offset to avoid collision with page-level ids
         async with websockets.connect(browser_ws_url, max_size=10 * 1024 * 1024) as bws:
@@ -925,12 +918,7 @@ class CDPDriver:
         logger.info("Created owned tab: %s", self._target_id)
         # Wait for the tab to appear in /json/list, then get its WS URL
         for _ in range(20):
-            targets = json.loads(
-                urllib.request.urlopen(
-                    urllib.request.Request(f"http://127.0.0.1:{self.port}/json/list"),
-                    timeout=5,
-                ).read()
-            )
+            targets = await self._fetch_cdp_json("/json/list", timeout=5)
             for t in targets:
                 if t.get("id") == self._target_id:
                     ws_url = t.get("webSocketDebuggerUrl")
@@ -943,12 +931,7 @@ class CDPDriver:
     def _find_owned_tab_ws(self) -> str | None:
         """Look up an owned tab's WS URL from /json/list. Returns None if gone."""
         try:
-            targets = json.loads(
-                urllib.request.urlopen(
-                    urllib.request.Request(f"http://127.0.0.1:{self.port}/json/list"),
-                    timeout=5,
-                ).read()
-            )
+            targets = self._fetch_cdp_json_sync("/json/list", timeout=5)
             for t in targets:
                 if t.get("id") == self._target_id:
                     return t.get("webSocketDebuggerUrl")
@@ -973,12 +956,7 @@ class CDPDriver:
         one). Never raises — a /json/list failure collapses to None.
         """
         try:
-            targets = json.loads(
-                urllib.request.urlopen(
-                    urllib.request.Request(f"http://127.0.0.1:{self.port}/json/list"),
-                    timeout=5,
-                ).read()
-            )
+            targets = self._fetch_cdp_json_sync("/json/list", timeout=5)
         except Exception:
             return None
 
@@ -1516,14 +1494,17 @@ class CDPDriver:
         Delegated to ChatGPTDom (Phase 5 PR3 extraction)."""
         return await self._dom._verify_composer_text(selector, expected)
 
-    async def click_send(self) -> None:
+    async def click_send(self, *, wait_timeout: float | None = None) -> None:
         """Click the send button via JS MouseEvent sequence.
 
         Delegated to ChatGPTDom (Phase 5 PR3 extraction). Preserved exactly:
         aria-label-then-legacy selector, COMPOSER_SEND_READINESS breaker
-        record_failure on miss / record_success on confirmed send (registry
-        stays on driver)."""
-        await self._dom.click_send()
+        record_failure on miss; acknowledged-send success is recorded by
+        send_and_stream (registry stays on driver)."""
+        if wait_timeout is None:
+            await self._dom.click_send()
+        else:
+            await self._dom.click_send(wait_timeout=wait_timeout)
 
     # ── Response Retrieval ────────────────────────────────────
 
@@ -1831,7 +1812,7 @@ class CDPDriver:
             try:
                 raw_asset_ids = await self._js_strict(
                     "(function(){var seen={},ids=[];"
-                    "document.querySelectorAll('[data-testid^=\"conversation-turn-\"] img').forEach(function(img){"
+                    "document.querySelectorAll('[data-testid^=\"conversation-turn-\"] img, section[data-turn=\"assistant\"] img').forEach(function(img){"
                     " var src=img.currentSrc||img.src||'';"
                     " if(src.indexOf('/backend-api/estuary/content')<0 && src.indexOf('/backend-api/files/')<0)return;"
                     " try{var u=new URL(src,location.href),id=u.searchParams.get('id')||u.pathname;"
@@ -1867,12 +1848,18 @@ class CDPDriver:
                 await self.upload_files(attachments)
             # Type and send.
             await self.type_message(text)
-            await self.click_send()
+            if attachments:
+                await self.click_send(
+                    wait_timeout=ATTACHMENT_SEND_BUTTON_MAX_WAIT_S
+                )
+            else:
+                await self.click_send()
 
             # A2 Step 6: wait for the IdentityListener to capture the UUID.
             captured_uuid = None
             if capture_scope is not None:
                 captured_uuid = await self._identity_listener.wait_for_captured_uuid(timeout=5.0)
+            acknowledged: bool | None = True if captured_uuid else None
 
             # P0 send acknowledgment (ChatGPT review, conv 6a52f0f3):
             # click_send dispatches synthetic mouse events — that proves the
@@ -1896,6 +1883,10 @@ class CDPDriver:
                         initial_assistant_count=initial_count
                     )
                     if acknowledged is False:  # explicitly False, not None
+                        if self._breakers:
+                            self._breakers.record_failure(
+                                BreakerKind.COMPOSER_SEND_READINESS
+                            )
                         raise SendReadinessError(
                             "Send not acknowledged — click dispatched but no user "
                             "message or generation appeared (no UUID captured, counts "
@@ -1910,6 +1901,11 @@ class CDPDriver:
                     # the send — let completion detection proceed. Log so the
                     # failure is traceable.
                     logger.debug("Send acknowledgment probe failed (non-blocking): %s", ack_err)
+
+            if acknowledged is True and self._breakers:
+                self._breakers.record_success(
+                    BreakerKind.COMPOSER_SEND_READINESS
+                )
 
             # A2 Step 7: build the final anchor (fallback + captured UUID).
             turn_anchor = fallback_anchor.with_captured_id(captured_uuid)
@@ -2042,6 +2038,10 @@ class CDPDriver:
                         backend_assets = extract_response_assets(
                             conversation, turn_anchor
                         )
+                    except AuthExpiredError:
+                        # Authentication failure is never a soft asset-fetch
+                        # miss.  Do not hide a 401 behind a DOM fallback.
+                        raise
                     except Exception as asset_err:
                         logger.warning("Response asset extraction failed: %s", asset_err)
                     merged_assets = []

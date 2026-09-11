@@ -112,6 +112,7 @@ const elements = {
   projectUseContext: $("#project-use-context"),
   projectStatus: $("#project-status"),
   projectFileInput: $("#project-file-input"),
+  projectUploadCancel: $("#project-upload-cancel"),
   projectFileList: $("#project-file-list"),
   projectFilesEmpty: $("#project-files-empty"),
   modelImport: $("#model-import"),
@@ -149,6 +150,8 @@ let models = [];
 let attachments = [];
 let isSending = false;
 let activeTurn = null;
+let activeTurnRequest = null;
+const uploadControllers = new Map();
 let loginPoll = null;
 let autoScrollEnabled = true;
 let hasRenderedMessages = false;
@@ -183,6 +186,7 @@ let settingsCloseTimer = null;
 let settingsReturnFocus = null;
 let projectCloseTimer = null;
 let projectReturnFocus = null;
+let activeProjectUploadController = null;
 function prefersReducedMotion() {
   return matchMedia("(prefers-reduced-motion: reduce)").matches;
 }
@@ -249,6 +253,30 @@ function stripInternalAnnotations(value, { removeIncomplete = false } = {}) {
   let text = String(value || "").replace(/\uE200[^\uE200\uE201]{0,1000}\uE201/g, "");
   if (removeIncomplete) text = text.replace(/\uE200[^\uE200\uE201]{0,1000}$/g, "");
   return text;
+}
+
+function userFacingError(value, status = 0) {
+  const message = String(value?.message || value || "").trim();
+  const lowered = message.toLowerCase();
+  if (Number(status) === 524 || /\b524\b/.test(lowered)) {
+    return "请求等待超时（524）。官网可能仍在处理，请稍后检查会话后再重试";
+  }
+  if (/\bunauthorized\b|not authorized|authentication/.test(lowered)) {
+    return "ChatGPT 网页登录已失效，请在专用浏览器重新登录后再试";
+  }
+  if (/image download failed/.test(lowered)) {
+    return "图片已生成，但下载转发失败，请稍后重试";
+  }
+  if (/send not acknowledged/.test(lowered)) {
+    return "官网未确认消息发送，可能页面繁忙或请求被拒绝，请稍后重试";
+  }
+  if (/spawn\s+openclaw\s+enoent/.test(lowered)) {
+    return "图片处理组件未启动，请联系管理员重启服务";
+  }
+  if (/failed to fetch|networkerror|network request failed|load failed/.test(lowered)) {
+    return "网络连接中断，请检查网络后重试";
+  }
+  return message || "请求失败，请稍后重试";
 }
 
 function normalizeConversation(item, fallbackWorkspaceId) {
@@ -2041,8 +2069,23 @@ function saveProjectDetails() {
   setProjectStatus("项目已保存并同步。", "success");
 }
 
-function waitForUploadRetry(delay) {
-  return new Promise((resolve) => setTimeout(resolve, delay));
+function abortError() {
+  return new DOMException("操作已取消", "AbortError");
+}
+
+function waitForUploadRetry(delay, signal) {
+  if (signal?.aborted) return Promise.reject(abortError());
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, delay);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(abortError());
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 function canRetryUpload(error) {
@@ -2050,28 +2093,32 @@ function canRetryUpload(error) {
   return status === 0 || status === 408 || status === 425 || status === 429 || status >= 500;
 }
 
-async function uploadStep(action) {
+async function uploadStep(action, signal) {
   let lastError = null;
   for (let attempt = 0; attempt < 3; attempt += 1) {
+    if (signal?.aborted) throw abortError();
     try {
       return await action();
     } catch (error) {
       lastError = error;
+      if (error?.name === "AbortError" || signal?.aborted) throw abortError();
       if (!canRetryUpload(error) || attempt === 2) throw error;
       const retryAfter = Math.max(0, Number(error?.retryAfter) || 0) * 1000;
-      await waitForUploadRetry(Math.max(retryAfter, 300 * (2 ** attempt)));
+      await waitForUploadRetry(Math.max(retryAfter, 300 * (2 ** attempt)), signal);
     }
   }
   throw lastError || new Error("上传失败");
 }
 
-async function uploadFileInChunks(file, sessionId, onProgress = () => {}, source = "file") {
+async function uploadFileInChunks(file, sessionId, onProgress = () => {}, source = "file", signal) {
   if (!file || file.size > MAX_UPLOAD_BYTES) throw new Error("单个文件不能超过 30 MB");
+  if (signal?.aborted) throw abortError();
   const initResponse = await uploadStep(() => api("/api/uploads/init", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ session_id: sessionId, name: file.name, size: file.size, source }),
-  }));
+    signal,
+  }), signal);
   const initialized = await initResponse.json();
   const uploadId = String(initialized.uploadId || "");
   const chunkSize = Number(initialized.chunkSize);
@@ -2096,9 +2143,10 @@ async function uploadFileInChunks(file, sessionId, onProgress = () => {}, source
       const response = await api(`/api/uploads/${encodeURIComponent(uploadId)}/chunk`, {
         method: "POST",
         body: form,
+        signal,
       });
       return response.json();
-    });
+    }, signal);
     const nextOffset = Number(chunkResult.nextOffset);
     if (String(chunkResult.uploadId || uploadId) !== uploadId || nextOffset !== nextExpectedOffset) {
       throw new Error("服务器返回的分片进度不一致，请重新上传");
@@ -2110,7 +2158,8 @@ async function uploadFileInChunks(file, sessionId, onProgress = () => {}, source
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ session_id: sessionId }),
-  }));
+    signal,
+  }), signal);
   const completed = await completeResponse.json();
   if (!Array.isArray(completed.files) || !completed.files.length) {
     throw new Error("上传完成，但服务器没有返回文件信息");
@@ -2150,6 +2199,9 @@ async function uploadProjectFiles(fileList) {
     return;
   }
   elements.projectFileInput.disabled = true;
+  const uploadController = new AbortController();
+  activeProjectUploadController = uploadController;
+  elements.projectUploadCancel.hidden = false;
   setProjectStatus(`正在上传 ${accepted.length} 个文件…`);
   let uploadedCount = 0;
   try {
@@ -2157,7 +2209,7 @@ async function uploadProjectFiles(fileList) {
       const file = accepted[index];
       const resultFiles = await uploadFileInChunks(file, project.workspaceId, (progress) => {
         setProjectStatus(`正在上传 ${index + 1}/${accepted.length}：${file.name}（${Math.round(progress * 100)}%）`);
-      });
+      }, "file", uploadController.signal);
       project.files.push(...resultFiles);
       uploadedCount += resultFiles.length;
       project.files = project.files.slice(0, 20);
@@ -2170,8 +2222,10 @@ async function uploadProjectFiles(fileList) {
     const skipped = files.length - accepted.length;
     setProjectStatus(`已加入 ${uploadedCount} 个共享文件${skipped ? `，另有 ${skipped} 个未加入` : ""}。`, "success");
   } catch (error) {
-    setProjectStatus(error.message, "error");
+    setProjectStatus(error?.name === "AbortError" ? "已取消上传。" : userFacingError(error), error?.name === "AbortError" ? "" : "error");
   } finally {
+    if (activeProjectUploadController === uploadController) activeProjectUploadController = null;
+    elements.projectUploadCancel.hidden = true;
     elements.projectFileInput.disabled = false;
     elements.projectFileInput.value = "";
   }
@@ -2361,7 +2415,7 @@ async function api(url, options = {}) {
       location.href = "/login";
       throw new Error("登录已失效");
     }
-    const error = new Error(detail);
+    const error = new Error(userFacingError(detail, response.status));
     error.status = response.status;
     error.retryAfter = Number(response.headers.get("Retry-After")) || 0;
     throw error;
@@ -2654,27 +2708,35 @@ async function uploadSelectedFiles(fileList) {
     id: randomId(), name: file.name, size: file.size, loading: true, progress: 0,
   }));
   attachments.push(...pending);
+  pending.forEach((item) => uploadControllers.set(item.id, new AbortController()));
   renderAttachments();
   const sessionId = conversation.workspaceId || state.sessionId;
   let firstError = null;
   for (let index = 0; index < acceptedFiles.length; index += 1) {
     const file = acceptedFiles[index];
     const pendingItem = pending[index];
+    const controller = uploadControllers.get(pendingItem.id);
     try {
       const uploadedFiles = await uploadFileInChunks(file, sessionId, (progress) => {
         pendingItem.progress = progress;
         renderAttachments();
-      });
+      }, "file", controller?.signal);
       attachments = attachments.filter((item) => item !== pendingItem);
       attachments.push(...uploadedFiles);
     } catch (error) {
-      pendingItem.loading = false;
-      pendingItem.error = error.message;
-      firstError ||= error;
+      if (error?.name === "AbortError") {
+        attachments = attachments.filter((item) => item !== pendingItem);
+      } else {
+        pendingItem.loading = false;
+        pendingItem.error = userFacingError(error);
+        firstError ||= error;
+      }
+    } finally {
+      uploadControllers.delete(pendingItem.id);
     }
     renderAttachments();
   }
-  if (firstError) showComposerError(firstError.message);
+  if (firstError) showComposerError(userFacingError(firstError, firstError.status));
   elements.fileInput.value = "";
   renderAttachments();
 }
@@ -2694,12 +2756,14 @@ function renderAttachments() {
         ? `${attachment.name} · ${attachment.error}`
         : `${attachment.name} · ${formatBytes(attachment.size)}`;
     item.append(name);
-    if (!attachment.loading) {
+    const uploadController = uploadControllers.get(attachment.id);
+    if (!attachment.loading || uploadController) {
       const remove = document.createElement("button");
       remove.type = "button";
-      remove.textContent = "移除";
-      remove.setAttribute("aria-label", `移除 ${attachment.name}`);
+      remove.textContent = attachment.loading ? "取消" : "移除";
+      remove.setAttribute("aria-label", `${attachment.loading ? "取消上传" : "移除"} ${attachment.name}`);
       remove.addEventListener("click", () => {
+        uploadController?.abort();
         attachments.splice(index, 1);
         renderAttachments();
       });
@@ -2763,7 +2827,9 @@ async function sendMessage() {
     const fileName = longTextFileName();
     let textFile = new File([text], fileName, { type: "text/plain;charset=utf-8" });
     const pendingText = { id: randomId(), name: fileName, size: textFile.size, loading: true, progress: 0 };
+    const textUploadController = new AbortController();
     attachments.push(pendingText);
+    uploadControllers.set(pendingText.id, textUploadController);
     isSending = true;
     renderAttachments();
     try {
@@ -2775,6 +2841,7 @@ async function sendMessage() {
           renderAttachments();
         },
         "composer_text",
+        textUploadController.signal,
       );
       const preview = String(uploadedFiles[0]?.preview || "");
       if (!preview || utf8ByteLength(preview) > INLINE_TEXT_BYTES) {
@@ -2792,8 +2859,10 @@ async function sendMessage() {
       attachments = attachments.filter((item) => item !== pendingText);
       isSending = false;
       renderAttachments();
-      showComposerError(`长文字上传失败：${error.message}`);
+      showComposerError(error?.name === "AbortError" ? "已取消长文字上传" : `长文字上传失败：${userFacingError(error)}`);
       return;
+    } finally {
+      uploadControllers.delete(pendingText.id);
     }
   }
   const history = conversation.messages
@@ -2853,10 +2922,13 @@ async function sendMessage() {
   elements.stopButton.hidden = false;
   elements.sendButton.hidden = true;
 
+  const turnRequest = new AbortController();
+  activeTurnRequest = turnRequest;
   try {
     const response = await api("/api/turn", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      signal: turnRequest.signal,
       body: JSON.stringify({
         session_id: conversation.workspaceId || state.sessionId,
         client_conversation_id: conversation.id,
@@ -2876,7 +2948,11 @@ async function sendMessage() {
     });
     await consumeStream(response, conversation, assistantMessage);
   } catch (error) {
-    if (error.status === 429) {
+    if (error?.name === "AbortError") {
+      assistantMessage.content = stripInternalAnnotations(assistantMessage.content, { removeIncomplete: true }).trimEnd()
+        || "已停止生成。";
+      assistantMessage.error = false;
+    } else if (error.status === 429) {
       conversation.messages = conversation.messages.filter(
         (message) => ![userMessage.id, assistantMessage.id].includes(message.id),
       );
@@ -2890,13 +2966,16 @@ async function sendMessage() {
         conversation.externalContextKey = null;
       }
       assistantMessage.error = true;
-      assistantMessage.content = error.message;
+      const detail = userFacingError(error, error.status);
+      const partial = stripInternalAnnotations(assistantMessage.content, { removeIncomplete: true }).trimEnd();
+      assistantMessage.content = partial ? `${partial}\n\n> 回答传输中断：${detail}` : detail;
     }
   } finally {
     assistantMessage.content = stripInternalAnnotations(assistantMessage.content, { removeIncomplete: true }).trimEnd();
     assistantMessage.streaming = false;
     isSending = false;
     activeTurn = null;
+    if (activeTurnRequest === turnRequest) activeTurnRequest = null;
     conversation.updatedAt = Date.now();
     saveState();
     renderAll();
@@ -2919,7 +2998,12 @@ async function consumeStream(response, conversation, assistantMessage) {
     buffer = done ? "" : lines.pop();
     for (const line of lines) {
       if (!line.trim()) continue;
-      const event = JSON.parse(line);
+      let event;
+      try {
+        event = JSON.parse(line);
+      } catch {
+        throw new Error("回答数据格式异常，请重试");
+      }
       if (event.type === "started") {
         if (!["external", "image"].includes(event.threadId)) {
           conversation.threadId = event.threadId;
@@ -2957,7 +3041,9 @@ async function consumeStream(response, conversation, assistantMessage) {
           conversation.externalContextKey = null;
         }
         assistantMessage.error = true;
-        assistantMessage.content = event.message;
+        const detail = userFacingError(event.message, event.status);
+        const partial = stripInternalAnnotations(assistantMessage.content, { removeIncomplete: true }).trimEnd();
+        assistantMessage.content = partial ? `${partial}\n\n> 回答传输中断：${detail}` : detail;
         return;
       }
     }
@@ -2978,12 +3064,16 @@ function updateStreamingMessage(message) {
 }
 
 async function stopCurrentTurn() {
-  if (!activeTurn) return;
+  if (!isSending) return;
+  const turn = activeTurn;
+  activeTurnRequest?.abort();
   elements.stopButton.disabled = true;
   try {
-    await api(`/api/turn/${encodeURIComponent(activeTurn.threadId)}/${encodeURIComponent(activeTurn.turnId)}/interrupt`, { method: "POST" });
+    if (turn) {
+      await api(`/api/turn/${encodeURIComponent(turn.threadId)}/${encodeURIComponent(turn.turnId)}/interrupt`, { method: "POST" });
+    }
   } catch (error) {
-    showComposerError(error.message);
+    showComposerError(`停止请求未送达：${userFacingError(error, error.status)}`);
   } finally {
     elements.stopButton.disabled = false;
   }
@@ -3075,6 +3165,7 @@ elements.projectForm.addEventListener("submit", (event) => {
   saveProjectDetails();
 });
 elements.projectFileInput.addEventListener("change", () => uploadProjectFiles(elements.projectFileInput.files));
+elements.projectUploadCancel.addEventListener("click", () => activeProjectUploadController?.abort());
 elements.siteUserForm.addEventListener("submit", (event) => {
   event.preventDefault();
   createSiteUser();
@@ -3124,7 +3215,11 @@ elements.input.addEventListener("keydown", (event) => {
     sendMessage();
   }
 });
-elements.fileInput.addEventListener("change", () => uploadSelectedFiles(elements.fileInput.files));
+elements.fileInput.addEventListener("change", () => {
+  const selectedFiles = [...elements.fileInput.files];
+  elements.fileInput.value = "";
+  uploadSelectedFiles(selectedFiles);
+});
 elements.sendButton.addEventListener("click", sendMessage);
 elements.stopButton.addEventListener("click", stopCurrentTurn);
 elements.accountAction.addEventListener("click", () => {
@@ -3255,7 +3350,13 @@ elements.composer.addEventListener("drop", (event) => {
   if (files?.length) uploadSelectedFiles(files);
 });
 window.addEventListener("dragend", clearComposerDropState);
-window.addEventListener("drop", clearComposerDropState);
+window.addEventListener("dragover", (event) => {
+  if (hasDraggedFiles(event)) event.preventDefault();
+});
+window.addEventListener("drop", (event) => {
+  if (hasDraggedFiles(event)) event.preventDefault();
+  clearComposerDropState();
+});
 
 if (!sortedConversations().some((item) => item.id === state.activeId)) {
   state.activeId = sortedConversations()[0]?.id || null;

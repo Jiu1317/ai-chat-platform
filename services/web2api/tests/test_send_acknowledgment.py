@@ -25,7 +25,9 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from chatgpt_web2api.cdp_driver import CDPDriver
+from chatgpt_web2api.breakers import BreakerKind, BreakerRegistry
+from chatgpt_web2api.cdp_driver import CDPDriver, SendReadinessError
+from chatgpt_web2api.chatgpt_dom import ATTACHMENT_SEND_BUTTON_MAX_WAIT_S
 from chatgpt_web2api.turn_anchor import TurnReconciliationError
 
 
@@ -86,6 +88,59 @@ async def test_send_not_acknowledged_raises_when_no_signals(monkeypatch):
     assert "acknowledge" in str(exc_info.value).lower() or "not acknowledged" in str(exc_info.value).lower(), (
         f"Expected send-acknowledgment error, got: {exc_info.value}"
     )
+
+
+@pytest.mark.asyncio
+async def test_attachment_send_waits_for_upload_and_records_unacknowledged_failure():
+    """A large attachment may keep Submit disabled well past the normal
+    composer-reset window. Attachment sends get the extended bounded wait, and
+    a conclusively rejected click counts toward the readiness breaker."""
+    assert ATTACHMENT_SEND_BUTTON_MAX_WAIT_S == 300.0
+
+    driver = _make_driver()
+    driver._breakers = MagicMock()
+    driver.upload_files = AsyncMock()
+    driver.type_message = AsyncMock()
+    driver.click_send = AsyncMock()
+    driver._read_assistant_count_baseline = AsyncMock(return_value=0)
+    driver._identity_listener = None
+    driver._capture_pre_send_fallback_anchor = AsyncMock(return_value=MagicMock())
+    driver._assert_owned_tab_required = MagicMock()
+    driver._verify_send_acknowledged = AsyncMock(return_value=False)
+
+    with pytest.raises(SendReadinessError, match="Send not acknowledged"):
+        async for _ in driver.send_and_stream(
+            "describe this", attachments=["C:/tmp/reference.png"]
+        ):
+            pass
+
+    driver.upload_files.assert_awaited_once_with(["C:/tmp/reference.png"])
+    driver.click_send.assert_awaited_once_with(
+        wait_timeout=ATTACHMENT_SEND_BUTTON_MAX_WAIT_S
+    )
+    driver._breakers.record_failure.assert_called_once_with(
+        BreakerKind.COMPOSER_SEND_READINESS
+    )
+
+
+@pytest.mark.asyncio
+async def test_repeated_unacknowledged_sends_accumulate_and_open_breaker():
+    driver = _make_driver()
+    driver._breakers = BreakerRegistry()
+    driver.type_message = AsyncMock()
+    driver.click_send = AsyncMock()
+    driver._read_assistant_count_baseline = AsyncMock(return_value=0)
+    driver._identity_listener = None
+    driver._capture_pre_send_fallback_anchor = AsyncMock(return_value=MagicMock())
+    driver._assert_owned_tab_required = MagicMock()
+    driver._verify_send_acknowledged = AsyncMock(return_value=False)
+
+    for _ in range(3):
+        with pytest.raises(SendReadinessError, match="Send not acknowledged"):
+            async for _chunk in driver.send_and_stream("test message"):
+                pass
+
+    assert driver._breakers.is_open(BreakerKind.COMPOSER_SEND_READINESS)
 
 
 @pytest.mark.asyncio

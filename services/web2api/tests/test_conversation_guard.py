@@ -441,17 +441,16 @@ async def test_ensure_send_ready_fail_closed_when_composer_still_absent():
     d._capture_selector_diagnostic.assert_awaited_once_with("composer (connect send-ready)")
 
 
-def test_has_composer_parses_ready_flag_from_js():
+@pytest.mark.asyncio
+async def test_has_composer_parses_ready_flag_from_js():
     """_has_composer reads a {ready: bool} JSON payload from _js and returns
     a real bool (the home page, which returns ready:false, must be False)."""
     d = CDPDriver(cdp_port=9222)
     d._js = AsyncMock(return_value=json.dumps({"ready": True}))
-    import asyncio
-
-    assert asyncio.get_event_loop().run_until_complete(d._has_composer()) is True
+    assert await d._has_composer() is True
 
     d._js = AsyncMock(return_value=json.dumps({"ready": False}))
-    assert asyncio.get_event_loop().run_until_complete(d._has_composer()) is False
+    assert await d._has_composer() is False
 
 
 @pytest.mark.asyncio

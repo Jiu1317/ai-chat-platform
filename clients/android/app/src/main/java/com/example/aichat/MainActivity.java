@@ -40,7 +40,7 @@ import org.json.JSONObject;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.OutputStream;
-import java.nio.charset.StandardCharsets;
+import java.util.ArrayDeque;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -51,7 +51,9 @@ import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
 
 public final class MainActivity extends ComponentActivity {
-    private static final int MAX_BRIDGE_DOWNLOAD_BYTES = 100 * 1024 * 1024;
+    private static final int MAX_BRIDGE_DOWNLOAD_BYTES = 30 * 1024 * 1024;
+    private static final int MAX_BRIDGE_DOWNLOAD_BASE64_CHARS =
+            ((MAX_BRIDGE_DOWNLOAD_BYTES + 2) / 3) * 4 + 16;
 
     private WebView webView;
     private ProgressBar progressBar;
@@ -60,7 +62,8 @@ public final class MainActivity extends ComponentActivity {
     private ValueCallback<Uri[]> fileChooserCallback;
     private ActivityResultLauncher<Intent> fileChooserLauncher;
     private ActivityResultLauncher<String> storagePermissionLauncher;
-    private DownloadRequest pendingDownload;
+    private final ArrayDeque<DownloadRequest> pendingDownloads = new ArrayDeque<>();
+    private boolean storagePermissionRequestInFlight;
     private ExecutorService fileExecutor;
     private Uri homeUri;
     private String allowedHost;
@@ -101,13 +104,16 @@ public final class MainActivity extends ComponentActivity {
         storagePermissionLauncher = registerForActivityResult(
                 new ActivityResultContracts.RequestPermission(),
                 granted -> {
-                    if (pendingDownload == null) return;
-                    DownloadRequest request = pendingDownload;
-                    pendingDownload = null;
-                    if (granted) {
-                        enqueueDownload(request);
-                    } else {
-                        openExternally(Uri.parse(request.url));
+                    storagePermissionRequestInFlight = false;
+                    DownloadRequest request;
+                    while ((request = pendingDownloads.pollFirst()) != null) {
+                        if (granted) {
+                            startDownload(request);
+                        } else if (request.url.startsWith("http://") || request.url.startsWith("https://")) {
+                            openExternally(Uri.parse(request.url));
+                        } else {
+                            Toast.makeText(this, R.string.download_failed, Toast.LENGTH_SHORT).show();
+                        }
                     }
                 }
         );
@@ -229,12 +235,19 @@ public final class MainActivity extends ComponentActivity {
     }
 
     @Override
+    protected void onStop() {
+        CookieManager.getInstance().flush();
+        super.onStop();
+    }
+
+    @Override
     protected void onDestroy() {
         if (fileChooserCallback != null) fileChooserCallback.onReceiveValue(null);
         webView.removeJavascriptInterface("AndroidShare");
         webView.removeJavascriptInterface("AndroidDownload");
         webView.stopLoading();
         webView.destroy();
+        pendingDownloads.clear();
         fileExecutor.shutdownNow();
         super.onDestroy();
     }
@@ -323,21 +336,30 @@ public final class MainActivity extends ComponentActivity {
                 long contentLength
         ) {
             String fileName = safeFilename(URLUtil.guessFileName(url, contentDisposition, mimeType));
-            if (url.startsWith("blob:")) {
-                downloadBlob(url, fileName, mimeType);
-                return;
-            }
-            if (url.startsWith("data:")) {
-                new DownloadBridge().saveDataUrl(url, fileName, mimeType);
+            if (contentLength > MAX_BRIDGE_DOWNLOAD_BYTES) {
+                Toast.makeText(MainActivity.this, R.string.download_too_large, Toast.LENGTH_SHORT).show();
                 return;
             }
             DownloadRequest request = new DownloadRequest(url, userAgent, mimeType, fileName);
             if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P
                     && checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
-                pendingDownload = request;
-                storagePermissionLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE);
+                pendingDownloads.addLast(request);
+                if (!storagePermissionRequestInFlight) {
+                    storagePermissionRequestInFlight = true;
+                    storagePermissionLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE);
+                }
                 return;
             }
+            startDownload(request);
+        }
+    }
+
+    private void startDownload(DownloadRequest request) {
+        if (request.url.startsWith("blob:")) {
+            downloadBlob(request.url, request.fileName, request.mimeType);
+        } else if (request.url.startsWith("data:")) {
+            new DownloadBridge().saveDataUrl(request.url, request.fileName, request.mimeType);
+        } else {
             enqueueDownload(request);
         }
     }
@@ -365,7 +387,9 @@ public final class MainActivity extends ComponentActivity {
     private void downloadBlob(String url, String fileName, String mimeType) {
         String script = "(async()=>{try{"
                 + "const response=await fetch(" + JSONObject.quote(url) + ");"
+                + "if(!response.ok)throw new Error('HTTP '+response.status);"
                 + "const blob=await response.blob();"
+                + "if(blob.size>" + MAX_BRIDGE_DOWNLOAD_BYTES + ")throw new Error('File is too large');"
                 + "const reader=new FileReader();"
                 + "reader.onloadend=()=>window.AndroidDownload.saveDataUrl(String(reader.result),"
                 + JSONObject.quote(fileName) + "," + JSONObject.quote(mimeType == null ? "" : mimeType) + ");"
@@ -396,10 +420,11 @@ public final class MainActivity extends ComponentActivity {
                     if (comma < 0 || !dataUrl.substring(0, comma).contains(";base64")) {
                         throw new IllegalArgumentException("Unsupported download format");
                     }
-                    byte[] bytes = android.util.Base64.decode(
-                            dataUrl.substring(comma + 1).getBytes(StandardCharsets.US_ASCII),
-                            android.util.Base64.DEFAULT
-                    );
+                    String payload = dataUrl.substring(comma + 1);
+                    if (payload.length() > MAX_BRIDGE_DOWNLOAD_BASE64_CHARS) {
+                        throw new IllegalArgumentException("File is too large");
+                    }
+                    byte[] bytes = android.util.Base64.decode(payload, android.util.Base64.DEFAULT);
                     if (bytes.length > MAX_BRIDGE_DOWNLOAD_BYTES) throw new IllegalArgumentException("File is too large");
                     String resolvedMime = mimeType == null || mimeType.isBlank()
                             ? dataUrl.substring(5, dataUrl.indexOf(';'))
@@ -445,8 +470,7 @@ public final class MainActivity extends ComponentActivity {
             values.put(MediaStore.Downloads.IS_PENDING, 0);
             getContentResolver().update(item, values, null, null);
         } else {
-            File directory = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
-            if (directory == null && (directory = getFilesDir()) == null) throw new IllegalStateException("No download directory");
+            File directory = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
             if (!directory.exists() && !directory.mkdirs()) throw new IllegalStateException("Cannot create download directory");
             try (OutputStream output = new FileOutputStream(new File(directory, fileName))) {
                 output.write(bytes);

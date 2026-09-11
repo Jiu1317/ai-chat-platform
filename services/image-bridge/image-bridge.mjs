@@ -37,12 +37,16 @@ const WEBSITE_OUTER_TIMEOUT_MS = 20 * 60 * SECOND_MS;
 const HTTP_REQUEST_TIMEOUT_MS = AGENT_HARD_TIMEOUT_MS
   + IMAGE_DISCOVERY_TIMEOUT_MS
   + IMAGE_RESPONSE_TRANSFER_RESERVE_MS;
+const SHUTDOWN_FORCE_TIMEOUT_MS = HTTP_REQUEST_TIMEOUT_MS + 30 * SECOND_MS;
 
 if (HTTP_REQUEST_TIMEOUT_MS >= WEBSITE_OUTER_TIMEOUT_MS) {
   throw new Error("图片桥超时必须短于网站外层超时");
 }
 
 let active = false;
+let shuttingDown = false;
+let shutdownForceTimer = null;
+const activeControllers = new Set();
 
 function cancellationError(signal) {
   if (signal?.reason instanceof Error) return signal.reason;
@@ -351,6 +355,11 @@ async function generatedImage(result, sessionKey, startedAt, signal) {
 }
 
 const server = http.createServer(async (request, response) => {
+  if (shuttingDown) {
+    response.setHeader("connection", "close");
+    replyJson(response, 503, { error: "图片生成服务正在停止，请稍后重试" });
+    return;
+  }
   if (request.method === "GET" && request.url === "/healthz") {
     replyJson(response, 200, { ok: true, busy: active });
     return;
@@ -369,6 +378,7 @@ const server = http.createServer(async (request, response) => {
   }
   active = true;
   const controller = new AbortController();
+  activeControllers.add(controller);
   const cancelRequest = () => {
     if (controller.signal.aborted) return;
     const error = new Error("客户端已断开，图片任务已取消");
@@ -406,9 +416,40 @@ const server = http.createServer(async (request, response) => {
   } finally {
     request.removeListener("aborted", cancelRequest);
     response.removeListener("close", cancelOnResponseClose);
+    activeControllers.delete(controller);
     active = false;
   }
 });
+
+function beginGracefulShutdown(signalName) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`AI Chat image bridge received ${signalName}; waiting for active request to finish`);
+
+  shutdownForceTimer = setTimeout(() => {
+    const error = new Error("图片生成服务停止等待超时");
+    error.code = "SHUTDOWN_TIMEOUT";
+    for (const controller of activeControllers) {
+      if (!controller.signal.aborted) controller.abort(error);
+    }
+    server.closeAllConnections?.();
+    console.error("AI Chat image bridge forced shutdown after graceful timeout");
+    process.exit(1);
+  }, SHUTDOWN_FORCE_TIMEOUT_MS);
+
+  server.close((error) => {
+    if (shutdownForceTimer) clearTimeout(shutdownForceTimer);
+    shutdownForceTimer = null;
+    if (error) {
+      console.error("AI Chat image bridge shutdown failed", error);
+      process.exitCode = 1;
+      return;
+    }
+    console.log("AI Chat image bridge stopped gracefully");
+    process.exitCode = 0;
+  });
+  server.closeIdleConnections?.();
+}
 
 // Internal worst case: 900s generation + 15s process-exit grace + 180s
 // artifact discovery. Keep another 45s for returning the image, while still
@@ -419,3 +460,6 @@ server.headersTimeout = 10_000;
 server.listen(port, host, () => {
   console.log(`AI Chat image bridge listening on http://${host}:${port}`);
 });
+
+process.once("SIGTERM", () => beginGracefulShutdown("SIGTERM"));
+process.once("SIGINT", () => beginGracefulShutdown("SIGINT"));

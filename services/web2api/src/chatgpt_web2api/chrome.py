@@ -30,6 +30,25 @@ logger = logging.getLogger(__name__)
 MONITOR_INTERVAL_S = 30
 
 
+async def _to_thread_complete(func, /, *args, **kwargs):
+    """Run blocking lifecycle work without abandoning it on cancellation.
+
+    Cancelling ``asyncio.to_thread`` only cancels the awaiter; the OS operation
+    keeps running. Shield it and wait for completion before propagating
+    cancellation so launch/kill cannot mutate ``_process`` later, after the
+    lifecycle lock has been released.
+    """
+    task = asyncio.create_task(asyncio.to_thread(func, *args, **kwargs))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        try:
+            await task
+        except Exception:
+            pass
+        raise
+
+
 class ChromeProcess:
     """Manages a Chrome subprocess with CDP access."""
 
@@ -207,6 +226,10 @@ class ChromeProcess:
     # ── Launch / Kill ─────────────────────────────────────────
 
     async def _launch(self) -> None:
+        await _to_thread_complete(self._launch_sync)
+
+    def _launch_sync(self) -> None:
+        """Launch Chrome in a worker thread; see :func:`_to_thread_complete`."""
         chrome = self._cfg.chrome_path
         user_dir = self._cfg.user_data_dir
         port = self._cfg.cdp_port
@@ -261,6 +284,10 @@ class ChromeProcess:
         logger.info("Chrome PID: %d", self._process.pid)
 
     async def _kill(self) -> None:
+        await _to_thread_complete(self._kill_sync)
+
+    def _kill_sync(self) -> None:
+        """Terminate Chrome in a worker thread without freezing heartbeats."""
         if self._process is None:
             return
 
@@ -291,6 +318,10 @@ class ChromeProcess:
 
     async def _cdp_alive(self) -> bool:
         """Check if CDP is responding."""
+        return bool(await _to_thread_complete(self._cdp_alive_sync))
+
+    def _cdp_alive_sync(self) -> bool:
+        """Synchronous bounded CDP probe, always dispatched to a worker."""
         try:
             req = urllib.request.Request(f"http://127.0.0.1:{self._cfg.cdp_port}/json/version")
             # CDP is always a loopback service.  Explicitly bypass environment

@@ -164,19 +164,20 @@ async def test_ensure_send_ready_routes_navigation_through_driver():
 
 
 @pytest.mark.asyncio
-async def test_click_send_records_success_through_driver_breaker():
-    """A confirmed send must record_success via driver._breakers (half-open
-    recovery) — the registry stays on the driver, not the dom."""
+async def test_click_send_does_not_clear_failures_before_acknowledgment():
+    """A synthetic click is only a dispatch, not proof that React accepted it.
+    Existing failures must survive until CDPDriver observes acknowledgment."""
     from chatgpt_web2api.breakers import BreakerKind, BreakerRegistry
 
     dom, driver = _make_dom()
     reg = BreakerRegistry()
     driver._breakers = reg
+    reg.record_failure(BreakerKind.COMPOSER_SEND_READINESS)
     driver._js = AsyncMock(return_value="sent")
 
     await dom.click_send()
-    # Not open after a success record (record_success clears failures).
-    assert not reg.is_open(BreakerKind.COMPOSER_SEND_READINESS)
+    state = reg._states[BreakerKind.COMPOSER_SEND_READINESS]
+    assert len(state.recent_failures) == 1
 
 
 # ── 5. dismiss_rate_limit tri-state via driver._js_strict ────────────

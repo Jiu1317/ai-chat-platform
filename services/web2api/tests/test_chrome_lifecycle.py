@@ -13,6 +13,8 @@ lock is held through ``_wait_for_cdp``.
 """
 
 import asyncio
+import threading
+import time
 
 import pytest
 
@@ -471,3 +473,38 @@ async def test_stop_owner_kills_attacher_does_not():
     await owner.stop()
     assert owner_kill["n"] == 1, "owner must kill"
     assert owner._owns_chrome is False, "owner relinquishes on stop"
+
+
+@pytest.mark.asyncio
+async def test_blocking_chrome_lifecycle_work_does_not_freeze_event_loop():
+    def slow_operation():
+        time.sleep(0.08)
+        return "done"
+
+    operation = asyncio.create_task(chrome_mod._to_thread_complete(slow_operation))
+    await asyncio.sleep(0.01)
+
+    assert not operation.done()
+    assert await operation == "done"
+
+
+@pytest.mark.asyncio
+async def test_chrome_lifecycle_cancellation_waits_for_os_operation():
+    started = threading.Event()
+    release = threading.Event()
+
+    def controlled_operation():
+        started.set()
+        release.wait(timeout=1)
+
+    operation = asyncio.create_task(
+        chrome_mod._to_thread_complete(controlled_operation)
+    )
+    assert await asyncio.to_thread(started.wait, 0.5)
+    operation.cancel()
+    await asyncio.sleep(0.01)
+    assert not operation.done(), "cancellation abandoned a running OS operation"
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await operation

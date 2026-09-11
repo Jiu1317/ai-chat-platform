@@ -54,6 +54,35 @@ def _make_driver():
     return d
 
 
+@pytest.mark.asyncio
+async def test_find_page_ws_does_not_block_event_loop_during_http_fetch():
+    """Chrome's synchronous debugging endpoint must run in a worker thread."""
+    d = _make_driver()
+    targets = [
+        {
+            "id": "tab-1",
+            "type": "page",
+            "title": "ChatGPT",
+            "url": "https://chatgpt.com/",
+            "webSocketDebuggerUrl": "ws://fake/tab-1",
+        }
+    ]
+
+    def slow_urlopen(*_args, **_kwargs):
+        time.sleep(0.08)
+        response = MagicMock()
+        response.read.return_value = json.dumps(targets).encode()
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        return response
+
+    with patch("urllib.request.urlopen", side_effect=slow_urlopen):
+        lookup = asyncio.create_task(d._find_page_ws())
+        await asyncio.sleep(0.01)
+        assert not lookup.done(), "blocking urlopen stalled the event loop"
+        assert await lookup == "ws://fake/tab-1"
+
+
 # ── 1. connect creates an owned tab via Target.createTarget ───────────
 
 @pytest.mark.asyncio

@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 const bridgePath = fileURLToPath(new URL("./image-bridge.mjs", import.meta.url));
+const projectRoot = path.resolve(path.dirname(bridgePath), "..", "..");
 const token = "test-token";
 const onePixelPng = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
@@ -119,6 +120,13 @@ async function startBridge(t, mode) {
     '  fs.mkdirSync(path.dirname(process.env.FAKE_IMAGE_PATH), { recursive: true });',
     '  fs.writeFileSync(process.env.FAKE_IMAGE_PATH, image);',
     '  process.stdout.write(JSON.stringify({ result: { payloads: [{ mediaUrls: [process.env.FAKE_IMAGE_PATH] }] } }));',
+    '} else if (process.env.FAKE_AGENT_MODE === "slow-success") {',
+    '  setTimeout(() => {',
+    '    const image = Buffer.from(process.env.FAKE_IMAGE_BASE64, "base64");',
+    '    fs.mkdirSync(path.dirname(process.env.FAKE_IMAGE_PATH), { recursive: true });',
+    '    fs.writeFileSync(process.env.FAKE_IMAGE_PATH, image);',
+    '    process.stdout.write(JSON.stringify({ result: { payloads: [{ mediaUrls: [process.env.FAKE_IMAGE_PATH] }] } }));',
+    '  }, 750);',
     '} else if (process.env.FAKE_AGENT_MODE === "missing") {',
     '  process.stdout.write(JSON.stringify({ result: { payloads: [] } }));',
     '} else {',
@@ -169,7 +177,7 @@ async function startBridge(t, mode) {
     }
     return Buffer.concat(stdout).toString("utf8").includes("AI Chat image bridge listening");
   });
-  return { port, fakePidPath };
+  return { port, fakePidPath, bridge, stdout, stderr };
 }
 
 test("client disconnect terminates the agent and releases capacity", async (t) => {
@@ -236,4 +244,58 @@ test("client disconnect interrupts image discovery polling", async (t) => {
   request.destroy();
 
   await waitUntil(async () => (await requestJson(fixture.port, "/healthz")).body.busy === false);
+});
+
+test("SIGTERM drains the active image response and refuses new connections", {
+  skip: process.platform === "win32" ? "Windows does not deliver graceful SIGTERM to child processes" : false,
+}, async (t) => {
+  const fixture = await startBridge(t, "slow-success");
+  const request = generateRequest(fixture.port);
+  const responsePromise = collectResponse(request);
+  request.end(JSON.stringify({
+    requestId: "0123456789abcdef0123456789abcdef",
+    prompt: "生成测试图片",
+  }));
+
+  await waitUntil(async () => (await requestJson(fixture.port, "/healthz")).body.busy === true);
+  const bridgeClosePromise = once(fixture.bridge, "close");
+  assert.equal(fixture.bridge.kill("SIGTERM"), true);
+  await waitUntil(async () => {
+    try {
+      await requestJson(fixture.port, "/healthz");
+      return false;
+    } catch (error) {
+      return ["ECONNREFUSED", "ECONNRESET"].includes(error?.code);
+    }
+  });
+  assert.equal(fixture.bridge.exitCode, null, "bridge exited before its active request completed");
+
+  const response = await responsePromise;
+  assert.equal(response.status, 200);
+  assert.equal(response.contentType, "image/png");
+  assert.deepEqual(response.body, onePixelPng);
+  await bridgeClosePromise;
+  assert.equal(fixture.bridge.exitCode, 0, Buffer.concat(fixture.stderr).toString("utf8"));
+  assert.match(Buffer.concat(fixture.stdout).toString("utf8"), /stopped gracefully/);
+});
+
+test("systemd and the updater preserve the bridge graceful-stop window", async () => {
+  const unit = await fs.readFile(
+    path.join(projectRoot, "deploy", "systemd", "ai-chat-image-bridge.service"),
+    "utf8",
+  );
+  assert.match(unit, /^TimeoutStopSec=20min$/m);
+
+  const update = await fs.readFile(path.join(projectRoot, "scripts", "update-server.sh"), "utf8");
+  const installUnit = update.indexOf(
+    'install -m 0644 "${project_root}/deploy/systemd/ai-chat-image-bridge.service"',
+  );
+  const daemonReload = update.indexOf("systemctl daemon-reload", installUnit);
+  const stopWebsite = update.indexOf("systemctl stop ai-chat.service", daemonReload);
+  const restartBridge = update.indexOf("systemctl restart ai-chat-image-bridge.service", stopWebsite);
+  assert.ok(installUnit >= 0);
+  assert.ok(installUnit < daemonReload);
+  assert.ok(daemonReload < stopWebsite);
+  assert.ok(daemonReload < restartBridge);
+  assert.match(update, /systemctl start ai-chat-image-bridge\.service \|\| true/);
 });

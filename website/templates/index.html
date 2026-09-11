@@ -10,8 +10,8 @@
   <link rel="icon" href="/static/favicon.ico?v=2" sizes="any">
   <link rel="icon" href="/static/app-icon-64.png?v=2" type="image/png" sizes="64x64">
   <link rel="apple-touch-icon" href="/static/apple-touch-icon-180.png?v=2" sizes="180x180">
-  <link rel="stylesheet" href="/static/styles.css?v=41">
-  <script src="/static/app.js?v=45" defer></script>
+  <link rel="stylesheet" href="/static/styles.css?v=42">
+  <script src="/static/app.js?v=46" defer></script>
 </head>
 <body data-site-user-id="{{ site_user.id }}" data-site-username="{{ site_user.username }}" data-site-admin="{{ 'true' if site_user.isAdmin else 'false' }}">
   <!--
@@ -412,7 +412,10 @@
             <h3 id="project-files-title">共享文件</h3>
             <p>项目中的每个聊天都能使用，最多 20 个，单个不超过 30 MB。</p>
           </div>
-          <label class="secondary-button compact-button project-file-add" for="project-file-input">添加文件</label>
+          <div class="project-file-actions">
+            <label class="secondary-button compact-button project-file-add" for="project-file-input">添加文件</label>
+            <button class="secondary-button compact-button" id="project-upload-cancel" type="button" hidden>取消上传</button>
+          </div>
           <input id="project-file-input" type="file" multiple accept=".png,.jpg,.jpeg,.webp,.pdf,.docx,.xlsx,.pptx,.txt,.md,.csv,.json,.py,.js,.ts,.tsx,.jsx,.html,.css,.xml,.yaml,.yml,.toml,.ini,.log,.sql,.sh,.ps1,.c,.h,.cpp,.hpp,.java,.go,.rs">
         </div>
         <div class="project-file-list" id="project-file-list"></div>

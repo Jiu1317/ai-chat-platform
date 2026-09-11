@@ -12,6 +12,9 @@ EnvironmentFile=/etc/ai-chat/website.env
 ExecStart=/srv/ai-chat/venv/bin/uvicorn app:app --host 127.0.0.1 --port 13002 --workers 1 --proxy-headers --forwarded-allow-ips=127.0.0.1
 Restart=on-failure
 RestartSec=3
+# Uvicorn stops accepting new requests on SIGTERM, then waits for active
+# streams to finish. Keep this above the website's 20-minute outer deadline.
+TimeoutStopSec=25min
 PrivateTmp=true
 NoNewPrivileges=true
 

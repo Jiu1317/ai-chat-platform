@@ -13,6 +13,8 @@
 - 下拉刷新、加载进度和断网重试
 - iPhone、iPad 与深色模式兼容
 
+上传大小由网页端统一校验；客户端会在下载前或下载完成后再次执行单文件 30 MiB 上限。
+
 ## 方法一：有 Mac 时直接安装
 
 1. 用 Xcode 打开 `AIChat.xcodeproj`。
@@ -21,16 +23,11 @@
 4. 用数据线连接 iPhone，选择这台 iPhone 作为运行设备，然后点击运行按钮。
 5. 若手机提示开发者未受信任，按系统提示在“设置”中启用开发者模式并信任对应证书。
 
-## 方法二：只有 Windows 时安装
+## 只有 Windows 时怎么办
 
-项目带有 `.github/workflows/build-unsigned-ipa.yml`，可在 GitHub 的 macOS 构建机上生成未签名 IPA：
+Windows 不能直接运行 Xcode，因此不能在本机编译这个 iOS 工程。当前仓库也没有提供 iOS 云构建工作流；不要在 Actions 中寻找不存在的 `Build unsigned iOS IPA`。
 
-1. 在 GitHub 新建一个私人仓库，把本目录全部上传到仓库根目录。
-2. 打开仓库的 `Actions`，选择 `Build unsigned iOS IPA`，点击 `Run workflow`。
-3. 构建完成后，从该次任务的 `Artifacts` 下载 `AI-Chat-iOS-v1.0.3-unsigned`。
-4. 解压得到 IPA，再用 Sideloadly 或 AltStore 和你自己的 Apple ID 签名并安装到 iPhone。
-
-未签名 IPA 不能直接在 iPhone 上点击安装。个人签名可能需要定期重新签名；这是 iOS 的安装限制，不是应用故障。无需上架 App Store。
+可行方法是使用自己的 Mac、可信的远程 Mac，或自行配置带 macOS 构建机的 CI。无论采用哪种方式，最终仍需用自己的 Apple ID 或开发者证书签名后才能安装到 iPhone。未签名 IPA 不能直接在手机上点击安装；个人免费签名可能需要定期重新签名，这是 iOS 的限制，不是应用故障。
 
 ## 修改网站地址或版本
 

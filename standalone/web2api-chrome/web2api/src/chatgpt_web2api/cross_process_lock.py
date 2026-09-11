@@ -157,7 +157,10 @@ class CrossProcessLock:
         # instant return, no thread, no cancellation leak. On contention we
         # sleep on the event loop and retry until the deadline.
         while True:
-            fh = open(self._lockfile_path, "a")
+            # Deliberately synchronous: this only opens a local lock-file
+            # descriptor. Moving it to a worker thread can leak a lock when
+            # cancellation lands between acquisition and returning the handle.
+            fh = open(self._lockfile_path, "a")  # noqa: ASYNC230
             try:
                 portalocker.lock(fh, portalocker.LOCK_EX | portalocker.LOCK_NB)
                 self._fh = fh  # acquired

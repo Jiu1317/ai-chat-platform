@@ -115,6 +115,10 @@ for chunk in response:
   reference images combined must be no larger than 30 MiB.
 - Each generated image or file asset downloaded and cached by the bridge may be
   no larger than 30 MiB.
+- Successfully prefetched generated assets are also stored in a shared,
+  one-hour disk cache, so the other local worker or a restarted worker can keep
+  serving the opaque asset URL. The default location is beside the Chrome
+  profile; set `W2A_ASSET_CACHE_DIR` to use another shared local directory.
 
 ### ⏱️ Rate Limits & Agent Retry
 
@@ -454,7 +458,9 @@ challenges from genuinely simultaneous multi-tab use.
 W2A_PORT=8080 W2A_CDP_PORT=9222 chatgpt-web2api
 ```
 
-See [`.env.example`](.env.example) for all available variables.
+Use `config.example.json` for the complete configuration template. Environment
+variables use the same settings through the documented `W2A_*` names; run
+`chatgpt-web2api --help` for the command-line overrides available in this copy.
 
 ## Tested Models
 
@@ -531,35 +537,33 @@ E2E safety model:
   created, even on crash.
 - **Pacing** (`W2A_E2E_PACE`, default 12s) between tests to avoid ChatGPT's
   "Too many requests" rate limit.
-- Reads are zero-risk; chat/memory operations create throwaway state that's
-  cleaned up; `create_project`/`update_project_instructions` are `xfail` (broken
-  against the current live API — see CHANGELOG).
+- Reads do not create account content; chat/memory test operations create
+  throwaway state that the E2E cleanup removes. Some mutation checks remain
+  `xfail` until their current live-API behavior is reconfirmed.
 
 If not logged in, the suite opens a headed window and waits up to 10 minutes
 for you to log in.
 
 ## Documentation
 
-**[📋 Full documentation index](docs/INDEX.md)** — start here if you're unsure which doc to read.
+The files shipped in this repository are:
 
-Key docs:
-
-- [Deployment Guide](docs/deployment.md) — pip install, Docker, cookie injection, multi-instance, sharing
-- [OS Supervision Guide](docs/os-supervision.md) — systemd / launchd / Task Scheduler / NSSM for always-on deployments
-- [Production Runbook](docs/runbook.md) — health interpretation, failure modes, breaker states, auth recovery, safe restart
-- [API Reference](docs/api-reference.md) — OpenAI-compatible REST endpoints + MCP server surface
-- [Architecture](docs/architecture.md) — codebase structure and the CDPDriver hub-and-spoke module layout
-- [Protocol Reference](docs/protocol-reference.md) — captured ChatGPT web API endpoints
-- [Roadmap](docs/ROADMAP.md) — phases 1–6, what landed, what's deferred
-- [Contributing](CONTRIBUTING.md) — how to contribute
-- [Changelog](CHANGELOG.md) — version history
+- Repository-root `docs/BEGINNER_GUIDE.md` — beginner deployment walkthrough.
+- Repository-root `docs/OPERATIONS.md` — routine startup, shutdown, health and
+  troubleshooting guidance.
+- `README.md` — Web2API installation, REST/MCP usage and configuration.
+- `src/chatgpt_web2api/guide.md` — compact guide bundled with the Python package.
+- `config.example.json` — copyable configuration template.
 
 ## Limitations
 
 - **Single browser session** — one Chrome profile = one ChatGPT account (scale with nginx round-robin)
 - **No headless** — headless Chrome triggers ChatGPT's bot detection; use VNC on servers
 - **Cookie expiry** — auth cookies expire ~2 weeks; re-login needed
-- **Serial requests** — one chat at a time through the browser *by default* (concurrent reads are fine). For per-tab parallelism on one shared Chrome, set `parallel_tabs: true` (requires `tab_mode: "owned"`); see [docs/deployment.md](docs/deployment.md) → "Parallel mode (one Chrome, many tabs)".
+- **Serial requests** — one chat at a time through the browser *by default*
+  (concurrent reads are fine). For per-tab parallelism on one shared Chrome,
+  set `parallel_tabs: true` together with `tab_mode: "owned"`; the configuration
+  section above contains the matching example.
 - **Memory writes** — ChatGPT's `/backend-api/memories` is read-only; creating memories works via chat interface
 
 ## Roadmap

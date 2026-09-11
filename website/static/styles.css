@@ -1309,6 +1309,7 @@ body.settings-open, body.project-open { overflow: hidden; }
 .project-details .primary-button { width: fit-content; }
 .project-context-toggle { margin-top: -2px; }
 .project-privacy-note { margin: -8px 0 0 24px; color: var(--faint); font-size: 10px; line-height: 1.5; }
+.project-file-actions { display: flex; flex: none; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
 .project-file-add { cursor: pointer; }
 #project-file-input { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
 .project-file-list { display: grid; margin-top: 12px; }

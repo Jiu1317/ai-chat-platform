@@ -5,12 +5,15 @@ final class BrowserViewController: UIViewController {
     // Replace these example hosts with the domain used by your own deployment.
     private static let homeURL = URL(string: "https://chat.example.com/")!
     private static let allowedHosts: Set<String> = ["chat.example.com"]
+    private static let maxDownloadBytes: Int64 = 30 * 1024 * 1024
 
     private lazy var webView: WKWebView = makeWebView()
     private let progressView = UIProgressView(progressViewStyle: .bar)
     private let offlineView = OfflineView()
     private var progressObservation: NSKeyValueObservation?
     private var downloadDestinations: [ObjectIdentifier: URL] = [:]
+    private var pendingDownloadShares: [URL] = []
+    private var isPresentingDownloadShare = false
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -175,6 +178,32 @@ final class BrowserViewController: UIViewController {
         present(alert, animated: true)
     }
 
+    private func presentDownloadTooLarge() {
+        let alert = UIAlertController(title: "文件过大", message: "单个文件不能超过 30 MiB。", preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "好", style: .default))
+        present(alert, animated: true)
+    }
+
+    private func presentNextDownloadShare() {
+        guard !isPresentingDownloadShare, !pendingDownloadShares.isEmpty else { return }
+        isPresentingDownloadShare = true
+        let destination = pendingDownloadShares.removeFirst()
+        let directory = destination.deletingLastPathComponent()
+        let controller = UIActivityViewController(activityItems: [destination], applicationActivities: nil)
+        if let popover = controller.popoverPresentationController {
+            popover.sourceView = view
+            popover.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 1, height: 1)
+        }
+        controller.completionWithItemsHandler = { [weak self] _, _, _, _ in
+            try? FileManager.default.removeItem(at: directory)
+            DispatchQueue.main.async {
+                self?.isPresentingDownloadShare = false
+                self?.presentNextDownloadShare()
+            }
+        }
+        present(controller, animated: true)
+    }
+
     private func safeFilename(_ value: String) -> String {
         let invalid = CharacterSet(charactersIn: "/\\?%*|\"<>:")
         let cleaned = value.components(separatedBy: invalid).joined(separator: "-").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -203,6 +232,11 @@ extension BrowserViewController: WKNavigationDelegate {
 
     func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse, decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
         let response = navigationResponse.response as? HTTPURLResponse
+        if navigationResponse.isForMainFrame, let status = response?.statusCode, status >= 500 {
+            decisionHandler(.cancel)
+            showOffline(message: "服务器暂时无法打开页面，请稍后重试。\nHTTP \(status)")
+            return
+        }
         let disposition = response?.value(forHTTPHeaderField: "Content-Disposition")?.lowercased() ?? ""
         decisionHandler(disposition.contains("attachment") || !navigationResponse.canShowMIMEType ? .download : .allow)
     }
@@ -239,11 +273,17 @@ extension BrowserViewController: WKUIDelegate {
 
 extension BrowserViewController: WKDownloadDelegate {
     func download(_ download: WKDownload, decideDestinationUsing response: URLResponse, suggestedFilename: String, completionHandler: @escaping (URL?) -> Void) {
+        if response.expectedContentLength > Self.maxDownloadBytes {
+            completionHandler(nil)
+            presentDownloadTooLarge()
+            return
+        }
         do {
-            let directory = FileManager.default.temporaryDirectory.appendingPathComponent("AIDownloads", isDirectory: true)
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("AIDownloads", isDirectory: true)
+                .appendingPathComponent(UUID().uuidString, isDirectory: true)
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             let destination = directory.appendingPathComponent(safeFilename(suggestedFilename))
-            try? FileManager.default.removeItem(at: destination)
             downloadDestinations[ObjectIdentifier(download)] = destination
             completionHandler(destination)
         } catch {
@@ -254,11 +294,21 @@ extension BrowserViewController: WKDownloadDelegate {
 
     func downloadDidFinish(_ download: WKDownload) {
         guard let destination = downloadDestinations.removeValue(forKey: ObjectIdentifier(download)) else { return }
-        presentShare(items: [destination])
+        let directory = destination.deletingLastPathComponent()
+        if let size = try? destination.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+           Int64(size) > Self.maxDownloadBytes {
+            try? FileManager.default.removeItem(at: directory)
+            presentDownloadTooLarge()
+            return
+        }
+        pendingDownloadShares.append(destination)
+        presentNextDownloadShare()
     }
 
     func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
-        downloadDestinations.removeValue(forKey: ObjectIdentifier(download))
+        if let destination = downloadDestinations.removeValue(forKey: ObjectIdentifier(download)) {
+            try? FileManager.default.removeItem(at: destination.deletingLastPathComponent())
+        }
         presentDownloadError(error)
     }
 }

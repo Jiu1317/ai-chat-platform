@@ -2,6 +2,7 @@ import asyncio
 import io
 import os
 import sqlite3
+import sys
 import tempfile
 import time
 import unittest
@@ -11,6 +12,9 @@ from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
+
+_website_dir = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_website_dir))
 
 _temporary_root = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
 _root = Path(_temporary_root.name)
@@ -306,7 +310,160 @@ class ImageRequestDetectionTests(unittest.TestCase):
         asyncio.run(scenario())
 
 
+class RuntimeCleanupTests(unittest.TestCase):
+    def test_lifespan_awaits_and_clears_background_tasks(self) -> None:
+        cleanup_finished = asyncio.Event()
+        worker_finished = asyncio.Event()
+
+        async def fake_cleanup_loop() -> None:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleanup_finished.set()
+
+        async def lingering_worker() -> None:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                worker_finished.set()
+
+        async def scenario() -> None:
+            with (
+                patch.object(app, "_prepare_directories"),
+                patch.object(app, "_cleanup_loop", new=fake_cleanup_loop),
+                patch.object(app.codex, "stop", new=AsyncMock()) as stop,
+            ):
+                async with app.lifespan(app.app):
+                    task = asyncio.create_task(lingering_worker())
+                    app.image_variant_tasks.add(task)
+                    await asyncio.sleep(0)
+                self.assertTrue(cleanup_finished.is_set())
+                self.assertTrue(worker_finished.is_set())
+                self.assertTrue(task.cancelled())
+                self.assertEqual(app.image_variant_tasks, set())
+                stop.assert_awaited_once()
+
+        asyncio.run(scenario())
+
+    def test_image_stream_enforces_outer_20_minute_deadline_and_cleans_task(self) -> None:
+        generation_cancelled = False
+        payload = app.TurnRequest(
+            session_id="3" * 32,
+            message="生成图片",
+            model="codex-model",
+            effort="default",
+        )
+
+        async def slow_generate(*_args, **_kwargs):
+            nonlocal generation_cancelled
+            try:
+                await asyncio.sleep(60)
+            finally:
+                generation_cancelled = True
+
+        async def scenario() -> list[dict]:
+            app.image_turns.clear()
+            with (
+                patch.object(app, "_generate_image", new=slow_generate),
+                patch.object(app, "IMAGE_BRIDGE_REQUEST_TIMEOUT_SECONDS", 0.01),
+            ):
+                events = [
+                    app.json.loads(event.decode())
+                    async for event in app._image_stream(payload, Path("."), "user-a")
+                ]
+            self.assertEqual(app.image_turns, {})
+            return events
+
+        self.assertEqual(app.IMAGE_BRIDGE_REQUEST_TIMEOUT_SECONDS, 20 * 60)
+        events = asyncio.run(scenario())
+        self.assertEqual(
+            [event["type"] for event in events],
+            ["started", "replace", "error"],
+        )
+        self.assertIn("20 分钟", events[-1]["message"])
+        self.assertTrue(generation_cancelled)
+
+    def test_unsupported_local_image_reference_does_not_reserve_quota(self) -> None:
+        payload = app.TurnRequest(
+            session_id="2" * 32,
+            message="请生成一张图片",
+            model="codex-model",
+            effort="default",
+            project_attachments=[app.AttachmentRef(id="project.png", name="project.png")],
+        )
+
+        async def scenario() -> list[dict]:
+            with (
+                patch.object(app, "_require_auth", return_value={"id": "user-a"}),
+                patch.object(app, "_session_path", return_value=Path(".")),
+                patch.object(app, "_validate_user_content_size"),
+                patch.object(app, "_decode_external_model", return_value=None),
+                patch.object(
+                    app, "_clear_external_conversation_state", new=AsyncMock()
+                ),
+                patch.object(app, "_reserve_message_slot") as reserve,
+            ):
+                response = await app.turn(object(), payload)
+                events = [
+                    app.json.loads(event.decode())
+                    async for event in response.body_iterator
+                ]
+            reserve.assert_not_called()
+            return events
+
+        events = asyncio.run(scenario())
+        self.assertEqual([event["type"] for event in events], ["started", "error"])
+        self.assertIn("参考图", events[-1]["message"])
+
+
 class ExternalImageTransferTests(unittest.TestCase):
+    def test_external_image_generation_prompt_keeps_selected_external_provider(self) -> None:
+        payload = app.TurnRequest(
+            session_id="4" * 32,
+            message="请参考附件，用 Image 2.5 生成一张配图",
+            model="external",
+            effort="medium",
+        )
+        provider = {
+            "baseUrl": "https://provider.example/v1",
+            "protocol": "openai",
+            "enabled": True,
+            "models": ["test-model"],
+        }
+        external_calls = []
+
+        async def fake_external_stream(*args, **kwargs):
+            external_calls.append((args, kwargs))
+            yield app._ndjson({"type": "done", "files": []})
+
+        def forbidden_image_stream(*_args, **_kwargs):
+            raise AssertionError("external image request was routed to the local image bridge")
+
+        async def scenario() -> list[dict]:
+            with (
+                patch.object(app, "_require_auth", return_value={"id": "user-1"}),
+                patch.object(app, "_session_path", return_value=Path(".")),
+                patch.object(app, "_validate_user_content_size"),
+                patch.object(
+                    app, "_decode_external_model", return_value=("provider-id", "test-model")
+                ),
+                patch.object(app, "_provider_by_id", return_value=provider),
+                patch.object(app, "_payload_has_images", return_value=False),
+                patch.object(app, "_cloud_context_history", return_value=[]),
+                patch.object(app, "_reserve_message_slot"),
+                patch.object(app, "_external_stream", new=fake_external_stream),
+                patch.object(app, "_image_stream", new=forbidden_image_stream),
+            ):
+                response = await app.turn(object(), payload)
+                return [
+                    app.json.loads(event.decode())
+                    async for event in response.body_iterator
+                ]
+
+        events = asyncio.run(scenario())
+        self.assertEqual(events, [{"type": "done", "files": []}])
+        self.assertEqual(len(external_calls), 1)
+
     def test_reference_image_requires_signed_transfer_for_openai_protocol(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             workspace = Path(directory)
@@ -1082,6 +1239,43 @@ class UploadCapacityTests(unittest.TestCase):
             len(payload.message) + app.MAX_CURRENT_ATTACHMENT_CONTEXT_CHARS + 64,
         )
 
+    def test_large_plain_text_and_pdf_are_excerpted_as_streams(self) -> None:
+        marker = "紫色彗星对应编号 STREAM-24680"
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            target = Path(directory) / "large.txt"
+            target.write_text(
+                "文件开头" + "甲" * 150_000 + marker + "乙" * 150_000 + "文件结尾",
+                encoding="utf-8",
+            )
+            with patch.object(Path, "read_text", side_effect=AssertionError("unbounded read")):
+                excerpt = app._extract_attachment_text(target, "紫色彗星是什么")
+
+        self.assertLessEqual(len(excerpt), app.MAX_EXTRACTED_CHARS)
+        self.assertIn("文件开头", excerpt)
+        self.assertIn(marker, excerpt)
+        self.assertIn("文件结尾", excerpt)
+
+        class FakePage:
+            def __init__(self, text: str):
+                self.text = text
+
+            def extract_text(self) -> str:
+                return self.text
+
+        fake_reader = type("FakeReader", (), {"pages": [
+            FakePage("PDF 开头" + "丙" * 130_000),
+            FakePage(marker + "丁" * 130_000),
+            FakePage("PDF 结尾"),
+        ]})()
+        with patch.object(app, "PdfReader", return_value=fake_reader):
+            pdf_excerpt = app._extract_attachment_text(
+                Path("document.pdf"), "紫色彗星是什么"
+            )
+        self.assertLessEqual(len(pdf_excerpt), app.MAX_EXTRACTED_CHARS)
+        self.assertIn("PDF 开头", pdf_excerpt)
+        self.assertIn(marker, pdf_excerpt)
+        self.assertIn("PDF 结尾", pdf_excerpt)
+
     def test_large_document_retrieval_handles_short_chinese_english_and_long_queries(self) -> None:
         def large_document(marker: str) -> str:
             def chunk(prefix: str, fill: str) -> str:
@@ -1621,6 +1815,46 @@ class ExternalContextTests(unittest.TestCase):
         asyncio.run(scenario())
         self.assertEqual(maximum_active, 1)
         self.assertEqual(calls, ["", "upstream_serial_1"])
+
+    def test_external_stream_enforces_outer_20_minute_deadline_and_cancels_source(self) -> None:
+        source_cancelled = False
+        payload = app.TurnRequest(
+            session_id="7" * 32,
+            message="慢请求",
+            model="external",
+            effort="default",
+        )
+        provider = {"baseUrl": "https://provider.example/v1", "protocol": "openai"}
+
+        async def slow_response(*_args, **_kwargs):
+            nonlocal source_cancelled
+            try:
+                await asyncio.sleep(60)
+                yield app._ndjson({"type": "done", "files": []})
+            finally:
+                source_cancelled = True
+
+        async def scenario() -> list[dict]:
+            with (
+                patch.object(app, "_external_response_stream", new=slow_response),
+                patch.object(app, "EXTERNAL_RESPONSE_TIMEOUT_SECONDS", 0.01),
+            ):
+                return [
+                    app.json.loads(event.decode())
+                    async for event in app._external_stream(
+                        payload,
+                        Path("."),
+                        provider,
+                        "model-a",
+                        "user-a",
+                    )
+                ]
+
+        self.assertEqual(app.EXTERNAL_RESPONSE_TIMEOUT_SECONDS, 20 * 60)
+        events = asyncio.run(scenario())
+        self.assertEqual([event["type"] for event in events], ["started", "error"])
+        self.assertIn("20 分钟", events[-1]["message"])
+        self.assertTrue(source_cancelled)
 
     def test_successful_continuation_keeps_existing_id_when_upstream_does_not_echo_it(self) -> None:
         line = app.json.dumps({

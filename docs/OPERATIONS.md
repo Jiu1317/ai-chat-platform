@@ -36,7 +36,7 @@ git pull
 sudo bash scripts/update-server.sh
 ```
 
-脚本不会覆盖 `/etc/ai-chat/website.env`、账户数据库或用户项目。
+脚本不会覆盖 `/etc/ai-chat/website.env`、账户数据库或用户项目。图片桥接如果原本正在运行，也会在文件更新后自动重启；更新中途失败时，脚本会尝试恢复网站服务并保留原错误信息，方便继续排查。
 
 ## Windows 双路 API
 

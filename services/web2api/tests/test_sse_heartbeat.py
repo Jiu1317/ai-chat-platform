@@ -1,15 +1,15 @@
 """Regression tests for idle SSE keep-alive handling."""
 
 import asyncio
-
 from unittest.mock import AsyncMock
+
 import pytest
+
+from chatgpt_web2api.api_server import APIServer
 
 
 @pytest.mark.asyncio
 async def test_with_heartbeat_keeps_pending_source_alive():
-    from chatgpt_web2api.api_server import APIServer
-
     completed = False
 
     async def slow_stream():
@@ -30,8 +30,6 @@ async def test_with_heartbeat_keeps_pending_source_alive():
 
 @pytest.mark.asyncio
 async def test_with_heartbeat_does_not_add_marker_to_fast_stream():
-    from chatgpt_web2api.api_server import APIServer
-
     async def fast_stream():
         yield "one"
         yield "two"
@@ -41,6 +39,25 @@ async def test_with_heartbeat_does_not_add_marker_to_fast_stream():
     ]
 
     assert observed == ["one", "two"]
+
+
+@pytest.mark.asyncio
+async def test_with_heartbeat_closes_source_when_consumer_stops_after_item():
+    closed = asyncio.Event()
+
+    async def source():
+        try:
+            yield "first"
+            await asyncio.Event().wait()
+        finally:
+            closed.set()
+
+    wrapped = APIServer._with_heartbeat(source(), interval=1)
+    assert await anext(wrapped) == "first"
+
+    await wrapped.aclose()
+
+    assert closed.is_set()
 
 
 @pytest.mark.asyncio

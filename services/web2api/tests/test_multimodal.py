@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import tempfile
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -32,6 +34,14 @@ PNG_1X1 = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMA"
     "ASsJTYQAAAAASUVORK5CYII="
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolated_asset_disk_cache(monkeypatch):
+    """Keep persistence tests isolated and remove every generated file."""
+    with tempfile.TemporaryDirectory() as directory:
+        monkeypatch.setenv("W2A_ASSET_CACHE_DIR", directory)
+        yield
 
 
 def test_parse_openai_image_url_and_text():
@@ -376,6 +386,37 @@ async def test_asset_capability_url_serves_bytes():
     assert response.content_type == "image/png"
     assert cached_response.body == PNG_1X1
     driver.download_response_asset.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_generated_asset_survives_worker_restart_via_shared_disk_cache():
+    first_driver = MagicMock()
+    first = APIServer(Config.load(None), first_driver)
+    expires_at = time.time() + 600
+    await first._cache_asset(
+        "restart-safe-token",
+        expires_at,
+        {
+            "data": PNG_1X1,
+            "content_type": "image/png",
+            "filename": "result.png",
+        },
+    )
+
+    second_driver = MagicMock()
+    second_driver.download_response_asset = AsyncMock(
+        side_effect=AssertionError("disk hit must not call the browser")
+    )
+    restarted = APIServer(Config.load(None), second_driver)
+    request = MagicMock()
+    request.match_info = {"token": "restart-safe-token"}
+
+    response = await restarted._handle_asset(request)
+
+    assert response.status == 200
+    assert response.body == PNG_1X1
+    assert response.content_type == "image/png"
+    second_driver.download_response_asset.assert_not_awaited()
 
 
 @pytest.mark.asyncio

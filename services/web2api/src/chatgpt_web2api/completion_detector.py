@@ -331,6 +331,98 @@ class CompletionDetector:
         self.completed_via_exact_action: bool = False
         self.non_text_dom_assets: list[dict] = []
 
+    async def _probe_non_text_dom_state(self, d) -> dict:
+        """Read global image completion evidence for either detector phase.
+
+        ChatGPT may remove the short-lived ``data-message-author-role``
+        wrapper before an image turn finishes.  The durable surfaces are the
+        global conversation-turn image URLs, the per-image feedback-action
+        count, and the visible Stop button.  Keep this single probe shared by
+        Phase 1 and Phase 2 so both apply identical identity and completion
+        rules.
+        """
+        from .cdp_driver import CDPJSError
+
+        try:
+            raw = await d._js_strict(
+                "(function(){"
+                " var visible=function(el){return !!(el && (el.offsetParent!==null || el.getClientRects().length));};"
+                " var stop=[].slice.call(document.querySelectorAll('[data-testid=\"stop-button\"], button[aria-label*=\"Stop\" i], button[aria-label*=\"停止\"]')).find(visible);"
+                " var actionCount=document.querySelectorAll('[data-testid=\"good-image-turn-action-button\"], [data-testid=\"bad-image-turn-action-button\"]').length;"
+                " var seen={},assets=[];"
+                " document.querySelectorAll('[data-testid^=\"conversation-turn-\"] img, section[data-turn=\"assistant\"] img').forEach(function(img){"
+                "   var src=img.currentSrc||img.src||'';"
+                "   if(src.indexOf('/backend-api/estuary/content')<0 && src.indexOf('/backend-api/files/')<0)return;"
+                "   try{var u=new URL(src,location.href),id=u.searchParams.get('id')||u.pathname;"
+                "     if(id&&!seen[id]){seen[id]=true;assets.push({identity:id,source_url:u.href,loaded:!!(img.complete&&img.naturalWidth>0)});}}catch(e){}"
+                " });"
+                " return JSON.stringify({generationActive:!!stop,actionCount:actionCount,assets:assets});"
+                "})()"
+            )
+            state = json.loads(raw)
+            if not isinstance(state, dict):
+                raise TypeError("invalid image asset probe result")
+            assets = state.get("assets", [])
+            if not isinstance(assets, list):
+                assets = []
+            return {
+                "generation_active": state.get("generationActive") is True,
+                "action_count": int(state.get("actionCount", -1)),
+                "assets": assets,
+            }
+        except (CDPJSError, json.JSONDecodeError, TypeError, ValueError):
+            return {
+                "generation_active": False,
+                "action_count": -1,
+                "assets": [],
+            }
+
+    @staticmethod
+    def _select_new_non_text_dom_assets(
+        state: dict,
+        *,
+        initial_action_count: int,
+        initial_asset_ids: tuple[str, ...],
+    ) -> tuple[list[dict], list[dict], bool]:
+        """Return ``(all_new, completion_ready, action_increased)`` assets.
+
+        A fully loaded new image is independently usable.  A lazy-loaded image
+        (``img.complete=false``/``naturalWidth=0``) is usable only when a new
+        image feedback action proves the current image turn completed; the
+        authenticated downloader validates the bytes afterward.  Every asset
+        must still be absent from the pre-send identity baseline.
+        """
+        baseline_ids = set(initial_asset_ids)
+        action_increased = int(state.get("action_count", -1)) > initial_action_count
+        new_assets = [
+            asset for asset in state.get("assets", [])
+            if isinstance(asset, dict)
+            and str(asset.get("identity") or "")
+            and str(asset.get("identity") or "") not in baseline_ids
+            and str(asset.get("source_url") or "").startswith(("http://", "https://"))
+        ]
+        completion_ready = [
+            asset for asset in new_assets
+            if asset.get("loaded") is True or action_increased
+        ]
+        return new_assets, completion_ready, action_increased
+
+    @staticmethod
+    def _format_non_text_dom_assets(assets: list[dict]) -> list[dict]:
+        """Convert validated DOM probe records to response-asset records."""
+        return [
+            {
+                "type": "image",
+                "name": f"generated-image-{index}.png",
+                "mime_type": "image/png",
+                "file_id": str(asset.get("identity") or "")
+                if str(asset.get("identity") or "").startswith("file_")
+                else "",
+                "source_url": str(asset["source_url"]),
+            }
+            for index, asset in enumerate(assets, start=1)
+        ]
+
     async def _reconcile_before_stall(
         self, d, conv_id: str, turn_anchor, had_non_text_content: bool,
     ) -> bool:
@@ -499,82 +591,36 @@ class CompletionDetector:
                 break
 
             # Generated images don't necessarily live under an element with
-            # data-message-author-role="assistant".  Their completed result
-            # does expose per-image feedback actions. Compare against a
-            # pre-send baseline so an older image in the same conversation
-            # cannot complete the new turn by mistake.
+            # data-message-author-role="assistant". Probe the durable global
+            # conversation-turn surface and compare it with both pre-send
+            # baselines. A fully loaded new URL can complete independently;
+            # a lazy-loaded URL additionally requires a newly appeared image
+            # action and an inactive generation signal. The authenticated
+            # downloader validates the bytes after this detector returns.
             if expect_non_text:
-                try:
-                    raw_actions = await d._js_strict(
-                        "document.querySelectorAll("
-                        "'[data-testid=\"good-image-turn-action-button\"], "
-                        "[data-testid=\"bad-image-turn-action-button\"]'"
-                        ").length"
+                non_text_state = await self._probe_non_text_dom_state(d)
+                _, completed_assets, action_increased = (
+                    self._select_new_non_text_dom_assets(
+                        non_text_state,
+                        initial_action_count=initial_non_text_action_count,
+                        initial_asset_ids=initial_non_text_asset_ids,
                     )
-                    action_count = int(raw_actions or 0)
-                except (CDPJSError, TypeError, ValueError):
-                    action_count = initial_non_text_action_count
-                if action_count > initial_non_text_action_count:
+                )
+                if (
+                    completed_assets
+                    and not non_text_state.get("generation_active")
+                ):
+                    self.non_text_dom_assets = self._format_non_text_dom_assets(
+                        completed_assets
+                    )
                     self.had_non_text_content = True
                     logger.info(
-                        "Generated image completion action appeared (%d -> %d)",
-                        initial_non_text_action_count,
-                        action_count,
+                        "Completed generated image asset appeared in Phase 1 "
+                        "(%d new, action_increased=%s)",
+                        len(completed_assets),
+                        action_increased,
                     )
                     return
-
-                # Newer ChatGPT image turns no longer expose the feedback
-                # action testids above and still omit the ordinary assistant
-                # role wrapper. Detect a fully loaded, newly-added Estuary/file
-                # asset instead. The pre-send identity baseline prevents an old
-                # image in a reused conversation from completing this turn.
-                try:
-                    raw_assets = await d._js_strict(
-                        "(function(){"
-                        " var visible=function(el){return !!(el && (el.offsetParent!==null || el.getClientRects().length));};"
-                        " var stop=[].slice.call(document.querySelectorAll('[data-testid=\"stop-button\"], button[aria-label*=\"Stop\" i], button[aria-label*=\"停止\"]')).find(visible);"
-                        " var seen={},assets=[];"
-                        " document.querySelectorAll('[data-testid^=\"conversation-turn-\"] img').forEach(function(img){"
-                        "   var src=img.currentSrc||img.src||'';"
-                        "   if(src.indexOf('/backend-api/estuary/content')<0 && src.indexOf('/backend-api/files/')<0)return;"
-                        "   if(!img.complete || !(img.naturalWidth>0))return;"
-                        "   try{var u=new URL(src,location.href),id=u.searchParams.get('id')||u.pathname;"
-                        "     if(!seen[id]){seen[id]=true;assets.push({identity:id,source_url:u.href});}}catch(e){}"
-                        " });"
-                        " return JSON.stringify({generationActive:!!stop,assets:assets});"
-                        "})()"
-                    )
-                    asset_state = json.loads(raw_assets)
-                    if not isinstance(asset_state, dict):
-                        raise TypeError("invalid image asset probe result")
-                    baseline_ids = set(initial_non_text_asset_ids)
-                    new_assets = [
-                        asset for asset in asset_state.get("assets", [])
-                        if isinstance(asset, dict)
-                        and str(asset.get("identity") or "") not in baseline_ids
-                        and str(asset.get("source_url") or "").startswith(("http://", "https://"))
-                    ]
-                    if new_assets and not asset_state.get("generationActive"):
-                        self.non_text_dom_assets = [
-                            {
-                                "type": "image",
-                                "name": f"generated-image-{index}.png",
-                                "mime_type": "image/png",
-                                "file_id": str(asset.get("identity") or "")
-                                if str(asset.get("identity") or "").startswith("file_")
-                                else "",
-                                "source_url": str(asset["source_url"]),
-                            }
-                            for index, asset in enumerate(new_assets, start=1)
-                        ]
-                        self.had_non_text_content = True
-                        logger.info(
-                            "Completed generated image asset appeared (%d new)",
-                            len(new_assets),
-                        )
-                        return
-                except (CDPJSError, json.JSONDecodeError, TypeError, ValueError):
-                    pass
 
             # Image/tool responses can complete entirely in backend nodes
             # without ever creating the ordinary assistant DOM wrapper.  When
@@ -694,6 +740,7 @@ class CompletionDetector:
         backend_terminal_node = ""
         backend_terminal_confirmations = 0
         conv_id_for_check = d._current_conv_id or ""
+        last_global_non_text_asset_ids: set[str] = set()
         # Mid-loop conv_id probe throttle. On a NEW chat (REST /health path or
         # the SSE/MCP path) _current_conv_id is None here and conv_id_for_check
         # is "" — which silently disables the backend end_turn fallback below
@@ -836,10 +883,41 @@ class CompletionDetector:
             html_len = data.get("html_len", 0)
             child_count = data.get("child_count", 0)
             meaningful_non_text = data.get("has_meaningful_non_text") is True
+            all_new_dom_assets: list[dict] = []
+            current_dom_assets: list[dict] = []
+            image_action_increased = False
+            global_generation_active = False
+            if expect_non_text:
+                non_text_state = await self._probe_non_text_dom_state(d)
+                (
+                    all_new_dom_assets,
+                    current_dom_assets,
+                    image_action_increased,
+                ) = self._select_new_non_text_dom_assets(
+                    non_text_state,
+                    initial_action_count=initial_non_text_action_count,
+                    initial_asset_ids=initial_non_text_asset_ids,
+                )
+                global_generation_active = bool(
+                    non_text_state.get("generation_active")
+                )
+                current_asset_ids = {
+                    str(asset.get("identity") or "")
+                    for asset in all_new_dom_assets
+                }
+                if current_asset_ids != last_global_non_text_asset_ids:
+                    last_global_non_text_asset_ids = current_asset_ids
+                    last_change_time = time.monotonic()
+                meaningful_non_text = (
+                    meaningful_non_text or bool(all_new_dom_assets)
+                )
             has_action = data.get("has_action", False)
             has_exact_action = data.get("has_exact_action", False)
             is_thinking = data.get("is_thinking", False)
-            generation_active = data.get("generation_active", False)
+            generation_active = bool(
+                data.get("generation_active", False)
+                or global_generation_active
+            )
 
             current = strip_reasoning_ui_prefix(current)
 
@@ -969,6 +1047,7 @@ class CompletionDetector:
             # content) so this can't complete an empty answer. Fetch failures set
             # backend_fetch_failed so the DOM fallback below is unlocked this poll.
             backend_fetch_failed = False
+            backend_rate_limited = False
             if (
                 conv_id_for_check
                 and (
@@ -1047,6 +1126,13 @@ class CompletionDetector:
                             backend_terminal_confirmations = 0
                     if status == "fetch_failed":
                         backend_fetch_failed = True
+                        backend_error = str(
+                            (end_result.diagnostic or {}).get("error") or ""
+                        ).lower()
+                        backend_rate_limited = (
+                            "http 429" in backend_error
+                            or "status 429" in backend_error
+                        )
                         logger.debug(
                             "end_turn fetch failed (status=%s): %s",
                             end_result.status, end_result.diagnostic,
@@ -1061,7 +1147,47 @@ class CompletionDetector:
                     # Transport/backend failure — treat as fetch_failed so the
                     # DOM fallback unlocks for this poll.
                     backend_fetch_failed = True
+                    backend_error = str(e).lower()
+                    backend_rate_limited = (
+                        "http 429" in backend_error
+                        or "status 429" in backend_error
+                    )
                     logger.debug("end_turn fetch raised (ignored): %s", e)
+
+            # A new generated-image URL on the global conversation-turn
+            # surface, absent from the pre-send baseline, is explicit
+            # current-turn evidence. Fully loaded images are independently
+            # ready; lazy-loaded images are ready only when the image-action
+            # count also increased. Once generation is inactive, preserve the
+            # URL so the authenticated downloader can validate its bytes even
+            # when the backend projection is temporarily rate-limited (429).
+            # Empty shells, old images, and unrelated thumbnails cannot pass.
+            if (
+                expect_non_text
+                and current_dom_assets
+                and not generation_active
+                and not is_thinking
+            ):
+                self.non_text_dom_assets = [
+                    {
+                        "type": "image",
+                        "name": f"generated-image-{index}.png",
+                        "mime_type": "image/png",
+                        "file_id": str(asset.get("identity") or "")
+                        if str(asset.get("identity") or "").startswith("file_")
+                        else "",
+                        "source_url": str(asset["source_url"]),
+                    }
+                    for index, asset in enumerate(current_dom_assets, start=1)
+                ]
+                self.had_non_text_content = True
+                logger.info(
+                    "Completed current-turn DOM image asset captured in Phase 2 "
+                    "(%d new, action_increased=%s)",
+                    len(current_dom_assets),
+                    image_action_increased,
+                )
+                break
 
             # Exact per-turn DOM completion is authoritative.  Unlike the
             # broad ancestor/geometry fallback, this button is contained in
@@ -1128,7 +1254,14 @@ class CompletionDetector:
                 has_action
                 and (
                     (not conv_id_for_check and not hold_dom_text_until_terminal)
-                    or (conv_id_for_check and backend_fetch_failed)
+                    or (
+                        conv_id_for_check
+                        and backend_fetch_failed
+                        # HTTP 429 is not proof of completion.  Only the exact
+                        # current-turn action row may override it; the broad
+                        # geometry fallback could belong to an older turn.
+                        and (not backend_rate_limited or has_exact_action)
+                    )
                 )
                 and (last_dom_text or had_non_text_content)
                 and not generation_active

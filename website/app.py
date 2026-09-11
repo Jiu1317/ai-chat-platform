@@ -120,6 +120,7 @@ IMAGE_BRIDGE_REQUEST_TIMEOUT_SECONDS = 20 * 60
 EXTERNAL_ASSET_DOWNLOAD_TIMEOUT_SECONDS = 3 * 60
 EXTERNAL_ASSET_DOWNLOAD_ATTEMPTS = 3
 EXTERNAL_ASSET_ATTEMPT_TIMEOUT_SECONDS = 55
+EXTERNAL_RESPONSE_TIMEOUT_SECONDS = 20 * 60
 EXTERNAL_ASSET_RETRYABLE_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504, 520, 522, 524}
 EXTERNAL_ASSET_PATH_RE = re.compile(r"^/v1/assets/[A-Za-z0-9_-]{16,256}$")
 EXTERNAL_ASSET_MARKDOWN_RE = re.compile(
@@ -1655,9 +1656,31 @@ async def _cleanup_loop() -> None:
 async def lifespan(_: FastAPI):
     _prepare_directories()
     cleanup = asyncio.create_task(_cleanup_loop())
-    yield
-    cleanup.cancel()
-    await codex.stop()
+    try:
+        yield
+    finally:
+        cleanup.cancel()
+        await asyncio.gather(cleanup, return_exceptions=True)
+        current = asyncio.current_task()
+        active_tasks = {
+            task
+            for _owner, task in [*external_turns.values(), *image_turns.values()]
+            if task is not current
+        }
+        active_tasks.update(task for task in image_variant_tasks if task is not current)
+        for task in active_tasks:
+            if not task.done():
+                task.cancel()
+        if active_tasks:
+            await asyncio.gather(*active_tasks, return_exceptions=True)
+        external_turns.clear()
+        image_turns.clear()
+        image_variant_tasks.clear()
+        external_conversation_locks.clear()
+        external_conversation_states.clear()
+        chunk_upload_locks.clear()
+        chunk_upload_lock_times.clear()
+        await codex.stop()
 
 
 app = FastAPI(title="AI Chat", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
@@ -2585,6 +2608,56 @@ def _upload_file_result(stored_name: str, original: str, extension: str, size: i
     }
 
 
+def _write_upload_block(target: Path, block: bytes, create: bool) -> None:
+    with target.open("xb" if create else "ab") as handle:
+        if block and handle.write(block) != len(block):
+            raise OSError("上传分片未完整写入")
+
+
+def _sync_upload_file(target: Path) -> None:
+    with target.open("r+b") as handle:
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _truncate_upload_file(target: Path, size: int) -> None:
+    with target.open("r+b") as handle:
+        handle.truncate(size)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _upload_block_matches(target: Path, offset: int, block: bytes) -> bool:
+    with target.open("rb") as handle:
+        handle.seek(offset)
+        return handle.read(len(block)) == block
+
+
+def _write_chunk_block(target: Path, offset: int, block: bytes) -> None:
+    try:
+        with target.open("r+b") as handle:
+            handle.seek(offset)
+            if handle.write(block) != len(block):
+                raise OSError("分片未完整写入")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        try:
+            _truncate_upload_file(target, offset)
+        except OSError:
+            LOG.exception("Unable to roll back partial upload %s", target.name)
+        raise
+
+
+async def _await_upload_io(function, *args) -> Any:
+    task = asyncio.create_task(asyncio.to_thread(function, *args))
+    try:
+        return await asyncio.shield(task)
+    except BaseException:
+        await asyncio.gather(task, return_exceptions=True)
+        raise
+
+
 def _composer_text_preview(target: Path, original: str) -> str:
     try:
         edge = 1_600
@@ -2657,22 +2730,24 @@ async def _stream_upload_to_path(
     batch_size: int,
 ) -> tuple[int, int]:
     written = 0
+    created = False
     try:
-        with target.open("xb") as handle:
-            while True:
-                block = await upload.read(UPLOAD_STREAM_BYTES)
-                if not block:
-                    break
-                written += len(block)
-                if written > MAX_FILE_BYTES:
-                    raise HTTPException(413, f"{_safe_filename(upload.filename or 'file')} 超过 30 MB")
-                if batch_size + written > MAX_UPLOAD_BATCH_BYTES:
-                    raise HTTPException(413, "单次上传的文件合计超过 30 MB")
-                handle.write(block)
-            handle.flush()
-            os.fsync(handle.fileno())
+        while True:
+            block = await upload.read(UPLOAD_STREAM_BYTES)
+            if not block:
+                break
+            written += len(block)
+            if written > MAX_FILE_BYTES:
+                raise HTTPException(413, f"{_safe_filename(upload.filename or 'file')} 超过 30 MB")
+            if batch_size + written > MAX_UPLOAD_BATCH_BYTES:
+                raise HTTPException(413, "单次上传的文件合计超过 30 MB")
+            await _await_upload_io(_write_upload_block, target, block, not created)
+            created = True
+        if not created:
+            await _await_upload_io(_write_upload_block, target, b"", True)
+        await _await_upload_io(_sync_upload_file, target)
     except BaseException:
-        target.unlink(missing_ok=True)
+        await _await_upload_io(_remove_paths, target)
         raise
     return written, batch_size + written
 
@@ -2810,18 +2885,13 @@ async def upload_chunk(
             and current_size < expected_size
             and offset % UPLOAD_CHUNK_BYTES == 0
         ):
-            with part_path.open("r+b") as handle:
-                handle.truncate(offset)
-                handle.flush()
-                os.fsync(handle.fileno())
+            await _await_upload_io(_truncate_upload_file, part_path, offset)
             current_size = offset
         if offset < current_size:
             if offset + len(block) > current_size:
                 raise HTTPException(409, f"分片偏移冲突，应从 {current_size} 字节继续")
-            with source.open("rb") as handle:
-                handle.seek(offset)
-                if handle.read(len(block)) != block:
-                    raise HTTPException(409, "重复分片内容不一致")
+            if not await _await_upload_io(_upload_block_matches, source, offset, block):
+                raise HTTPException(409, "重复分片内容不一致")
             if source == part_path:
                 os.utime(part_path, None)
             os.utime(metadata_path, None)
@@ -2837,22 +2907,7 @@ async def upload_chunk(
         if source == final_path:
             raise HTTPException(409, "文件已经完成，不能继续追加分片")
         if block:
-            try:
-                with part_path.open("r+b") as handle:
-                    handle.seek(current_size)
-                    if handle.write(block) != len(block):
-                        raise OSError("分片未完整写入")
-                    handle.flush()
-                    os.fsync(handle.fileno())
-            except BaseException:
-                try:
-                    with part_path.open("r+b") as handle:
-                        handle.truncate(current_size)
-                        handle.flush()
-                        os.fsync(handle.fileno())
-                except OSError:
-                    LOG.exception("Unable to roll back partial upload %s", upload_id)
-                raise
+            await _await_upload_io(_write_chunk_block, part_path, current_size, block)
         os.utime(metadata_path, None)
         next_offset = offset + len(block)
         return {
@@ -3252,7 +3307,12 @@ def _extract_attachment_text(
     try:
         if extension == ".pdf":
             reader = PdfReader(str(target))
-            extracted = "\n\n".join((page.extract_text() or "") for page in reader.pages)
+            extracted = _stream_relevant_attachment_excerpt(
+                ((page.extract_text() or "") + "\n\n" for page in reader.pages),
+                query,
+                MAX_EXTRACTED_CHARS,
+                query_terms=query_terms,
+            )
             if not extracted.strip():
                 extracted = "该 PDF 没有可提取的文本，可能是扫描件。"
         elif extension in OFFICE_EXTENSIONS:
@@ -3260,7 +3320,13 @@ def _extract_attachment_text(
             if not extracted.strip():
                 extracted = "该 Office 文件没有可提取的文字。"
         else:
-            extracted = target.read_text(encoding="utf-8", errors="replace")
+            with target.open("r", encoding="utf-8", errors="replace") as handle:
+                extracted = _stream_relevant_attachment_excerpt(
+                    iter(lambda: handle.read(64 * 1024), ""),
+                    query,
+                    MAX_EXTRACTED_CHARS,
+                    query_terms=query_terms,
+                )
     except Exception as exc:
         extracted = f"附件读取失败：{exc}"
     return _relevant_attachment_excerpt(
@@ -3444,6 +3510,74 @@ def _relevant_attachment_excerpt(
         elif candidate_slots and entry[:2] > candidates[0][:2]:
             heapq.heapreplace(candidates, entry)
     selected.update({index: chunk for _score, _reverse, index, chunk in candidates})
+    result = "\n\n…\n\n".join(selected[index] for index in sorted(selected))
+    return _clip_context_text(result, limit)
+
+
+def _stream_relevant_attachment_excerpt(
+    parts,
+    query: str,
+    limit: int,
+    *,
+    query_terms: list[str] | None = None,
+) -> str:
+    """Select a bounded relevant excerpt without loading the source in memory."""
+    if limit <= 0:
+        return ""
+    chunk_size = 1_200
+    terms = query_terms if query_terms is not None else _context_query_terms(query)
+    rank_capacity = max(2, math.ceil(limit / chunk_size) + 2)
+    ranked: list[tuple[int, int, int, str]] = []
+    small_chunks: list[str] = []
+    buffered = ""
+    first = ""
+    last = ""
+    last_index = -1
+    total_chars = 0
+
+    def consume(raw_chunk: str) -> None:
+        nonlocal first, last, last_index, total_chars
+        if not raw_chunk:
+            return
+        chunk = unicodedata.normalize("NFC", raw_chunk)
+        index = last_index + 1
+        last_index = index
+        total_chars += len(chunk)
+        if index == 0:
+            first = chunk
+        last = chunk
+        if total_chars <= limit:
+            small_chunks.append(chunk)
+        if index > 0:
+            lowered = chunk.lower()
+            score = sum(len(term) * len(term) for term in terms if term in lowered)
+            entry = (score, -index, index, chunk)
+            if len(ranked) < rank_capacity:
+                heapq.heappush(ranked, entry)
+            elif entry[:2] > ranked[0][:2]:
+                heapq.heapreplace(ranked, entry)
+
+    for part in parts:
+        if not part:
+            continue
+        buffered += str(part)
+        while len(buffered) >= chunk_size:
+            consume(buffered[:chunk_size])
+            buffered = buffered[chunk_size:]
+    consume(buffered)
+
+    if last_index < 0:
+        return ""
+    if total_chars <= limit:
+        return _normalize_context_text("".join(small_chunks))
+    selected: dict[int, str] = {0: first}
+    if last_index:
+        selected[last_index] = last
+    mandatory_size = sum(len(chunk) for chunk in selected.values()) + 5 * (len(selected) - 1)
+    candidate_slots = max(0, (limit - mandatory_size) // (chunk_size + 5))
+    candidates = [entry for entry in ranked if entry[2] != last_index]
+    for _score, _reverse, index, chunk in sorted(candidates, reverse=True)[:candidate_slots]:
+        selected[index] = chunk
     result = "\n\n…\n\n".join(selected[index] for index in sorted(selected))
     return _clip_context_text(result, limit)
 
@@ -3859,7 +3993,7 @@ async def _generate_image(prompt: str, workspace: Path) -> dict[str, Any]:
 
 async def _image_stream(payload: TurnRequest, workspace: Path, user_id: str) -> AsyncIterator[bytes]:
     turn_id = uuid.uuid4().hex
-    if payload.attachments:
+    if payload.attachments or payload.project_attachments:
         yield _ndjson({"type": "started", "threadId": "image", "turnId": turn_id, "mode": "image"})
         yield _ndjson({"type": "error", "message": "当前仅支持文字描述生成图片，暂不支持参考图编辑"})
         return
@@ -3868,15 +4002,21 @@ async def _image_stream(payload: TurnRequest, workspace: Path, user_id: str) -> 
     try:
         yield _ndjson({"type": "started", "threadId": "image", "turnId": turn_id, "mode": "image"})
         yield _ndjson({"type": "replace", "text": "正在生成图片，请稍候…"})
-        while not task.done():
-            done, _ = await asyncio.wait(
-                {task}, timeout=LONG_TASK_HEARTBEAT_SECONDS
-            )
-            if not done:
-                yield _ndjson({"type": "ping"})
-        generated = await task
+        async with asyncio.timeout(IMAGE_BRIDGE_REQUEST_TIMEOUT_SECONDS):
+            while not task.done():
+                done, _ = await asyncio.wait(
+                    {task}, timeout=LONG_TASK_HEARTBEAT_SECONDS
+                )
+                if not done:
+                    yield _ndjson({"type": "ping"})
+            generated = await task
         yield _ndjson({"type": "replace", "text": "图片已生成。"})
         yield _ndjson({"type": "done", "files": [generated], "cost": {"kind": "unavailable"}})
+    except TimeoutError:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        yield _ndjson({"type": "error", "message": "图片桥接超过 20 分钟，已自动停止"})
     except asyncio.CancelledError:
         if not task.done():
             task.cancel()
@@ -4776,16 +4916,20 @@ async def _external_stream(
             external_context_key=context_key,
             completion_state=completion_state,
         )
-        async for event in _iter_with_heartbeat(source):
-            if event is None:
-                yield _ndjson({"type": "ping"})
-            else:
-                if site_key and completion_state.get("external_conversation_id"):
-                    external_conversation_states[site_key] = {
-                        "external_conversation_id": completion_state["external_conversation_id"],
-                        "external_context_key": completion_state["external_context_key"],
-                    }
-                yield event
+        try:
+            async with asyncio.timeout(EXTERNAL_RESPONSE_TIMEOUT_SECONDS):
+                async for event in _iter_with_heartbeat(source):
+                    if event is None:
+                        yield _ndjson({"type": "ping"})
+                    else:
+                        if site_key and completion_state.get("external_conversation_id"):
+                            external_conversation_states[site_key] = {
+                                "external_conversation_id": completion_state["external_conversation_id"],
+                                "external_context_key": completion_state["external_context_key"],
+                            }
+                        yield event
+        except TimeoutError:
+            yield _ndjson({"type": "error", "message": "API 回答超过 20 分钟，已自动停止"})
 
     try:
         if lock:
@@ -4806,15 +4950,16 @@ async def turn(request: Request, payload: TurnRequest):
     user = _require_auth(request)
     workspace = _session_path(user["id"], payload.session_id)
     _validate_user_content_size(payload, workspace)
-    if _is_image_generation_request(payload.message):
+    external = _decode_external_model(payload.model)
+    if external is None and _is_image_generation_request(payload.message):
         await _clear_external_conversation_state(user["id"], payload.client_conversation_id)
-        _reserve_message_slot(user["id"])
+        if not payload.attachments and not payload.project_attachments:
+            _reserve_message_slot(user["id"])
         return StreamingResponse(
             _image_stream(payload, workspace, user["id"]),
             media_type="application/x-ndjson",
             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
         )
-    external = _decode_external_model(payload.model)
     if external:
         provider_id, model_id = external
         provider = _provider_by_id(provider_id)

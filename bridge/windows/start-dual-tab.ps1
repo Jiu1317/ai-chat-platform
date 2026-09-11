@@ -4,6 +4,8 @@ $WorkRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $PythonExe = Join-Path $WorkRoot '.venv\Scripts\python.exe'
 $ConfigFile = Join-Path $WorkRoot 'web2api-config.json'
 $GatewayFile = Join-Path $WorkRoot 'dual_tab_gateway.py'
+$ProcessStateFile = Join-Path $WorkRoot 'dual-tab-processes.json'
+$startedProcesses = @()
 
 # urllib honors system proxy variables. CDP and worker traffic must never send
 # loopback addresses through the desktop HTTP proxy.
@@ -17,6 +19,7 @@ if (-not (Test-Path -LiteralPath $ConfigFile)) {
     throw "Configuration not found. Copy web2api-config.example.json to web2api-config.json and replace the API key."
 }
 
+try {
 $existing = Get-CimInstance Win32_Process | Where-Object {
     $_.CommandLine -and (
         $_.CommandLine -like "*$GatewayFile*" -or
@@ -32,6 +35,7 @@ $worker1 = Start-Process -FilePath $PythonExe -ArgumentList @(
     '-m', 'chatgpt_web2api', '--config', $ConfigFile,
     '--port', '9182', '--cdp-port', '9325'
 ) -WindowStyle Hidden -RedirectStandardOutput (Join-Path $WorkRoot 'dual-worker-1.stdout.log') -RedirectStandardError (Join-Path $WorkRoot 'dual-worker-1.stderr.log') -PassThru
+$startedProcesses += $worker1
 
 $worker1Deadline = (Get-Date).AddSeconds(30)
 do {
@@ -47,6 +51,7 @@ $worker2 = Start-Process -FilePath $PythonExe -ArgumentList @(
     '-m', 'chatgpt_web2api', '--config', $ConfigFile,
     '--port', '9183', '--cdp-port', '9325'
 ) -WindowStyle Hidden -RedirectStandardOutput (Join-Path $WorkRoot 'dual-worker-2.stdout.log') -RedirectStandardError (Join-Path $WorkRoot 'dual-worker-2.stderr.log') -PassThru
+$startedProcesses += $worker2
 
 $deadline = (Get-Date).AddSeconds(45)
 do {
@@ -63,13 +68,14 @@ $gateway = Start-Process -FilePath $PythonExe -ArgumentList @(
     $GatewayFile, '--host', '127.0.0.1', '--port', '9181',
     '--backends', 'http://127.0.0.1:9182', 'http://127.0.0.1:9183'
 ) -WindowStyle Hidden -RedirectStandardOutput (Join-Path $WorkRoot 'dual-gateway.stdout.log') -RedirectStandardError (Join-Path $WorkRoot 'dual-gateway.stderr.log') -PassThru
+$startedProcesses += $gateway
 
 @{
     gateway = $gateway.Id
     worker1 = $worker1.Id
     worker2 = $worker2.Id
     started_at = (Get-Date).ToString('o')
-} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $WorkRoot 'dual-tab-processes.json') -Encoding UTF8
+} | ConvertTo-Json | Set-Content -LiteralPath $ProcessStateFile -Encoding UTF8
 
 Start-Sleep -Seconds 2
 $health = Invoke-RestMethod -Uri 'http://127.0.0.1:9181/health' -TimeoutSec 10
@@ -78,3 +84,15 @@ if ($health.ready_backends -ne 2) {
 }
 
 Write-Output "Dual-tab gateway ready: gateway=$($gateway.Id), workers=$($worker1.Id),$($worker2.Id)"
+} catch {
+    foreach ($startedProcess in $startedProcesses) {
+        try {
+            Stop-Process -Id $startedProcess.Id -Force -ErrorAction SilentlyContinue
+        } catch {
+            # Continue cleanup so one failed stop cannot leave the other
+            # processes from this startup attempt running.
+        }
+    }
+    Remove-Item -LiteralPath $ProcessStateFile -Force -ErrorAction SilentlyContinue
+    throw
+}

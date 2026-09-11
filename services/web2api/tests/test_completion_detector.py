@@ -718,10 +718,22 @@ async def test_expected_non_text_can_complete_from_backend_before_dom_node():
 
 
 @pytest.mark.asyncio
-async def test_expected_image_completes_from_new_image_action_without_assistant_node():
+async def test_expected_image_completes_from_new_lazy_asset_and_action_without_assistant_node():
     detector, driver = _make_detector()
 
     async def fake_js(expr):
+        if "actionCount" in expr:
+            return json.dumps({
+                "generationActive": False,
+                "actionCount": 2,
+                "assets": [
+                    {
+                        "identity": "file_new",
+                        "source_url": "https://chatgpt.com/backend-api/estuary/content?id=file_new",
+                        "loaded": False,
+                    }
+                ],
+            })
         if "image-turn-action-button" in expr:
             return "2"
         if "innerText" in expr:
@@ -743,6 +755,7 @@ async def test_expected_image_completes_from_new_image_action_without_assistant_
 
     assert chunks == []
     assert detector.had_non_text_content is True
+    assert detector.non_text_dom_assets[0]["file_id"] == "file_new"
     driver._fetch_end_turn_for_turn.assert_not_awaited()
 
 
@@ -751,18 +764,20 @@ async def test_expected_image_completes_from_new_loaded_estuary_asset():
     detector, driver = _make_detector()
 
     async def fake_js(expr):
-        if "image-turn-action-button" in expr:
-            return "0"
-        if "estuary/content" in expr:
+        if "actionCount" in expr:
             return json.dumps({
                 "generationActive": False,
+                "actionCount": 0,
                 "assets": [
                     {
                         "identity": "file_new",
                         "source_url": "https://chatgpt.com/backend-api/estuary/content?id=file_new",
+                        "loaded": True,
                     }
                 ],
             })
+        if "image-turn-action-button" in expr:
+            return "0"
         if "innerText" in expr:
             return '{"text": ""}'
         return "0"

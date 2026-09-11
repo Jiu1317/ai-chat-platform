@@ -12,6 +12,9 @@ EnvironmentFile=/etc/ai-chat/image-bridge.env
 ExecStart=/usr/bin/node /srv/ai-chat/current/services/image-bridge/image-bridge.mjs
 Restart=on-failure
 RestartSec=3
+# The bridge drains active generation/download requests for up to 19m30s.
+# Keep systemd's deadline slightly above the bridge's own bounded fallback.
+TimeoutStopSec=20min
 PrivateTmp=true
 NoNewPrivileges=true
 

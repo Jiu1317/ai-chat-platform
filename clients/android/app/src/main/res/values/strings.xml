@@ -14,5 +14,6 @@
     <string name="download_started">已开始下载</string>
     <string name="download_saved">文件已保存到下载目录</string>
     <string name="download_failed">下载失败</string>
+    <string name="download_too_large">文件超过 30 MiB，无法下载</string>
     <string name="no_app">没有找到可以打开此链接的应用</string>
 </resources>

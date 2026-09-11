@@ -104,6 +104,12 @@ SEND_BUTTON_BROAD_SELECTOR = (
 # indefinitely on a genuinely broken composer.
 SEND_BUTTON_POLL_INTERVAL_S = 0.3
 SEND_BUTTON_POLL_MAX_WAIT_S = 10.0
+# Large reference images can keep ChatGPT's submit button disabled while the
+# browser finishes uploading them.  The ordinary 10-second composer-reset
+# budget is too short for a 30 MiB attachment on a slow uplink.  Five minutes
+# covers roughly 30 MiB at 1 Mbps plus browser-side processing while remaining
+# bounded when the upload/composer is genuinely stuck.
+ATTACHMENT_SEND_BUTTON_MAX_WAIT_S = 300.0
 
 
 class ChatGPTDom:
@@ -507,7 +513,7 @@ class ChatGPTDom:
         # match, OR actual == expected + one editor newline.
         return canon_actual == canon_expected or canon_actual == canon_expected + "\n"
 
-    async def click_send(self) -> None:
+    async def click_send(self, *, wait_timeout: float | None = None) -> None:
         """Click the send button via JS MouseEvent sequence.
 
         The new composer has no ``data-testid="send-button"``; its send
@@ -523,7 +529,12 @@ class ChatGPTDom:
         # budgeted (not a fixed iteration count) so the wait scales to the
         # composer-reset window after a prior send — see
         # SEND_BUTTON_POLL_MAX_WAIT_S for rationale.
-        deadline = time.monotonic() + SEND_BUTTON_POLL_MAX_WAIT_S
+        max_wait = (
+            SEND_BUTTON_POLL_MAX_WAIT_S
+            if wait_timeout is None
+            else max(0.0, float(wait_timeout))
+        )
+        deadline = time.monotonic() + max_wait
         while time.monotonic() < deadline:
             has_btn = await d._js(
                 "(function() {"
@@ -559,11 +570,9 @@ class ChatGPTDom:
 
             raise SendReadinessError(f"Send failed: {result}")
         logger.info("Message sent")
-        # Success: clear composer failure history and recover a half-open
-        # breaker. Only after the message is confirmed sent — not after
-        # type_message alone, since a successful type can still fail to send.
-        if d._breakers:
-            d._breakers.record_success(BreakerKind.COMPOSER_SEND_READINESS)
+        # Dispatching synthetic click events only proves that JavaScript ran.
+        # CDPDriver records breaker success after UUID/DOM acknowledgment;
+        # clearing failures here would erase consecutive rejected sends.
 
     # ── Rate-limit popup ──────────────────────────────────────
 

@@ -10,14 +10,17 @@ Endpoints:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import os
 import re
 import secrets
 import tempfile
 import time
 import unicodedata
 import uuid
+from pathlib import Path
 
 from aiohttp import web
 
@@ -53,6 +56,10 @@ ASSET_PREFETCH_TIMEOUT_SECONDS = 3 * 60
 MAX_ASSET_CACHE_ITEMS = 4
 MAX_ASSET_CACHE_BYTES = 30 * 1024 * 1024
 MAX_ASSET_CACHE_TOTAL_BYTES = MAX_ASSET_CACHE_ITEMS * MAX_ASSET_CACHE_BYTES
+MAX_SHARED_ASSET_CACHE_ITEMS = MAX_ASSET_CACHE_ITEMS * 2
+MAX_SHARED_ASSET_CACHE_TOTAL_BYTES = (
+    MAX_SHARED_ASSET_CACHE_ITEMS * MAX_ASSET_CACHE_BYTES
+)
 MAX_HISTORY_TURNS = 31
 MAX_CONTEXT_CHARS = 150_000
 MAX_SYSTEM_CONTEXT_CHARS = 24_000
@@ -253,6 +260,12 @@ class APIServer:
         self._last_project_id: str | None = None
         self._asset_tokens: dict[str, tuple[float, dict]] = {}
         self._asset_cache: dict[str, tuple[float, dict]] = {}
+        configured_asset_dir = os.environ.get("W2A_ASSET_CACHE_DIR", "").strip()
+        self._asset_cache_dir = (
+            Path(configured_asset_dir).expanduser()
+            if configured_asset_dir
+            else Path(config.chrome.user_data_dir).expanduser().parent / "asset-cache"
+        )
 
         self.app = web.Application(client_max_size=70 * 1024 * 1024)
         self.app.router.add_post("/v1/chat/completions", self._handle_chat)
@@ -323,8 +336,8 @@ class APIServer:
             result["content_type"] = detected_type
         return result
 
-    def _cache_asset(self, token: str, expires_at: float, downloaded: dict) -> None:
-        """Store bounded, expiring asset bytes in the process-local cache."""
+    def _cache_asset_memory(self, token: str, expires_at: float, downloaded: dict) -> None:
+        """Store bounded, expiring asset bytes in this worker's memory."""
         data = downloaded.get("data")
         if not isinstance(data, bytes) or len(data) > MAX_ASSET_CACHE_BYTES:
             return
@@ -345,6 +358,134 @@ class APIServer:
             if isinstance(evicted_data, bytes):
                 total_bytes -= len(evicted_data)
 
+    @staticmethod
+    def _asset_disk_key(token: str) -> str:
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    def _asset_disk_paths(self, token: str) -> tuple[Path, Path]:
+        key = self._asset_disk_key(token)
+        return self._asset_cache_dir / f"{key}.json", self._asset_cache_dir / f"{key}.bin"
+
+    def _purge_disk_assets_sync(self, now: float | None = None) -> None:
+        """Remove expired/invalid disk records and enforce the shared bound."""
+        current = time.time() if now is None else now
+        try:
+            metadata_files = list(self._asset_cache_dir.glob("*.json"))
+        except OSError:
+            return
+
+        live: list[tuple[float, int, Path, Path]] = []
+        for metadata_path in metadata_files:
+            data_path = metadata_path.with_suffix(".bin")
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                expires_at = float(metadata["expires_at"])
+                size = data_path.stat().st_size
+                if expires_at <= current or size <= 0 or size > MAX_ASSET_CACHE_BYTES:
+                    raise ValueError("expired or invalid asset")
+                live.append((metadata_path.stat().st_mtime, size, metadata_path, data_path))
+            except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+                for path in (metadata_path, data_path):
+                    try:
+                        path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+
+        live.sort(key=lambda item: item[0])
+        total_bytes = sum(item[1] for item in live)
+        while (
+            len(live) > MAX_SHARED_ASSET_CACHE_ITEMS
+            or total_bytes > MAX_SHARED_ASSET_CACHE_TOTAL_BYTES
+        ):
+            _, size, metadata_path, data_path = live.pop(0)
+            total_bytes -= size
+            for path in (metadata_path, data_path):
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    def _write_asset_disk_sync(
+        self, token: str, expires_at: float, downloaded: dict
+    ) -> None:
+        """Atomically persist validated bytes for another worker or restart."""
+        data = downloaded.get("data")
+        if not isinstance(data, bytes) or not data or len(data) > MAX_ASSET_CACHE_BYTES:
+            return
+        self._asset_cache_dir.mkdir(parents=True, exist_ok=True)
+        metadata_path, data_path = self._asset_disk_paths(token)
+        suffix = f".{os.getpid()}.{secrets.token_hex(4)}.tmp"
+        metadata_tmp = Path(str(metadata_path) + suffix)
+        data_tmp = Path(str(data_path) + suffix)
+        metadata = {
+            "token": token,
+            "expires_at": expires_at,
+            "content_type": str(
+                downloaded.get("content_type") or "application/octet-stream"
+            ),
+            "filename": str(downloaded.get("filename") or "attachment"),
+        }
+        try:
+            data_tmp.write_bytes(data)
+            metadata_tmp.write_text(json.dumps(metadata), encoding="utf-8")
+            os.replace(data_tmp, data_path)
+            os.replace(metadata_tmp, metadata_path)
+            self._purge_disk_assets_sync()
+        finally:
+            for path in (metadata_tmp, data_tmp):
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    def _load_asset_disk_sync(self, token: str) -> tuple[float, dict] | None:
+        metadata_path, data_path = self._asset_disk_paths(token)
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            expires_at = float(metadata["expires_at"])
+            if metadata.get("token") != token or expires_at <= time.time():
+                raise ValueError("asset record expired or mismatched")
+            size = data_path.stat().st_size
+            if size <= 0 or size > MAX_ASSET_CACHE_BYTES:
+                raise ValueError("asset data size is invalid")
+            data = data_path.read_bytes()
+            if len(data) != size:
+                raise ValueError("asset data changed while reading")
+            downloaded = {
+                "data": data,
+                "content_type": str(
+                    metadata.get("content_type") or "application/octet-stream"
+                ),
+                "filename": str(metadata.get("filename") or "attachment"),
+            }
+            return expires_at, downloaded
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+            for path in (metadata_path, data_path):
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            return None
+
+    async def _cache_asset(
+        self, token: str, expires_at: float, downloaded: dict
+    ) -> None:
+        """Cache an asset in memory and in the shared restart-safe store."""
+        self._cache_asset_memory(token, expires_at, downloaded)
+        try:
+            await asyncio.to_thread(
+                self._write_asset_disk_sync, token, expires_at, downloaded
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # The in-memory capability remains usable even if disk persistence
+            # is unavailable; report the degraded restart behavior explicitly.
+            logger.warning("Generated asset disk cache write failed: %s", exc)
+
+    async def _load_asset_disk(self, token: str) -> tuple[float, dict] | None:
+        return await asyncio.to_thread(self._load_asset_disk_sync, token)
+
     async def _prefetch_published_assets(self, assets: list[dict]) -> None:
         """Fill the generated-image cache before capability URLs are exposed."""
         async def _prefetch(asset: dict) -> None:
@@ -360,7 +501,7 @@ class APIServer:
                     timeout=ASSET_PREFETCH_TIMEOUT_SECONDS,
                 )
                 validated = self._validated_asset_download(record[1], downloaded)
-                self._cache_asset(token, record[0], validated)
+                await self._cache_asset(token, record[0], validated)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -434,24 +575,30 @@ class APIServer:
         token = request.match_info.get("token", "")
         self._purge_expired_assets()
         record = self._asset_tokens.get(token)
-        if not record or record[0] <= time.time():
+        disk_cached = await self._load_asset_disk(token)
+        if (not record or record[0] <= time.time()) and disk_cached is None:
             self._asset_tokens.pop(token, None)
             self._asset_cache.pop(token, None)
             raise web.HTTPNotFound(text="Asset link is invalid or expired")
         cached = self._asset_cache.get(token)
         if cached and cached[0] > time.time():
             downloaded = cached[1]
+        elif disk_cached is not None:
+            expires_at, downloaded = disk_cached
+            self._cache_asset_memory(token, expires_at, downloaded)
         else:
+            assert record is not None
             try:
                 downloaded = await self._driver.download_response_asset(record[1])
                 downloaded = self._validated_asset_download(record[1], downloaded)
             except Exception as exc:
                 logger.warning("Asset proxy failed: %s", exc)
                 raise web.HTTPBadGateway(text="Could not retrieve ChatGPT asset") from exc
-            self._cache_asset(token, record[0], downloaded)
+            await self._cache_asset(token, record[0], downloaded)
         content_type = str(downloaded.get("content_type") or "application/octet-stream")
         content_type = content_type.split(";", 1)[0]
-        filename = str(downloaded.get("filename") or record[1].get("name") or "attachment")
+        source_name = record[1].get("name") if record is not None else None
+        filename = str(downloaded.get("filename") or source_name or "attachment")
         filename = "".join(c if c.isalnum() or c in "._-" else "_" for c in filename)[:120]
         return web.Response(
             body=downloaded["data"],
@@ -1336,6 +1483,14 @@ class APIServer:
             if not pending.done():
                 pending.cancel()
                 await asyncio.gather(pending, return_exceptions=True)
+            close = getattr(iterator, "aclose", None)
+            if callable(close):
+                try:
+                    await close()
+                except Exception as exc:
+                    # Cleanup must not replace the original client-disconnect
+                    # or stream error that caused the consumer to stop early.
+                    logger.debug("Async response iterator close failed: %s", exc)
 
     @staticmethod
     async def _send_sse(resp: web.StreamResponse, data: dict) -> None:
