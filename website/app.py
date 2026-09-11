@@ -83,6 +83,8 @@ MAX_CURRENT_ATTACHMENT_CONTEXT_CHARS = 48_000
 MAX_PROJECT_ATTACHMENT_CONTEXT_CHARS = 24_000
 MAX_PROJECT_FILE_EXCERPT_CHARS = 8_000
 MAX_PROJECT_CONTEXT_SOURCE_BYTES = 30 * 1024 * 1024
+MAX_CONTEXT_QUERY_SCAN_CHARS = 8_192
+MAX_CONTEXT_QUERY_SAMPLE_WINDOWS = 16
 MAX_EXTERNAL_IMAGES = 8
 MAX_EXTERNAL_IMAGE_BYTES = 30 * 1024 * 1024
 EXTERNAL_SYSTEM_VERSION = "ai-chat-v3"
@@ -3240,7 +3242,12 @@ def _external_context_key(
     ).hexdigest()
 
 
-def _extract_attachment_text(target: Path, query: str = "") -> str:
+def _extract_attachment_text(
+    target: Path,
+    query: str = "",
+    *,
+    query_terms: list[str] | None = None,
+) -> str:
     extension = target.suffix.lower()
     try:
         if extension == ".pdf":
@@ -3256,23 +3263,162 @@ def _extract_attachment_text(target: Path, query: str = "") -> str:
             extracted = target.read_text(encoding="utf-8", errors="replace")
     except Exception as exc:
         extracted = f"附件读取失败：{exc}"
-    return _relevant_attachment_excerpt(extracted, query, MAX_EXTRACTED_CHARS)
+    return _relevant_attachment_excerpt(
+        extracted,
+        query,
+        MAX_EXTRACTED_CHARS,
+        query_terms=query_terms,
+    )
+
+
+def _sample_context_query(query: str) -> str:
+    if len(query) <= MAX_CONTEXT_QUERY_SCAN_CHARS:
+        return query
+    window_count = MAX_CONTEXT_QUERY_SAMPLE_WINDOWS
+    window_chars = max(1, (MAX_CONTEXT_QUERY_SCAN_CHARS - window_count + 1) // window_count)
+    last_start = len(query) - window_chars
+    starts = sorted({
+        round(index * last_start / (window_count - 1))
+        for index in range(window_count)
+    })
+    return " ".join(query[start:start + window_chars] for start in starts)
+
+
+def _sampled_regex_matches(pattern: re.Pattern[str], text: str, limit: int) -> list[str]:
+    first_matches: list[str] = []
+    match_count = 0
+    for match in pattern.finditer(text):
+        if match_count < limit:
+            first_matches.append(match.group())
+        match_count += 1
+    if match_count <= limit:
+        return first_matches
+
+    wanted = {
+        round(index * (match_count - 1) / (limit - 1))
+        for index in range(limit)
+    }
+    return [
+        match.group()
+        for index, match in enumerate(pattern.finditer(text))
+        if index in wanted
+    ]
 
 
 def _context_query_terms(query: str) -> list[str]:
-    normalized = _normalize_context_text(query).lower()
+    normalized = _normalize_context_text(_sample_context_query(query)).lower()
     terms: list[str] = []
-    for token in re.findall(r"[a-z0-9_.-]{2,}|[\u4e00-\u9fff]{2,}", normalized):
-        candidates = [token] if len(token) <= 12 else [token[index:index + 2] for index in range(len(token) - 1)]
-        for candidate in candidates:
-            if candidate not in terms:
-                terms.append(candidate)
-            if len(terms) >= 16:
+    max_terms = 32
+    ignored = {
+        "请问", "帮我", "告诉我", "是什么", "什么意思", "怎么样", "怎么办",
+        "为什么", "有哪些", "有没有", "是否", "如何", "什么", "怎么",
+        "附件", "文档", "文件", "内容", "问题", "一下",
+        "what", "which", "where", "when", "why", "how", "the", "is", "are",
+        "does", "do", "please", "find", "tell", "about",
+    }
+
+    def add(candidate: str) -> None:
+        candidate = candidate.strip()
+        if 2 <= len(candidate) <= 64 and candidate not in terms and candidate not in ignored:
+            terms.append(candidate)
+
+    # Keep exact Latin identifiers first: model names, codes and hyphenated terms
+    # are usually more selective than natural-language filler.
+    latin_tokens = [
+        token
+        for token in _sampled_regex_matches(
+            re.compile(r"[a-z0-9_.-]{2,}"), normalized, 12
+        )
+        if token not in ignored
+    ]
+    for token in latin_tokens:
+        if len(token) <= 64:
+            add(token)
+        else:
+            add(token[:32])
+            add(token[-32:])
+
+    prefixes = (
+        "请问一下", "请告诉我", "请帮我查找", "请帮我查询", "帮我查找",
+        "帮我查询", "麻烦查找", "麻烦查询", "请查找", "请查询", "帮我看看",
+        "我想知道", "想知道", "请问", "请",
+    )
+    suffixes = (
+        "分别是什么", "是什么意思", "是什么东西", "是什么", "有哪些内容",
+        "有哪些", "怎么样", "怎么办", "如何处理", "如何", "请回答", "吗", "呢",
+    )
+    separators = re.compile(
+        r"(?:请问一下|请告诉我|请帮我|帮我|麻烦|请|查找|查询|搜索|概括|总结|"
+        r"根据|关于|告诉我|说明|回答|是什么意思|是什么|怎么样|怎么办|如何|"
+        r"是否|有没有|有哪些|附件|文档|文件|内容|问题|一下)"
+    )
+
+    variants: list[str] = []
+    chinese_tokens = _sampled_regex_matches(
+        re.compile(r"[\u4e00-\u9fff]{2,}"),
+        normalized,
+        MAX_CONTEXT_QUERY_SAMPLE_WINDOWS,
+    )
+    for token in chinese_tokens:
+        core = token
+        changed = True
+        while changed and len(core) >= 2:
+            changed = False
+            for prefix in prefixes:
+                if core.startswith(prefix) and len(core) - len(prefix) >= 2:
+                    core = core[len(prefix):]
+                    changed = True
+                    break
+            for suffix in suffixes:
+                if core.endswith(suffix) and len(core) - len(suffix) >= 2:
+                    core = core[:-len(suffix)]
+                    changed = True
+                    break
+
+        split_limit = max(1, 64 - len(variants))
+        for variant in (*separators.split(core, maxsplit=split_limit), core, token):
+            if len(variant) >= 2 and variant not in variants:
+                variants.append(variant)
+        if len(variants) >= 64:
+            break
+
+    # Add the concise subjects from every clause before n-grams so a long opening
+    # clause cannot consume the whole bounded term budget.
+    for variant in variants:
+        if len(variant) <= 12:
+            add(variant)
+            if len(terms) >= max_terms:
                 return terms
+
+    for width in (4, 3, 2):
+        windows: list[tuple[str, list[int]]] = []
+        for variant in variants:
+            if len(variant) >= width:
+                window_count = len(variant) - width + 1
+                if window_count <= 12:
+                    starts = list(range(window_count))
+                else:
+                    starts = sorted({round(index * (window_count - 1) / 11) for index in range(12)})
+                windows.append((variant, starts))
+        # Round-robin across clauses keeps both the start and end of a long
+        # question represented without creating an unbounded combination list.
+        for rank in range(12):
+            for variant, starts in windows:
+                if rank < len(starts):
+                    start = starts[rank]
+                    add(variant[start:start + width])
+                    if len(terms) >= max_terms:
+                        return terms
     return terms
 
 
-def _relevant_attachment_excerpt(text: str, query: str, limit: int) -> str:
+def _relevant_attachment_excerpt(
+    text: str,
+    query: str,
+    limit: int,
+    *,
+    query_terms: list[str] | None = None,
+) -> str:
     normalized = _normalize_context_text(text)
     if len(normalized) <= limit:
         return normalized
@@ -3280,7 +3426,7 @@ def _relevant_attachment_excerpt(text: str, query: str, limit: int) -> str:
     if limit < chunk_size * 2 + 5:
         return _clip_context_text(normalized, limit)
     chunk_count = math.ceil(len(normalized) / chunk_size)
-    terms = _context_query_terms(query)
+    terms = query_terms if query_terms is not None else _context_query_terms(query)
     selected: dict[int, str] = {
         0: normalized[:chunk_size],
         chunk_count - 1: normalized[(chunk_count - 1) * chunk_size:],
@@ -3291,7 +3437,7 @@ def _relevant_attachment_excerpt(text: str, query: str, limit: int) -> str:
     for index in range(1, chunk_count - 1):
         chunk = normalized[index * chunk_size:(index + 1) * chunk_size]
         lowered = chunk.lower()
-        score = sum(1 for term in terms if term in lowered)
+        score = sum(len(term) * len(term) for term in terms if term in lowered)
         entry = (score, -index, index, chunk)
         if len(candidates) < candidate_slots:
             heapq.heappush(candidates, entry)
@@ -3308,11 +3454,15 @@ def _attachment_inputs(
     include_history: bool = True,
     *,
     include_project_context: bool = True,
+    include_project_instructions: bool | None = None,
+    include_project_images: bool = True,
     max_text_chars: int | None = None,
     external_limits: bool = False,
 ) -> list[dict[str, Any]]:
     message = payload.message
-    if include_project_context and payload.project_instructions.strip():
+    if include_project_instructions is None:
+        include_project_instructions = include_project_context
+    if include_project_instructions and payload.project_instructions.strip():
         message = (
             "请在整个回答中遵循以下项目说明：\n"
             f"{payload.project_instructions.strip()}\n\n"
@@ -3344,6 +3494,7 @@ def _attachment_inputs(
     ]
     all_attachments = [*payload.attachments, *project_attachments]
     prepared: list[tuple[AttachmentRef, Path, bool, str | None]] = []
+    query_terms: list[str] | None = None
     selected_images = 0
     selected_image_bytes = 0
     selected_project_bytes = 0
@@ -3355,6 +3506,8 @@ def _attachment_inputs(
             raise HTTPException(400, f"附件 {attachment.name} 不存在")
         extension = target.suffix.lower()
         is_project = attachment.id not in current_ids
+        if is_project and extension in IMAGE_EXTENSIONS and not include_project_images:
+            continue
         size = target.stat().st_size
         if is_project and selected_project_bytes + size > MAX_PROJECT_CONTEXT_SOURCE_BYTES:
             omitted_project_files += 1
@@ -3377,7 +3530,14 @@ def _attachment_inputs(
             continue
         if is_project:
             selected_project_bytes += size
-        prepared.append((attachment, target, is_project, _extract_attachment_text(target, payload.message)))
+        if query_terms is None:
+            query_terms = _context_query_terms(payload.message)
+        prepared.append((
+            attachment,
+            target,
+            is_project,
+            _extract_attachment_text(target, payload.message, query_terms=query_terms),
+        ))
 
     current_documents = sum(1 for _attachment, _target, is_project, text in prepared if text is not None and not is_project)
     project_documents = sum(1 for _attachment, _target, is_project, text in prepared if text is not None and is_project)
@@ -3393,13 +3553,17 @@ def _attachment_inputs(
                 max(1, MAX_PROJECT_ATTACHMENT_CONTEXT_CHARS // max(1, project_documents)),
                 project_document_budget,
             )
-            excerpt = _relevant_attachment_excerpt(extracted, payload.message, per_file)
+            excerpt = _relevant_attachment_excerpt(
+                extracted, payload.message, per_file, query_terms=query_terms
+            )
             project_document_budget -= len(excerpt)
             attachment_label = "项目共享文件"
         else:
             per_file = max(1, MAX_CURRENT_ATTACHMENT_CONTEXT_CHARS // max(1, current_documents))
             per_file = min(per_file, current_document_budget)
-            excerpt = _relevant_attachment_excerpt(extracted, payload.message, per_file)
+            excerpt = _relevant_attachment_excerpt(
+                extracted, payload.message, per_file, query_terms=query_terms
+            )
             current_document_budget -= len(excerpt)
             attachment_label = "附件"
         block = f"\n【{attachment_label}：{attachment.name}】\n{excerpt}\n【文件结束】"
@@ -3915,6 +4079,8 @@ async def _external_current_content(
     user_id: str,
     *,
     include_project_context: bool = True,
+    include_project_instructions: bool | None = None,
+    include_project_images: bool = True,
     max_text_chars: int = MAX_CONTEXT_TEXT_CHARS,
 ) -> str | list[dict[str, Any]]:
     inputs = _attachment_inputs(
@@ -3922,6 +4088,8 @@ async def _external_current_content(
         workspace,
         include_history=False,
         include_project_context=include_project_context,
+        include_project_instructions=include_project_instructions,
+        include_project_images=include_project_images,
         max_text_chars=max_text_chars,
         external_limits=True,
     )
@@ -4344,12 +4512,16 @@ async def _external_response_stream(
         protocol = str(provider.get("protocol", "openai"))
         is_continuation = bool(reuse_conversation_id)
         current_limit = MAX_CONTEXT_TEXT_CHARS - (0 if is_continuation else len(EXTERNAL_SYSTEM_PROMPT))
+        # The upstream conversation already retains stable instructions and images.
+        # Re-excerpt project documents so a follow-up can ask about a different section.
         current_content = await _external_current_content(
             payload,
             workspace,
             protocol,
             user_id,
-            include_project_context=not is_continuation,
+            include_project_context=True,
+            include_project_instructions=not is_continuation,
+            include_project_images=not is_continuation,
             max_text_chars=max(1, current_limit),
         )
         if is_continuation:

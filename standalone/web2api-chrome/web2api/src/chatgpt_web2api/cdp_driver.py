@@ -1925,6 +1925,7 @@ class CDPDriver:
                 budgets=budgets,
                 model=model,
                 expect_non_text=expect_non_text,
+                has_input_attachments=bool(attachments),
                 initial_non_text_action_count=initial_non_text_action_count,
                 initial_non_text_asset_ids=initial_non_text_asset_ids,
             ):

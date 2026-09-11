@@ -379,6 +379,7 @@ class CompletionDetector:
         budgets: DetectorBudgets | None = None,
         model: str | None = None,
         expect_non_text: bool = False,
+        has_input_attachments: bool = False,
         initial_non_text_action_count: int = 0,
         initial_non_text_asset_ids: tuple[str, ...] = (),
     ) -> AsyncIterator[StreamChunk]:
@@ -1068,12 +1069,46 @@ class CompletionDetector:
             # prior-turn action row cannot satisfy it.  This also covers the
             # live failure mode where message-ID capture is missed and the
             # backend projection remains not_ready after the DOM has finished.
+            #
+            # Reasoning models deliberately hold mutable DOM narration until
+            # terminal (``current`` is cleared above).  For reference-image
+            # requests, once the exact action row appears and generation is
+            # inactive, ``observed_progress_text`` is the stable terminal
+            # answer and is safe to emit in one chunk.
+            # Without this promotion, ``last_dom_text`` can never become truthy
+            # for a completed Pro/reference-image turn, leaving the detector to
+            # wait for the full first-content timeout when the backend anchor
+            # projection remains ``not_ready``.
+            # Keep the promotion text-only and tool-free: generated-output
+            # requests must wait for an actual asset, while a web-search/tool
+            # surface can retain an action row through Stop-button flicker.
+            attachment_text_terminal = (
+                has_input_attachments
+                and not expect_non_text
+                and not had_non_text_content
+                and bool(observed_progress_text)
+            )
             if (
                 has_exact_action
-                and last_dom_text
+                and (
+                    last_dom_text
+                    or attachment_text_terminal
+                )
                 and not generation_active
                 and not is_thinking
             ):
+                if (
+                    hold_dom_text_until_terminal
+                    and attachment_text_terminal
+                    and observed_progress_text
+                ):
+                    terminal_delta = append_only_delta(
+                        last_dom_text, observed_progress_text
+                    )
+                    if terminal_delta:
+                        yield StreamChunk(delta=terminal_delta)
+                        last_dom_text += terminal_delta
+                        self.last_dom_text = last_dom_text
                 self.completed_via_exact_action = True
                 logger.info("Exact current-turn action detected (DOM completion)")
                 break

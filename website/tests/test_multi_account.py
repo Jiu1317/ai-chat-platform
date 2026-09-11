@@ -1082,6 +1082,77 @@ class UploadCapacityTests(unittest.TestCase):
             len(payload.message) + app.MAX_CURRENT_ATTACHMENT_CONTEXT_CHARS + 64,
         )
 
+    def test_large_document_retrieval_handles_short_chinese_english_and_long_queries(self) -> None:
+        def large_document(marker: str) -> str:
+            def chunk(prefix: str, fill: str) -> str:
+                return (prefix + fill * 1_200)[:1_200]
+
+            return "".join((
+                chunk("文件开头。", "甲"),
+                chunk("无关章节一。", "乙"),
+                chunk(marker, "丙"),
+                chunk("无关章节二。", "丁"),
+                chunk("文件结尾。", "戊"),
+            ))
+
+        cases = (
+            ("紫色彗星是什么", "紫色彗星对应编号 A-13579"),
+            ("What is the blue-rocket specification?", "blue-rocket specification code BX-42"),
+            (
+                (
+                    "请介绍一段非常冗长但与目标无关的背景说明以及已经完成的处理过程，"
+                    "然后告诉我绿色灯塔对应什么编号"
+                ),
+                "绿色灯塔对应编号 B-24680",
+            ),
+        )
+        for query, marker in cases:
+            with self.subTest(query=query):
+                terms = app._context_query_terms(query)
+                excerpt = app._relevant_attachment_excerpt(large_document(marker), query, 3_610)
+
+                self.assertLessEqual(len(terms), 32)
+                self.assertIn(marker, excerpt)
+
+    def test_query_terms_bound_work_for_very_long_mixed_language_input(self) -> None:
+        query = ("alpha " * 100_000) + ("背景" * 100_000) + " 绿色灯塔"
+
+        with (
+            patch.object(app, "_normalize_context_text", wraps=app._normalize_context_text) as normalize,
+            patch.object(app.re, "findall", side_effect=AssertionError("unbounded findall")),
+        ):
+            terms = app._context_query_terms(query)
+
+        sampled_query = normalize.call_args.args[0]
+        self.assertLessEqual(len(sampled_query), app.MAX_CONTEXT_QUERY_SCAN_CHARS)
+        self.assertLessEqual(len(terms), 32)
+        self.assertTrue(any("灯塔" in term for term in terms))
+
+    def test_attachment_inputs_compute_query_terms_once_for_multiple_documents(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            workspace = Path(directory)
+            upload_root = workspace / "uploads"
+            upload_root.mkdir()
+            attachments = []
+            for index in range(2):
+                name = f"large-{index}.txt"
+                (upload_root / name).write_text("无关内容" * 30_000, encoding="utf-8")
+                attachments.append(app.AttachmentRef(id=name, name=name))
+            payload = app.TurnRequest(
+                session_id="f" * 32,
+                message="绿色灯塔",
+                model="external",
+                effort="default",
+                attachments=attachments,
+            )
+
+            with patch.object(
+                app, "_context_query_terms", wraps=app._context_query_terms
+            ) as query_terms:
+                app._attachment_inputs(payload, workspace, include_history=False)
+
+            self.assertEqual(query_terms.call_count, 1)
+
 
 class ExternalContextTests(unittest.TestCase):
     def test_short_history_remains_verbatim(self) -> None:
@@ -1248,6 +1319,22 @@ class ExternalContextTests(unittest.TestCase):
             ])
             self.assertIn("另有 2 张项目共享图片", inputs[0]["text"])
 
+            continuation_inputs = app._attachment_inputs(
+                payload,
+                workspace,
+                include_history=False,
+                include_project_images=False,
+            )
+            continuation_images = [
+                Path(item["path"]).name
+                for item in continuation_inputs
+                if item["type"] == "localImage"
+            ]
+            self.assertEqual(
+                continuation_images,
+                [f"current-{index}.png" for index in range(5)],
+            )
+
     def test_project_images_are_omitted_before_current_images_hit_byte_limit(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             workspace = Path(directory)
@@ -1334,7 +1421,7 @@ class ExternalContextTests(unittest.TestCase):
         self.assertEqual(content[1]["source"]["media_type"], "image/webp")
         self.assertEqual(content[1]["source"]["data"], app.base64.b64encode(b"small").decode())
 
-    def test_first_request_is_bounded_and_continuation_only_sends_current_turn(self) -> None:
+    def test_first_request_is_bounded_and_continuation_refreshes_project_excerpt(self) -> None:
         bodies: list[dict] = []
         first_line = app.json.dumps({
             "conversation_id": "upstream_context_3",
@@ -1383,15 +1470,33 @@ class ExternalContextTests(unittest.TestCase):
             "apiKey": "test-key",
             "preset": "custom",
         }
+
+        def project_chunk(text: str) -> str:
+            return text + ("填" * (1_200 - len(text)))
+
+        project_document = "".join([
+            project_chunk("项目资料开头。"),
+            project_chunk("普通资料第一段。"),
+            project_chunk("普通资料第二段。"),
+            project_chunk("普通资料第三段。"),
+            project_chunk("普通资料第四段。"),
+            project_chunk("甲区答案 A-13579，仅用于首轮问题。"),
+            project_chunk("乙区答案 B-24680，仅用于第二轮问题。"),
+            project_chunk("普通资料第八段。"),
+            project_chunk("项目资料结尾。"),
+        ])
         first_payload = app.TurnRequest(
             session_id="3" * 32,
             client_conversation_id="4" * 32,
-            message="当前问题",
+            message="甲区",
             model="external",
             effort="default",
             project_instructions="项目规则",
+            project_attachments=[
+                app.AttachmentRef(id="project-notes.txt", name="project-notes.txt")
+            ],
         )
-        continuation_payload = first_payload.model_copy(update={"message": "只发这一问"})
+        continuation_payload = first_payload.model_copy(update={"message": "乙区"})
 
         async def scenario() -> tuple[list[dict], list[dict], dict[str, str]]:
             completion: dict[str, str] = {}
@@ -1404,6 +1509,9 @@ class ExternalContextTests(unittest.TestCase):
                 ),
                 patch.object(app.httpx, "AsyncClient", return_value=FakeClient()),
             ):
+                upload_root = Path(directory) / "uploads"
+                upload_root.mkdir()
+                (upload_root / "project-notes.txt").write_text(project_document, encoding="utf-8")
                 first_events = [
                     app.json.loads(event.decode())
                     async for event in app._external_response_stream(
@@ -1450,10 +1558,15 @@ class ExternalContextTests(unittest.TestCase):
         )
         self.assertEqual(first_body["messages"][0]["role"], "system")
         self.assertIn("较早对话摘录", first_body["messages"][-1]["content"])
+        self.assertIn("甲区答案 A-13579", first_body["messages"][-1]["content"])
+        self.assertNotIn("乙区答案 B-24680", first_body["messages"][-1]["content"])
         self.assertEqual(first_events[-1]["externalConversationId"], "upstream_context_3")
         self.assertEqual(completion["external_context_key"], "a" * 64)
         self.assertEqual(continuation_body["conversation_id"], "upstream_context_3")
-        self.assertEqual(continuation_body["messages"], [{"role": "user", "content": "只发这一问"}])
+        self.assertEqual(len(continuation_body["messages"]), 1)
+        continuation_content = continuation_body["messages"][0]["content"]
+        self.assertIn("乙区答案 B-24680", continuation_content)
+        self.assertNotIn("甲区答案 A-13579", continuation_content)
         self.assertNotIn("项目规则", app.json.dumps(continuation_body, ensure_ascii=False))
         self.assertEqual(continuation_events[-1]["type"], "done")
 

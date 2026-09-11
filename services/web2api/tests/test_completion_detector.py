@@ -75,6 +75,14 @@ def test_stream_until_complete_is_keyword_only():
         )
 
 
+def test_driver_forwards_reference_attachment_presence_to_detector():
+    """The driver must tell the detector when the request uploaded files."""
+    from chatgpt_web2api.cdp_driver import CDPDriver
+
+    source = inspect.getsource(CDPDriver.send_and_stream)
+    assert "has_input_attachments=bool(attachments)" in source
+
+
 # ── 2. CDPDriver wires _completion ────────────────────────────────────
 
 
@@ -438,6 +446,157 @@ async def test_attachment_status_prefix_keeps_following_answer():
 
     assert "".join(chunks) == "这是正式回答。"
     assert detector.completed_via_exact_action is True
+
+
+@pytest.mark.parametrize("model", ["auto", "gpt-5-6-thinking"])
+@pytest.mark.asyncio
+async def test_reasoning_reference_image_uses_exact_dom_terminal_when_backend_lags(model):
+    """A completed Pro/reference-image answer must not wait out the detector.
+
+    Reasoning models hold mutable DOM text until terminal.  The attachment
+    analysis placeholder may already share the current turn's action row, so
+    it must remain filtered; once the real answer replaces it and the exact
+    current-turn action is visible with no active generation, the stable DOM
+    answer is authoritative even if the anchored backend projection is still
+    ``not_ready``.
+    """
+    detector, driver = _make_detector()
+    polls = [
+        '{"text":"正在分析 1 幅图片","md_text":"正在分析 1 幅图片",'
+        '"html_len":90,"child_count":1,"has_action":true,'
+        '"has_exact_action":true,"is_thinking":false,'
+        '"generation_active":false}',
+        '{"text":"参考图中的主体颜色是深棕色。",'
+        '"md_text":"参考图中的主体颜色是深棕色。","html_len":130,'
+        '"child_count":1,"has_action":true,"has_exact_action":true,'
+        '"is_thinking":false,"generation_active":false}',
+    ]
+    poll_index = 0
+
+    async def fake_js(expr):
+        nonlocal poll_index
+        if "getBoundingClientRect" in expr:
+            selected = polls[min(poll_index, len(polls) - 1)]
+            poll_index += 1
+            return selected
+        if "body.innerText" in expr:
+            return '{"text":""}'
+        return "1"
+
+    driver._current_conv_id = "conv-reference-image"
+    driver._js_strict = fake_js
+    driver._fetch_end_turn_for_turn = AsyncMock(
+        return_value=TurnEndResult(status="not_ready")
+    )
+
+    chunks = []
+    async for chunk in detector.stream_until_complete(
+        initial_count=0,
+        timeout=2,
+        turn_anchor=TurnAnchor(sent_text="看参考图回答", mode="fresh_chat"),
+        budgets=DetectorBudgets(
+            first_content_timeout_seconds=1,
+            stream_idle_timeout_seconds=1,
+            hard_timeout_seconds=1,
+        ),
+        model=model,
+        has_input_attachments=True,
+    ):
+        chunks.append(chunk.delta)
+
+    assert "".join(chunks) == "参考图中的主体颜色是深棕色。"
+    assert detector.last_dom_text == "参考图中的主体颜色是深棕色。"
+    assert detector.completed_via_exact_action is True
+    assert driver._fetch_end_turn_for_turn.await_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_attachment_search_activity_survives_stop_button_flicker():
+    """An exact action row is not terminal while a search/tool surface is live.
+
+    The global Stop button can disappear between search batches.  Keep waiting
+    on the sticky non-text/tool signal instead of promoting mutable narration.
+    """
+    detector, driver = _make_detector()
+    polls = iter([
+        '{"text":"正在搜索官方资料。","md_text":"","html_len":120,'
+        '"child_count":2,"has_meaningful_non_text":true,'
+        '"has_action":true,"has_exact_action":true,"is_thinking":false,'
+        '"generation_active":true}',
+        '{"text":"正在整理搜索结果。","md_text":"","html_len":140,'
+        '"child_count":2,"has_meaningful_non_text":true,'
+        '"has_action":true,"has_exact_action":true,"is_thinking":false,'
+        '"generation_active":false}',
+    ])
+
+    async def fake_js(expr):
+        if "getBoundingClientRect" in expr:
+            return next(polls)
+        if "body.innerText" in expr:
+            return '{"text":""}'
+        return "1"
+
+    driver._current_conv_id = "conv-attachment-search"
+    driver._js_strict = fake_js
+    driver._fetch_end_turn_for_turn = AsyncMock(
+        return_value=TurnEndResult(status="not_ready")
+    )
+
+    chunks = []
+    async for chunk in detector.stream_until_complete(
+        initial_count=0,
+        timeout=0.75,
+        turn_anchor=TurnAnchor(sent_text="结合附件搜索最新资料", mode="fresh_chat"),
+        model="gpt-5-5-pro",
+        has_input_attachments=True,
+    ):
+        chunks.append(chunk.delta)
+
+    assert chunks == []
+    assert detector.last_dom_text == ""
+    assert detector.had_non_text_content is True
+    assert detector.completed_via_exact_action is False
+
+
+@pytest.mark.asyncio
+async def test_attachment_expected_non_text_ignores_text_before_asset():
+    """Image generation narration cannot satisfy attachment DOM promotion."""
+    detector, driver = _make_detector()
+    pre_asset_poll = (
+        '{"text":"正在创建图片。","md_text":"正在创建图片。","html_len":90,'
+        '"child_count":1,"has_meaningful_non_text":false,'
+        '"has_action":true,"has_exact_action":true,"is_thinking":false,'
+        '"generation_active":false}'
+    )
+
+    async def fake_js(expr):
+        if "getBoundingClientRect" in expr:
+            return pre_asset_poll
+        if "body.innerText" in expr:
+            return '{"text":""}'
+        return "1"
+
+    driver._current_conv_id = "conv-attachment-image-output"
+    driver._js_strict = fake_js
+    driver._fetch_end_turn_for_turn = AsyncMock(
+        return_value=TurnEndResult(status="not_ready")
+    )
+
+    chunks = []
+    async for chunk in detector.stream_until_complete(
+        initial_count=0,
+        timeout=0.1,
+        turn_anchor=TurnAnchor(sent_text="参考附件生成图片", mode="fresh_chat"),
+        model="gpt-5-6-thinking",
+        expect_non_text=True,
+        has_input_attachments=True,
+    ):
+        chunks.append(chunk.delta)
+
+    assert chunks == []
+    assert detector.last_dom_text == ""
+    assert detector.had_non_text_content is False
+    assert detector.completed_via_exact_action is False
 
 
 @pytest.mark.asyncio
