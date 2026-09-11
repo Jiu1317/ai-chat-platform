@@ -40,13 +40,13 @@ jobs:
           android sdk install "build-tools/36.0.0"
 
       - name: Verify Gradle wrapper
-        uses: gradle/actions/wrapper-validation@v4
+        uses: gradle/actions/wrapper-validation@v6
 
       - name: Check source and build debug APK
         run: ./gradlew --no-daemon lintDebug assembleDebug
 
       - name: Upload APK
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: AIChat-Android-debug
           path: clients/android/app/build/outputs/apk/debug/app-debug.apk
