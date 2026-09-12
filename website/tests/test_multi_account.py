@@ -425,16 +425,23 @@ class RuntimeCleanupTests(unittest.TestCase):
         self.assertIn("20 分钟", events[-1]["message"])
         self.assertTrue(generation_cancelled)
 
-    def test_unsupported_local_image_reference_does_not_reserve_quota(self) -> None:
+    def test_no_attachment_image_request_uses_resumable_direct_image(self) -> None:
         payload = app.TurnRequest(
             session_id="2" * 32,
+            client_conversation_id="3" * 32,
+            client_turn_id="4" * 32,
             message="请生成一张图片",
             model="codex-model",
             effort="default",
-            project_attachments=[app.AttachmentRef(id="project.png", name="project.png")],
+        )
+        record = app.ResumableExternalTurn(
+            user_id="user-a",
+            client_turn_id=payload.client_turn_id,
+            fingerprint="fingerprint",
+            kind="image",
         )
 
-        async def scenario() -> list[dict]:
+        async def scenario() -> str | None:
             with (
                 patch.object(app, "_require_auth", return_value={"id": "user-a"}),
                 patch.object(app, "_session_path", return_value=Path(".")),
@@ -443,19 +450,78 @@ class RuntimeCleanupTests(unittest.TestCase):
                 patch.object(
                     app, "_clear_external_conversation_state", new=AsyncMock()
                 ),
+                patch.object(
+                    app,
+                    "_start_or_reuse_resumable_image_turn",
+                    new=AsyncMock(return_value=record),
+                ) as direct_start,
+                patch.object(
+                    app, "_attachment_inputs_async", new=AsyncMock(return_value=[])
+                ) as attachment_inputs,
+            ):
+                response = await app.turn(object(), payload)
+            direct_start.assert_awaited_once_with(payload, Path("."), "user-a")
+            attachment_inputs.assert_not_awaited()
+            return response.headers.get("x-client-turn-id")
+
+        self.assertEqual(asyncio.run(scenario()), payload.client_turn_id)
+
+    def test_image_request_with_any_attachment_uses_codex(self) -> None:
+        cases = (
+            {
+                "attachments": [
+                    app.AttachmentRef(id="reference.png", name="reference.png")
+                ]
+            },
+            {
+                "project_attachments": [
+                    app.AttachmentRef(id="project.png", name="project.png")
+                ]
+            },
+        )
+
+        async def scenario(payload: app.TurnRequest) -> str | None:
+            with (
+                patch.object(app, "_require_auth", return_value={"id": "user-a"}),
+                patch.object(app, "_session_path", return_value=Path(".")),
+                patch.object(app, "_validate_user_content_size"),
+                patch.object(app, "_decode_external_model", return_value=None),
+                patch.object(app, "_read_disabled_codex_models", return_value=set()),
+                patch.object(
+                    app, "_clear_external_conversation_state", new=AsyncMock()
+                ),
+                patch.object(
+                    app, "_attachment_inputs_async", new=AsyncMock(return_value=[])
+                ) as attachment_inputs,
+                patch.object(
+                    app,
+                    "_start_or_reuse_resumable_image_turn",
+                    new=AsyncMock(),
+                ) as direct_start,
                 patch.object(app, "_reserve_message_slot") as reserve,
             ):
                 response = await app.turn(object(), payload)
-                events = [
-                    app.json.loads(event.decode())
-                    async for event in response.body_iterator
-                ]
-            reserve.assert_not_called()
-            return events
+            direct_start.assert_not_awaited()
+            attachment_inputs.assert_awaited_once_with(
+                payload,
+                Path("."),
+                max_text_chars=app.MAX_CONTEXT_TEXT_CHARS,
+            )
+            reserve.assert_called_once_with("user-a")
+            return response.headers.get("x-client-turn-id")
 
-        events = asyncio.run(scenario())
-        self.assertEqual([event["type"] for event in events], ["started", "error"])
-        self.assertIn("参考图", events[-1]["message"])
+        for index, update in enumerate(cases):
+            with self.subTest(attachment_kind=next(iter(update))):
+                payload = app.TurnRequest(
+                    session_id="5" * 32,
+                    client_conversation_id="6" * 32,
+                    client_turn_id=f"{index + 7:x}" * 32,
+                    message="请参考附件生成一张图片",
+                    model="codex-model",
+                    effort="default",
+                    **update,
+                )
+                self.assertIsNone(asyncio.run(scenario(payload)))
 
 
 class ExternalImageTransferTests(unittest.TestCase):
@@ -2315,6 +2381,43 @@ class ExternalContextTests(unittest.TestCase):
         self.assertIn("20 分钟", events[-1]["message"])
         self.assertTrue(source_cancelled)
 
+    def test_external_stream_propagates_client_cancellation(self) -> None:
+        source_cancelled = asyncio.Event()
+        payload = app.TurnRequest(
+            session_id="8" * 32,
+            message="取消请求",
+            model="external",
+            effort="default",
+        )
+
+        async def slow_response(*_args, **_kwargs):
+            try:
+                await asyncio.Event().wait()
+                yield app._ndjson({"type": "done", "files": []})
+            finally:
+                source_cancelled.set()
+
+        async def scenario() -> None:
+            with patch.object(app, "_external_response_stream", new=slow_response):
+                stream = app._external_stream(
+                    payload,
+                    Path("."),
+                    {"baseUrl": "https://provider.example/v1", "protocol": "openai"},
+                    "model-a",
+                    "user-a",
+                )
+                started = app.json.loads((await anext(stream)).decode())
+                self.assertEqual(started["type"], "started")
+                waiting = asyncio.create_task(anext(stream))
+                await asyncio.sleep(0)
+                waiting.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await waiting
+                self.assertTrue(source_cancelled.is_set())
+                self.assertEqual(app.external_turns, {})
+
+        asyncio.run(scenario())
+
     def test_successful_continuation_keeps_existing_id_when_upstream_does_not_echo_it(self) -> None:
         line = app.json.dumps({
             "choices": [{"delta": {"content": "完成"}, "finish_reason": "stop"}],
@@ -2544,9 +2647,519 @@ class ExternalContextTests(unittest.TestCase):
             "external_context_key: conversation.externalContextKey",
             "externalConversationId: conversation.externalConversationId || null",
             "if (done) buffer += decoder.decode();",
-            'throw new Error("回答连接意外中断，请重试")',
+            "client_turn_id: clientTurnId",
         ):
             self.assertIn(marker, source)
+
+
+class ResumableExternalTurnTests(unittest.TestCase):
+    @staticmethod
+    def _payload(client_turn_id: str = "d" * 32) -> app.TurnRequest:
+        return app.TurnRequest(
+            session_id="e" * 32,
+            client_conversation_id="f" * 32,
+            client_turn_id=client_turn_id,
+            message="请描述附件",
+            model="external",
+            effort="default",
+        )
+
+    @staticmethod
+    async def _reset_records() -> None:
+        tasks = {
+            record.task
+            for record in app.resumable_external_turns.values()
+            if record.task is not None and not record.task.done()
+        }
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        app.resumable_external_turns.clear()
+        app.resumable_stop_tombstones.clear()
+        app.external_turns.clear()
+
+    def test_disconnected_reader_does_not_cancel_and_resume_uses_cursor(self) -> None:
+        release = asyncio.Event()
+        upstream_cancelled = False
+
+        async def fake_external_stream(*_args, **_kwargs):
+            nonlocal upstream_cancelled
+            yield app._ndjson({
+                "type": "started",
+                "threadId": "external",
+                "turnId": "upstream-turn",
+                "mode": "external",
+            })
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                upstream_cancelled = True
+                raise
+            yield app._ndjson({"type": "delta", "text": "回答"})
+            yield app._ndjson({"type": "done", "files": []})
+
+        async def scenario() -> list[dict]:
+            await self._reset_records()
+            payload = self._payload()
+            with (
+                patch.object(app, "_reserve_message_slot"),
+                patch.object(app, "_cloud_context_history", return_value=[]),
+                patch.object(app, "_external_stream", new=fake_external_stream),
+            ):
+                record = await app._start_or_reuse_resumable_external_turn(
+                    payload, Path("."), {}, "model-a", "user-a", "provider-a"
+                )
+                first_reader = app._resumable_external_event_stream(record, 0)
+                first = app.json.loads((await anext(first_reader)).decode())
+                await first_reader.aclose()
+                self.assertEqual(first["cursor"], 1)
+                self.assertFalse(record.task.done())
+
+                release.set()
+                await asyncio.wait_for(record.task, timeout=1)
+                resumed = [
+                    app.json.loads(event.decode())
+                    async for event in app._resumable_external_event_stream(record, 1)
+                ]
+            await self._reset_records()
+            return resumed
+
+        resumed = asyncio.run(scenario())
+        self.assertFalse(upstream_cancelled)
+        self.assertEqual([event["type"] for event in resumed], ["delta", "done"])
+        self.assertEqual([event["cursor"] for event in resumed], [2, 3])
+
+    def test_duplicate_client_turn_is_idempotent_and_does_not_reserve_twice(self) -> None:
+        upstream_calls = 0
+
+        async def fake_external_stream(*_args, **_kwargs):
+            nonlocal upstream_calls
+            upstream_calls += 1
+            yield app._ndjson({"type": "done", "files": []})
+
+        async def scenario() -> tuple[app.ResumableExternalTurn, app.ResumableExternalTurn]:
+            await self._reset_records()
+            payload = self._payload("1" * 32)
+            with (
+                patch.object(app, "_reserve_message_slot") as reserve,
+                patch.object(app, "_cloud_context_history", return_value=[]),
+                patch.object(app, "_external_stream", new=fake_external_stream),
+                patch.object(app, "EXTERNAL_RESUME_MAX_TURNS", 1),
+            ):
+                first = await app._start_or_reuse_resumable_external_turn(
+                    payload, Path("."), {}, "model-a", "user-a", "provider-a"
+                )
+                await asyncio.wait_for(first.task, timeout=1)
+                second = await app._start_or_reuse_resumable_external_turn(
+                    payload, Path("."), {}, "model-a", "user-a", "provider-a"
+                )
+                reserve.assert_called_once_with("user-a")
+            await self._reset_records()
+            return first, second
+
+        first, second = asyncio.run(scenario())
+        self.assertIs(first, second)
+        self.assertEqual(upstream_calls, 1)
+
+    def test_reusing_client_turn_for_different_payload_is_rejected(self) -> None:
+        async def fake_external_stream(*_args, **_kwargs):
+            yield app._ndjson({"type": "done", "files": []})
+
+        async def scenario() -> int:
+            await self._reset_records()
+            payload = self._payload("2" * 32)
+            changed = payload.model_copy(update={"message": "另一条消息"})
+            with (
+                patch.object(app, "_reserve_message_slot") as reserve,
+                patch.object(app, "_cloud_context_history", return_value=[]),
+                patch.object(app, "_external_stream", new=fake_external_stream),
+            ):
+                record = await app._start_or_reuse_resumable_external_turn(
+                    payload, Path("."), {}, "model-a", "user-a", "provider-a"
+                )
+                with self.assertRaises(app.HTTPException) as raised:
+                    await app._start_or_reuse_resumable_external_turn(
+                        changed, Path("."), {}, "model-a", "user-a", "provider-a"
+                    )
+                await asyncio.wait_for(record.task, timeout=1)
+                reserve.assert_called_once_with("user-a")
+            await self._reset_records()
+            return raised.exception.status_code
+
+        self.assertEqual(asyncio.run(scenario()), 409)
+
+    def test_resume_endpoint_is_scoped_to_authenticated_user(self) -> None:
+        async def fake_external_stream(*_args, **_kwargs):
+            yield app._ndjson({"type": "delta", "text": "私有回答"})
+            yield app._ndjson({"type": "done", "files": []})
+
+        async def scenario() -> list[dict]:
+            await self._reset_records()
+            payload = self._payload("3" * 32)
+            with (
+                patch.object(app, "_reserve_message_slot"),
+                patch.object(app, "_cloud_context_history", return_value=[]),
+                patch.object(app, "_external_stream", new=fake_external_stream),
+            ):
+                record = await app._start_or_reuse_resumable_external_turn(
+                    payload, Path("."), {}, "model-a", "user-a", "provider-a"
+                )
+                await asyncio.wait_for(record.task, timeout=1)
+                with (
+                    patch.object(app, "_require_auth", return_value={"id": "user-b"}),
+                    self.assertRaises(app.HTTPException) as raised,
+                ):
+                    await app.resume_external_turn(object(), payload.client_turn_id, 0)
+                self.assertEqual(raised.exception.status_code, 404)
+                with patch.object(app, "_require_auth", return_value={"id": "user-a"}):
+                    response = await app.resume_external_turn(
+                        object(), payload.client_turn_id, 1
+                    )
+                    events = [
+                        app.json.loads(event.decode())
+                        async for event in response.body_iterator
+                    ]
+            await self._reset_records()
+            return events
+
+        events = asyncio.run(scenario())
+        self.assertEqual([event["type"] for event in events], ["done"])
+        self.assertEqual(events[0]["cursor"], 2)
+
+    def test_waiting_for_conversation_lock_times_out_to_replayable_error(self) -> None:
+        async def forbidden_response(*_args, **_kwargs):
+            raise AssertionError("upstream must not start while the conversation lock is held")
+            yield b""  # pragma: no cover
+
+        async def scenario() -> tuple[list[dict], bool, bool]:
+            await self._reset_records()
+            payload = self._payload("5" * 32)
+            lock_key = ("user-a", payload.client_conversation_id)
+            lock = asyncio.Lock()
+            await lock.acquire()
+            app.external_conversation_locks[lock_key] = lock
+            try:
+                with (
+                    patch.object(app, "_reserve_message_slot"),
+                    patch.object(app, "_cloud_context_history", return_value=[]),
+                    patch.object(app, "_external_response_stream", new=forbidden_response),
+                    patch.object(app, "EXTERNAL_RESPONSE_TIMEOUT_SECONDS", 0.02),
+                    patch.object(app, "LONG_TASK_HEARTBEAT_SECONDS", 0.005),
+                ):
+                    record = await app._start_or_reuse_resumable_external_turn(
+                        payload,
+                        Path("."),
+                        {"baseUrl": "https://provider.example/v1", "protocol": "openai"},
+                        "model-a",
+                        "user-a",
+                        "provider-a",
+                    )
+                    await asyncio.wait_for(record.task, timeout=1)
+                    events = [app.json.loads(item.decode()) for item in record.events]
+                    terminal = record.terminal
+                    task_done = record.task.done()
+            finally:
+                lock.release()
+                app.external_conversation_locks.clear()
+            await self._reset_records()
+            return events, terminal, task_done
+
+        events, terminal, task_done = asyncio.run(scenario())
+        self.assertEqual([event["type"] for event in events], ["started", "error"])
+        self.assertIn("20 分钟", events[-1]["message"])
+        self.assertTrue(terminal)
+        self.assertTrue(task_done)
+        self.assertEqual(app.external_turns, {})
+
+    def test_completed_records_expire_and_user_stop_is_replayable(self) -> None:
+        upstream_started = asyncio.Event()
+        upstream_stopped = asyncio.Event()
+
+        async def fake_external_stream(*_args, **_kwargs):
+            task = asyncio.current_task()
+            app.external_turns["stop-turn"] = ("user-a", task)
+            try:
+                yield app._ndjson({
+                    "type": "started",
+                    "threadId": "external",
+                    "turnId": "stop-turn",
+                    "mode": "external",
+                })
+                upstream_started.set()
+                await asyncio.Event().wait()
+            finally:
+                upstream_stopped.set()
+                app.external_turns.pop("stop-turn", None)
+
+        async def scenario() -> tuple[list[dict], bool]:
+            await self._reset_records()
+            payload = self._payload("4" * 32)
+            with (
+                patch.object(app, "_reserve_message_slot"),
+                patch.object(app, "_cloud_context_history", return_value=[]),
+                patch.object(app, "_external_stream", new=fake_external_stream),
+                patch.object(app, "_require_auth", return_value={"id": "user-a"}),
+            ):
+                record = await app._start_or_reuse_resumable_external_turn(
+                    payload, Path("."), {}, "model-a", "user-a", "provider-a"
+                )
+                await asyncio.wait_for(upstream_started.wait(), timeout=1)
+                await app.interrupt(object(), "external", payload.client_turn_id)
+                await asyncio.wait_for(record.task, timeout=1)
+                events = [app.json.loads(item.decode()) for item in record.events]
+                record.updated_at = 10
+                await app._cleanup_resumable_external_turns(
+                    now=10 + app.EXTERNAL_RESUME_TTL_SECONDS + 1
+                )
+                removed = ("user-a", payload.client_turn_id) not in app.resumable_external_turns
+            await self._reset_records()
+            return events, removed
+
+        events, removed = asyncio.run(scenario())
+        self.assertTrue(upstream_stopped.is_set())
+        self.assertEqual([event["type"] for event in events], ["started", "error"])
+        self.assertEqual(events[-1]["message"], "已停止回答")
+        self.assertTrue(removed)
+
+    def test_internal_turn_id_stops_real_resumable_task(self) -> None:
+        upstream_started = asyncio.Event()
+        upstream_stopped = asyncio.Event()
+
+        async def fake_external_stream(*_args, **_kwargs):
+            task = asyncio.current_task()
+            app.external_turns["internal-stop-turn"] = ("user-a", task)
+            try:
+                yield app._ndjson({
+                    "type": "started",
+                    "threadId": "external",
+                    "turnId": "internal-stop-turn",
+                    "mode": "external",
+                })
+                upstream_started.set()
+                await asyncio.Event().wait()
+            finally:
+                upstream_stopped.set()
+                app.external_turns.pop("internal-stop-turn", None)
+
+        async def scenario() -> list[dict]:
+            await self._reset_records()
+            payload = self._payload("6" * 32)
+            with (
+                patch.object(app, "_reserve_message_slot"),
+                patch.object(app, "_cloud_context_history", return_value=[]),
+                patch.object(app, "_external_stream", new=fake_external_stream),
+                patch.object(app, "_require_auth", return_value={"id": "user-a"}),
+            ):
+                record = await app._start_or_reuse_resumable_external_turn(
+                    payload, Path("."), {}, "model-a", "user-a", "provider-a"
+                )
+                await asyncio.wait_for(upstream_started.wait(), timeout=1)
+                await app.interrupt(object(), "external", "internal-stop-turn")
+                await asyncio.wait_for(record.task, timeout=1)
+                events = [app.json.loads(item.decode()) for item in record.events]
+            await self._reset_records()
+            return events
+
+        events = asyncio.run(scenario())
+        self.assertTrue(upstream_stopped.is_set())
+        self.assertEqual([event["type"] for event in events], ["started", "error"])
+        self.assertEqual(events[-1]["message"], "已停止回答")
+
+    def test_stop_before_start_is_scoped_and_does_not_consume_quota(self) -> None:
+        upstream_users: list[str] = []
+
+        async def fake_external_stream(*args, **_kwargs):
+            upstream_users.append(args[4])
+            yield app._ndjson({"type": "done", "files": []})
+
+        async def scenario() -> tuple[int, app.ResumableExternalTurn]:
+            await self._reset_records()
+            payload = self._payload("7" * 32)
+            with patch.object(app, "_require_auth", return_value={"id": "user-a"}):
+                await app.interrupt(object(), "external", payload.client_turn_id)
+            self.assertIn(("user-a", payload.client_turn_id), app.resumable_stop_tombstones)
+            with (
+                patch.object(app, "_reserve_message_slot") as reserve,
+                patch.object(app, "_cloud_context_history", return_value=[]),
+                patch.object(app, "_external_stream", new=fake_external_stream),
+            ):
+                with self.assertRaises(app.HTTPException) as stopped:
+                    await app._start_or_reuse_resumable_external_turn(
+                        payload, Path("."), {}, "model-a", "user-a", "provider-a"
+                    )
+                other = await app._start_or_reuse_resumable_external_turn(
+                    payload, Path("."), {}, "model-a", "user-b", "provider-a"
+                )
+                await asyncio.wait_for(other.task, timeout=1)
+                reserve.assert_called_once_with("user-b")
+            return stopped.exception.status_code, other
+
+        status, other = asyncio.run(scenario())
+        self.assertEqual(status, 409)
+        self.assertEqual(upstream_users, ["user-b"])
+        self.assertTrue(other.terminal)
+        asyncio.run(self._reset_records())
+
+    def test_stop_tombstones_expire_and_stay_within_capacity(self) -> None:
+        async def scenario() -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
+            await self._reset_records()
+            first = ("user-a", "8" * 32)
+            second = ("user-a", "9" * 32)
+            third = ("user-a", "a" * 32)
+            other = ("user-b", "f" * 32)
+            app.resumable_stop_tombstones.update({first: 10.0, second: 15.0})
+            with patch.object(app, "RESUMABLE_STOP_TOMBSTONE_TTL_SECONDS", 10):
+                await app._cleanup_resumable_external_turns(now=20.0)
+            after_expiry = set(app.resumable_stop_tombstones)
+            app.resumable_stop_tombstones[other] = 25.0
+            with (
+                patch.object(app, "RESUMABLE_STOP_TOMBSTONE_TTL_SECONDS", 1000),
+                patch.object(app, "RESUMABLE_STOP_TOMBSTONE_MAX_ENTRIES", 2),
+                patch.object(app.time, "time", return_value=30.0),
+            ):
+                await app._cancel_or_tombstone_resumable_turn(*third)
+            bounded = set(app.resumable_stop_tombstones)
+            await self._reset_records()
+            return after_expiry, bounded
+
+        after_expiry, bounded = asyncio.run(scenario())
+        self.assertEqual(after_expiry, {("user-a", "9" * 32)})
+        self.assertEqual(bounded, {("user-b", "f" * 32), ("user-a", "a" * 32)})
+
+    def test_start_and_stop_are_atomic_in_either_lock_order(self) -> None:
+        async def fake_external_stream(*_args, **_kwargs):
+            yield app._ndjson({"type": "started", "threadId": "external", "turnId": "atomic"})
+            await asyncio.Event().wait()
+
+        async def start_wins() -> tuple[list[dict], int]:
+            await self._reset_records()
+            payload = self._payload("b" * 32)
+            with (
+                patch.object(app, "_reserve_message_slot") as reserve,
+                patch.object(app, "_cloud_context_history", return_value=[]),
+                patch.object(app, "_external_stream", new=fake_external_stream),
+            ):
+                await app.resumable_external_turns_lock.acquire()
+                starter = asyncio.create_task(app._start_or_reuse_resumable_external_turn(
+                    payload, Path("."), {}, "model-a", "user-a", "provider-a"
+                ))
+                await asyncio.sleep(0)
+                stopper = asyncio.create_task(
+                    app._cancel_or_tombstone_resumable_turn("user-a", payload.client_turn_id)
+                )
+                await asyncio.sleep(0)
+                app.resumable_external_turns_lock.release()
+                record = await starter
+                await stopper
+                await asyncio.wait_for(record.task, timeout=1)
+                events = [app.json.loads(item.decode()) for item in record.events]
+                calls = reserve.call_count
+            await self._reset_records()
+            return events, calls
+
+        async def stop_wins() -> tuple[int, int]:
+            await self._reset_records()
+            payload = self._payload("c" * 32)
+            with patch.object(app, "_reserve_message_slot") as reserve:
+                await app.resumable_external_turns_lock.acquire()
+                stopper = asyncio.create_task(
+                    app._cancel_or_tombstone_resumable_turn("user-a", payload.client_turn_id)
+                )
+                await asyncio.sleep(0)
+                starter = asyncio.create_task(app._start_or_reuse_resumable_external_turn(
+                    payload, Path("."), {}, "model-a", "user-a", "provider-a"
+                ))
+                await asyncio.sleep(0)
+                app.resumable_external_turns_lock.release()
+                await stopper
+                result = await asyncio.gather(starter, return_exceptions=True)
+                status = result[0].status_code if isinstance(result[0], app.HTTPException) else 0
+                calls = reserve.call_count
+            await self._reset_records()
+            return status, calls
+
+        async def scenario():
+            return await start_wins(), await stop_wins()
+
+        (events, reserve_calls), (status, stopped_reserve_calls) = asyncio.run(scenario())
+        self.assertEqual(reserve_calls, 1)
+        self.assertEqual(events[-1]["type"], "error")
+        self.assertEqual(events[-1]["message"], "已停止回答")
+        self.assertEqual(status, 409)
+        self.assertEqual(stopped_reserve_calls, 0)
+
+    def test_direct_image_turn_continues_after_disconnect_and_is_idempotent(self) -> None:
+        release = asyncio.Event()
+        upstream_calls = 0
+
+        async def fake_image_stream(*_args, **_kwargs):
+            nonlocal upstream_calls
+            upstream_calls += 1
+            yield app._ndjson({"type": "started", "threadId": "image", "turnId": "image-upstream", "mode": "image"})
+            await release.wait()
+            yield app._ndjson({"type": "replace", "text": "图片已生成。"})
+            yield app._ndjson({"type": "done", "files": [{"name": "image.png"}], "mode": "image"})
+
+        async def scenario() -> tuple[list[dict], bool, int]:
+            await self._reset_records()
+            payload = self._payload("d" * 32).model_copy(update={"message": "用 image2.5 画猫"})
+            changed = payload.model_copy(update={"message": "用 image2.5 画狗"})
+            with (
+                patch.object(app, "_reserve_message_slot") as reserve,
+                patch.object(app, "_image_stream", new=fake_image_stream),
+            ):
+                record = await app._start_or_reuse_resumable_image_turn(payload, Path("."), "user-a")
+                reader = app._resumable_external_event_stream(record, 0)
+                first = app.json.loads((await anext(reader)).decode())
+                await reader.aclose()
+                release.set()
+                await asyncio.wait_for(record.task, timeout=1)
+                resumed = [
+                    app.json.loads(item.decode())
+                    async for item in app._resumable_external_event_stream(record, 1)
+                ]
+                duplicate = await app._start_or_reuse_resumable_image_turn(payload, Path("."), "user-a")
+                with self.assertRaises(app.HTTPException) as conflict:
+                    await app._start_or_reuse_resumable_image_turn(changed, Path("."), "user-a")
+                reserve.assert_called_once_with("user-a")
+            await self._reset_records()
+            return [first, *resumed], duplicate is record, conflict.exception.status_code
+
+        events, reused, conflict = asyncio.run(scenario())
+        self.assertEqual([event["type"] for event in events], ["started", "replace", "done"])
+        self.assertEqual([event["cursor"] for event in events], [1, 2, 3])
+        self.assertTrue(reused)
+        self.assertEqual(conflict, 409)
+        self.assertEqual(upstream_calls, 1)
+
+    def test_direct_image_turn_can_be_stopped_by_client_turn_id(self) -> None:
+        started = asyncio.Event()
+
+        async def fake_image_stream(*_args, **_kwargs):
+            yield app._ndjson({"type": "started", "threadId": "image", "turnId": "image-upstream", "mode": "image"})
+            started.set()
+            await asyncio.Event().wait()
+
+        async def scenario() -> list[dict]:
+            await self._reset_records()
+            payload = self._payload("e" * 32).model_copy(update={"message": "用 image2.5 画猫"})
+            with (
+                patch.object(app, "_reserve_message_slot"),
+                patch.object(app, "_image_stream", new=fake_image_stream),
+                patch.object(app, "_require_auth", return_value={"id": "user-a"}),
+            ):
+                record = await app._start_or_reuse_resumable_image_turn(payload, Path("."), "user-a")
+                await asyncio.wait_for(started.wait(), timeout=1)
+                await app.interrupt(object(), "image", payload.client_turn_id)
+                await asyncio.wait_for(record.task, timeout=1)
+                events = [app.json.loads(item.decode()) for item in record.events]
+            await self._reset_records()
+            return events
+
+        events = asyncio.run(scenario())
+        self.assertEqual([event["type"] for event in events], ["started", "error"])
+        self.assertEqual(events[-1]["message"], "已停止生成图片")
 
 
 def conversation(identifier: str, workspace: str) -> dict:

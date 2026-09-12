@@ -6,11 +6,20 @@ const siteAccount = {
 };
 const legacyStorageKey = "ai-chat-state-v1";
 const storageKey = `${legacyStorageKey}:${siteAccount.id}`;
+const pendingTurnStorageKey = `${storageKey}:pending-turn`;
 const MEBIBYTE = 1024 * 1024;
 const MAX_UPLOAD_BYTES = 30 * MEBIBYTE;
 const UPLOAD_CHUNK_BYTES = 3 * MEBIBYTE;
 const MAX_TURN_FILES = 5;
 const INLINE_TEXT_BYTES = 60_000;
+const TURN_RESUME_MAX_ATTEMPTS = 8;
+const TURN_RESUME_BASE_DELAY_MS = 750;
+const TURN_RESUME_MAX_DELAY_MS = 15_000;
+const TURN_RESUME_RECORD_TTL_MS = 6 * 60 * 60 * 1000;
+const TURN_REPLAY_SAFETY_MARGIN_MS = 15 * 60 * 1000;
+const TURN_REPLAY_SAFE_WINDOW_MS = TURN_RESUME_RECORD_TTL_MS - TURN_REPLAY_SAFETY_MARGIN_MS;
+const IMAGE_REQUEST_PATTERN = /(?:(?:^|[\s，。！？,.!?])(?:请|麻烦)?(?:帮我|给我)?(?:生成|画|绘制|创建|制作|做)(?:一张|一个|几张|一些)?[^。！？\n]{0,100}(?:图片|图像|插画|海报|壁纸|头像|照片|图|画)|(?:^|[\s，。！？,.!?])(?:请|麻烦)?(?:帮我|给我)?(?:用|使用|调用|让)\s*(?:gpt[\s_-]*)?image\s*[\s_-]*2(?:\s*[._-]\s*5)?(?:[\s_-]*(?:sunburst|flare))?\s*(?:来|帮我|给我)?\s*(?:生成|画|绘制|创建|制作|做)|\b(?:generate|create|draw|make)\b.{0,100}\b(?:image|picture|illustration|poster|wallpaper|avatar)\b)/i;
+const IMAGE_DISCUSSION_PATTERN = /(?:为什么|为何|怎么|如何|是否|能否|支不支持|可以吗|是什么).{0,24}(?:生成|画|绘制|制作).{0,24}(?:图片|图像|图|画)/i;
 const utf8Encoder = new TextEncoder();
 try {
   if (siteAccount.isAdmin && !localStorage.getItem(storageKey) && localStorage.getItem(legacyStorageKey)) {
@@ -178,6 +187,10 @@ let cloudSyncInFlight = false;
 let cloudSyncQueued = false;
 let cloudSyncFailureShown = false;
 let lastCloudSignature = "";
+let pendingTurnSaveTimer = null;
+let latestPendingTurnSnapshot = null;
+let pendingRecoveryWaiting = false;
+let pendingRecoveryPromise = null;
 
 let providers = [];
 let siteUsers = [];
@@ -275,10 +288,276 @@ function userFacingError(value, status = 0) {
   if (/spawn\s+openclaw\s+enoent/.test(lowered)) {
     return "图片处理组件未启动，请联系管理员重启服务";
   }
-  if (/failed to fetch|networkerror|network request failed|load failed/.test(lowered)) {
+  if (/failed to fetch|network\s*error|network request failed|load failed|fetch failed/.test(lowered)) {
     return "网络连接中断，请检查网络后重试";
   }
   return message || "请求失败，请稍后重试";
+}
+
+function isTurnConnectionError(error) {
+  if (error?.name === "AbortError") return false;
+  if (error?.recoverableStreamError) return true;
+  const status = Number(error?.status) || 0;
+  if ([408, 425].includes(status) || status >= 500) return true;
+  const message = String(error?.message || error || "").trim().toLowerCase();
+  return /failed to fetch|network\s*error|network request failed|load failed|fetch failed|connection (?:was )?(?:closed|lost|reset)|closing transport|stream terminated|回答连接意外中断/.test(message);
+}
+
+function turnResumeDelay(attempt) {
+  const retryIndex = Math.max(0, Math.trunc(Number(attempt) || 0));
+  return Math.min(TURN_RESUME_MAX_DELAY_MS, TURN_RESUME_BASE_DELAY_MS * (2 ** retryIndex));
+}
+
+function waitForTurnResume(attempt, signal) {
+  if (signal?.aborted) return Promise.reject(abortError());
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      window.removeEventListener("online", onOnline);
+      resolve();
+    };
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      window.removeEventListener("online", onOnline);
+      reject(abortError());
+    };
+    const onOnline = () => finish();
+    const offline = navigator.onLine === false;
+    const timer = setTimeout(finish, offline ? TURN_RESUME_MAX_DELAY_MS : turnResumeDelay(attempt));
+    if (offline) window.addEventListener("online", onOnline, { once: true });
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function turnResumeUrl(clientTurnId, cursor) {
+  return `/api/turn/resume/${encodeURIComponent(clientTurnId)}?cursor=${encodeURIComponent(String(cursor || 0))}`;
+}
+
+function isDirectImageRequest(message, turnAttachments = [], projectAttachments = []) {
+  const text = String(message || "").trim();
+  if (!text || turnAttachments.length || projectAttachments.length || IMAGE_DISCUSSION_PATTERN.test(text)) return false;
+  return IMAGE_REQUEST_PATTERN.test(text);
+}
+
+function initialPostReplayBlockReason(streamState, now = Date.now()) {
+  const responseState = String(streamState?.initialPostResponseState || "unknown");
+  if (responseState === "received") {
+    return "原请求已经收到过服务器响应，但恢复记录不存在。为避免重复执行，已停止自动补发；请先核对官网或会话记录，再手动重试";
+  }
+  if (responseState !== "no_http_response") {
+    return "无法确认原请求是否已经执行。为避免重复发送，已停止自动补发；请先核对官网或会话记录，再手动重试";
+  }
+  if (streamState?.initialPostReplayAttempted) {
+    return "自动补发已经尝试过，但服务器仍没有可恢复记录。为避免重复执行，不会再次补发；请先核对官网或会话记录，再手动重试";
+  }
+  const attemptedAt = Number(streamState?.initialPostAttemptedAt);
+  const age = Number(now) - attemptedAt;
+  if (!Number.isFinite(attemptedAt) || attemptedAt <= 0 || !Number.isFinite(age) || age < 0) {
+    return "无法确认原请求的发送时间。为避免重复发送，已停止自动补发；请先核对官网或会话记录，再手动重试";
+  }
+  if (age >= TURN_REPLAY_SAFE_WINDOW_MS) {
+    return "这条请求已接近或超过 6 小时恢复期限。为避免重复执行，已停止自动补发；请先核对官网或会话记录，再手动重试";
+  }
+  return "";
+}
+
+function missingTurnRecoveryError(message = "") {
+  const error = new Error(message || "服务器没有可恢复记录。为避免重复执行，已停止自动恢复；请先核对官网或会话记录，再手动重试");
+  error.status = 404;
+  return error;
+}
+
+function postTurnRequest(requestPayload, signal) {
+  return api("/api/turn", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    signal,
+    body: JSON.stringify(requestPayload),
+  });
+}
+
+function acceptTurnEvent(event, streamState) {
+  const eventId = String(event?.event_id ?? event?.eventId ?? "").trim();
+  const rawCursor = event?.cursor ?? event?.event_cursor ?? event?.eventCursor;
+  const numericCursor = Number(rawCursor);
+  const hasNumericCursor = rawCursor !== undefined && rawCursor !== null && rawCursor !== "" && Number.isFinite(numericCursor);
+
+  if (hasNumericCursor && streamState.hasCursor && numericCursor <= streamState.cursor) return false;
+  if (eventId && streamState.eventIds.has(eventId)) {
+    if (hasNumericCursor) {
+      streamState.cursor = Math.max(streamState.cursor, numericCursor);
+      streamState.hasCursor = true;
+    }
+    return false;
+  }
+
+  if (hasNumericCursor) {
+    streamState.cursor = numericCursor;
+    streamState.hasCursor = true;
+  } else {
+    streamState.cursor = streamState.hasCursor ? streamState.cursor + 1 : 1;
+    streamState.hasCursor = true;
+  }
+  if (eventId) streamState.eventIds.add(eventId);
+  return true;
+}
+
+function buildPendingTurnSnapshot(conversation, assistantMessage, streamState = {}) {
+  const previous = latestPendingTurnSnapshot?.clientTurnId === assistantMessage?.clientTurnId
+    ? latestPendingTurnSnapshot
+    : null;
+  const hasRequestPayload = Object.prototype.hasOwnProperty.call(streamState, "requestPayload");
+  const requestPayload = hasRequestPayload
+    ? streamState.requestPayload
+    : (previous
+      ? previous.requestPayload
+      : null);
+  const initialPostResponseState = ["awaiting", "no_http_response", "received", "unknown"].includes(
+    String(streamState.initialPostResponseState || ""),
+  )
+    ? String(streamState.initialPostResponseState)
+    : String(previous?.initialPostResponseState || "unknown");
+  const initialPostAttemptedAt = Number(streamState.initialPostAttemptedAt || previous?.initialPostAttemptedAt || 0);
+  const initialPostReplayAttempted = Object.prototype.hasOwnProperty.call(streamState, "initialPostReplayAttempted")
+    ? Boolean(streamState.initialPostReplayAttempted)
+    : Boolean(previous?.initialPostReplayAttempted);
+  const requestKindCandidate = String(streamState.requestKind || previous?.requestKind || "");
+  const requestKind = ["external", "direct_image", "codex"].includes(requestKindCandidate)
+    ? requestKindCandidate
+    : (String(conversation?.backendKey || "").startsWith("external:") ? "external" : "codex");
+  return {
+    version: 3,
+    clientTurnId: String(assistantMessage?.clientTurnId || ""),
+    conversationId: String(conversation?.id || ""),
+    assistantMessageId: String(assistantMessage?.id || ""),
+    backendKey: String(conversation?.backendKey || ""),
+    requestKind,
+    content: String(assistantMessage?.content || ""),
+    files: Array.isArray(assistantMessage?.files) ? assistantMessage.files : [],
+    mode: String(assistantMessage?.mode || ""),
+    cursor: Math.max(0, Number(streamState.cursor) || 0),
+    hasCursor: Boolean(streamState.hasCursor),
+    eventIds: [...(streamState.eventIds instanceof Set ? streamState.eventIds : [])].slice(-128),
+    initialPostUncertain: Boolean(streamState.initialPostUncertain),
+    initialPostResponseState,
+    initialPostAttemptedAt: Number.isFinite(initialPostAttemptedAt) && initialPostAttemptedAt > 0
+      ? initialPostAttemptedAt
+      : 0,
+    initialPostReplayAttempted,
+    requestPayload: requestPayload && typeof requestPayload === "object" ? requestPayload : null,
+    requestPayloadStored: Boolean(requestPayload && typeof requestPayload === "object"),
+    threadId: String(activeTurn?.threadId || ""),
+    turnId: String(activeTurn?.turnId || ""),
+    createdAt: Number(assistantMessage?.createdAt) || Date.now(),
+    updatedAt: Date.now(),
+  };
+}
+
+function flushPendingTurnSnapshot() {
+  clearTimeout(pendingTurnSaveTimer);
+  pendingTurnSaveTimer = null;
+  if (!latestPendingTurnSnapshot) return;
+  try {
+    localStorage.setItem(pendingTurnStorageKey, JSON.stringify(latestPendingTurnSnapshot));
+  } catch {
+    const compact = {
+      ...latestPendingTurnSnapshot,
+      content: "",
+      files: [],
+      eventIds: [],
+    };
+    try {
+      localStorage.setItem(pendingTurnStorageKey, JSON.stringify(compact));
+      latestPendingTurnSnapshot = compact;
+    } catch {
+      const resumeOnly = {
+        ...compact,
+        requestPayload: null,
+        requestPayloadStored: false,
+        storageDegraded: true,
+      };
+      try {
+        localStorage.setItem(pendingTurnStorageKey, JSON.stringify(resumeOnly));
+        latestPendingTurnSnapshot = resumeOnly;
+      } catch {}
+    }
+  }
+}
+
+function persistPendingTurn(conversation, assistantMessage, streamState = {}, { immediate = false } = {}) {
+  latestPendingTurnSnapshot = buildPendingTurnSnapshot(conversation, assistantMessage, streamState);
+  if (immediate) {
+    flushPendingTurnSnapshot();
+    return;
+  }
+  if (!pendingTurnSaveTimer) pendingTurnSaveTimer = setTimeout(flushPendingTurnSnapshot, 120);
+}
+
+function loadPendingTurn() {
+  let pending = null;
+  try {
+    pending = JSON.parse(localStorage.getItem(pendingTurnStorageKey) || "null");
+  } catch {}
+  const valid = pending
+    && [1, 2, 3].includes(pending.version)
+    && /^[a-f0-9]{32}$/.test(String(pending.clientTurnId || ""))
+    && /^[a-f0-9]{32}$/.test(String(pending.conversationId || ""))
+    && /^[a-f0-9]{32}$/.test(String(pending.assistantMessageId || ""));
+  if (valid) {
+    const responseState = Number(pending.version) >= 3
+      ? String(pending.initialPostResponseState || "unknown")
+      : "unknown";
+    pending.initialPostResponseState = ["awaiting", "no_http_response", "received", "unknown"].includes(responseState)
+      ? responseState
+      : "unknown";
+    const attemptedAt = Number(pending.initialPostAttemptedAt);
+    pending.initialPostAttemptedAt = Number(pending.version) >= 3
+      && Number.isFinite(attemptedAt)
+      && attemptedAt > 0
+      ? attemptedAt
+      : 0;
+    pending.initialPostReplayAttempted = Number(pending.version) >= 3
+      ? Boolean(pending.initialPostReplayAttempted)
+      : false;
+    const requestKind = String(pending.requestKind || "");
+    pending.requestKind = ["external", "direct_image", "codex"].includes(requestKind)
+      ? requestKind
+      : (String(pending.backendKey || "").startsWith("external:") ? "external" : "codex");
+    if (
+      !pending.requestPayload
+      || typeof pending.requestPayload !== "object"
+      || String(pending.requestPayload.client_turn_id || "") !== String(pending.clientTurnId || "")
+    ) {
+      pending.requestPayload = null;
+      pending.requestPayloadStored = false;
+    }
+    return pending;
+  }
+  try { localStorage.removeItem(pendingTurnStorageKey); } catch {}
+  return null;
+}
+
+function clearPendingTurn(clientTurnId = "") {
+  clearTimeout(pendingTurnSaveTimer);
+  pendingTurnSaveTimer = null;
+  if (clientTurnId && latestPendingTurnSnapshot?.clientTurnId && latestPendingTurnSnapshot.clientTurnId !== clientTurnId) return;
+  latestPendingTurnSnapshot = null;
+  try {
+    if (!clientTurnId) {
+      localStorage.removeItem(pendingTurnStorageKey);
+      return;
+    }
+    const saved = JSON.parse(localStorage.getItem(pendingTurnStorageKey) || "null");
+    if (!saved || saved.clientTurnId === clientTurnId) localStorage.removeItem(pendingTurnStorageKey);
+  } catch {
+    try { localStorage.removeItem(pendingTurnStorageKey); } catch {}
+  }
 }
 
 function normalizeConversation(item, fallbackWorkspaceId) {
@@ -475,7 +754,7 @@ async function syncCloudConversations({ force = false, initial = false } = {}) {
     cloudSyncQueued = true;
     return;
   }
-  if (isSending || renamingConversationId || attachments.some((item) => item.loading)) {
+  if (isSending || pendingRecoveryWaiting || renamingConversationId || attachments.some((item) => item.loading)) {
     scheduleCloudSync(1200);
     return;
   }
@@ -491,6 +770,11 @@ async function syncCloudConversations({ force = false, initial = false } = {}) {
       body: outgoingSignature,
     });
     const result = await response.json();
+    if (isSending || pendingRecoveryWaiting) {
+      cloudSyncReady = true;
+      cloudSyncQueued = true;
+      return;
+    }
     const deleted = new Set(Array.isArray(result.deleted) ? result.deleted : []);
     const merged = new Map();
     for (const conversation of state.conversations) {
@@ -574,6 +858,7 @@ function sortedConversations(projectId = state.activeProjectId) {
 }
 
 function selectProject(projectId) {
+  if (blockPendingRecoveryAction("切换项目")) return;
   if (isSending || attachments.some((item) => item.loading)) return;
   state.activeProjectId = projectId || null;
   const conversations = sortedConversations();
@@ -588,6 +873,7 @@ function selectProject(projectId) {
 }
 
 function createProject() {
+  if (blockPendingRecoveryAction("新建项目")) return null;
   if (state.projects.length >= 50) {
     showComposerError("项目数量已达到 50 个，请先整理现有项目。");
     return null;
@@ -617,6 +903,7 @@ function createProject() {
 }
 
 function createConversation() {
+  if (blockPendingRecoveryAction("新建聊天")) return null;
   const project = activeProject();
   const conversation = {
     id: randomId(),
@@ -667,6 +954,7 @@ function renderProjects() {
   for (const project of projects) {
     const button = document.createElement("button");
     button.type = "button";
+    button.disabled = isSending || pendingRecoveryWaiting;
     button.className = "project-item";
     button.classList.toggle("is-active", project.id === state.activeProjectId);
     button.setAttribute("aria-current", project.id === state.activeProjectId ? "page" : "false");
@@ -750,6 +1038,7 @@ function renderHistory() {
 
     const button = document.createElement("button");
     button.type = "button";
+    button.disabled = isSending || pendingRecoveryWaiting;
     button.className = "history-item";
     button.setAttribute("aria-current", conversation.id === state.activeId ? "page" : "false");
     button.title = conversation.title;
@@ -765,7 +1054,7 @@ function renderHistory() {
       button.append(pin);
     }
     button.addEventListener("click", () => {
-      if (isSending) return;
+      if (blockPendingRecoveryAction("切换聊天") || isSending) return;
       if (attachments.some((item) => item.loading)) {
         showComposerError("请等待文件上传完成后再切换聊天");
         return;
@@ -845,7 +1134,7 @@ function openHistoryMenu(conversation, x, y) {
   elements.historyPinLabel.textContent = conversation.pinned ? "取消置顶" : "置顶";
   const uploadInProgress = attachments.some((item) => item.loading);
   for (const button of elements.historyMenu.querySelectorAll("button")) {
-    button.disabled = isSending || (button.dataset.historyAction === "delete" && uploadInProgress);
+    button.disabled = isSending || pendingRecoveryWaiting || (button.dataset.historyAction === "delete" && uploadInProgress);
   }
   elements.historyMenu.hidden = false;
   elements.historyMenu.style.left = "0";
@@ -859,7 +1148,7 @@ function openHistoryMenu(conversation, x, y) {
 }
 
 async function deleteConversation(conversationId) {
-  if (isSending || attachments.some((item) => item.loading)) return;
+  if (blockPendingRecoveryAction("删除聊天") || isSending || attachments.some((item) => item.loading)) return;
   const conversation = state.conversations.find((item) => item.id === conversationId);
   if (!conversation) return;
   const workspaceId = conversation.workspaceId || state.sessionId;
@@ -993,14 +1282,10 @@ function buildMessage(message, workspaceId) {
   node.classList.toggle("is-image-response", message.mode === "image");
   $(".message-role", node).textContent = message.role === "user" ? "你" : "AI Chat";
   const body = $(".message-body", node);
-  if (isThinking) {
-    const thinking = document.createElement("span");
-    thinking.className = "thinking-indicator";
-    thinking.setAttribute("role", "status");
-    thinking.textContent = "正在思考中......";
-    body.replaceChildren(thinking);
+  if (message.role === "assistant") {
+    renderAssistantMessageBody(body, message);
   } else {
-    body.innerHTML = message.role === "assistant" ? renderMarkdown(message.content) : renderPlain(message.content);
+    body.innerHTML = renderPlain(message.content);
   }
   const actions = $(".message-actions", node);
   const copyButton = $(".copy-button", node);
@@ -1154,6 +1439,29 @@ function buildMessage(message, workspaceId) {
   return node;
 }
 
+function renderAssistantMessageBody(body, message) {
+  const content = String(message?.content || "");
+  const recoveryStatus = String(message?.recoveryStatus || "").trim();
+  if (message?.streaming && !content.trim()) {
+    const thinking = document.createElement("span");
+    thinking.className = "thinking-indicator";
+    thinking.setAttribute("role", "status");
+    thinking.setAttribute("aria-live", "polite");
+    thinking.textContent = recoveryStatus || "正在思考中......";
+    body.replaceChildren(thinking);
+    return;
+  }
+  body.innerHTML = renderMarkdown(content);
+  if (message?.streaming && recoveryStatus) {
+    const status = document.createElement("span");
+    status.className = "thinking-indicator";
+    status.setAttribute("role", "status");
+    status.setAttribute("aria-live", "polite");
+    status.textContent = recoveryStatus;
+    body.append(status);
+  }
+}
+
 function renderPlain(text) {
   return `<p>${escapeHtml(text).replaceAll("\n", "<br>")}</p>`;
 }
@@ -1201,13 +1509,17 @@ function formatBytes(bytes) {
 }
 
 function updateComposer() {
-  const ready = Boolean(state.model) && !isSending;
+  const ready = Boolean(state.model) && !isSending && !pendingRecoveryWaiting;
   const readyAttachments = attachments.filter((item) => !item.loading && !item.error);
   const attachmentsBlocked = attachments.some((item) => item.loading || item.error);
   elements.sendButton.disabled = !ready || attachmentsBlocked || (!elements.input.value.trim() && readyAttachments.length === 0);
-  elements.modelSelect.disabled = models.length === 0 || isSending;
-  elements.effortSelect.disabled = models.length === 0 || isSending;
-  elements.fileInput.disabled = isSending || attachments.some((item) => item.loading);
+  elements.modelSelect.disabled = models.length === 0 || isSending || pendingRecoveryWaiting;
+  elements.effortSelect.disabled = models.length === 0 || isSending || pendingRecoveryWaiting;
+  elements.fileInput.disabled = isSending || pendingRecoveryWaiting || attachments.some((item) => item.loading);
+  elements.newChat.disabled = isSending || pendingRecoveryWaiting;
+  elements.newProject.disabled = isSending || pendingRecoveryWaiting;
+  elements.allChats.disabled = isSending || pendingRecoveryWaiting;
+  if (!activeProjectUploadController) elements.projectFileInput.disabled = pendingRecoveryWaiting;
   updatePickerTriggers();
 }
 
@@ -2192,6 +2504,10 @@ async function uploadFileInChunks(file, sessionId, onProgress = () => {}, source
 }
 
 async function uploadProjectFiles(fileList) {
+  if (blockPendingRecoveryAction("上传项目文件")) {
+    elements.projectFileInput.value = "";
+    return;
+  }
   const project = activeProject();
   const files = [...fileList];
   if (!project || !files.length) return;
@@ -2242,7 +2558,7 @@ async function uploadProjectFiles(fileList) {
   } finally {
     if (activeProjectUploadController === uploadController) activeProjectUploadController = null;
     elements.projectUploadCancel.hidden = true;
-    elements.projectFileInput.disabled = false;
+    elements.projectFileInput.disabled = pendingRecoveryWaiting;
     elements.projectFileInput.value = "";
   }
 }
@@ -2668,6 +2984,10 @@ function updateEfforts({ persist = true } = {}) {
 async function uploadSelectedFiles(fileList) {
   const files = [...fileList];
   if (!files.length) return;
+  if (blockPendingRecoveryAction("上传文件")) {
+    elements.fileInput.value = "";
+    return;
+  }
   if (isSending) {
     showComposerError("回答生成中，请等待结束后再添加文件");
     return;
@@ -2799,9 +3119,15 @@ function showComposerError(message) {
   }, 5000);
 }
 
+function blockPendingRecoveryAction(action) {
+  if (!pendingRecoveryWaiting) return false;
+  showComposerError(`正在恢复未完成的回答，暂时不能${action}；联网后会自动继续`);
+  return true;
+}
+
 async function sendMessage() {
   let text = elements.input.value.trim();
-  if (isSending || (!text && attachments.length === 0) || !state.model) return;
+  if (isSending || pendingRecoveryWaiting || (!text && attachments.length === 0) || !state.model) return;
   if (attachments.some((item) => item.error)) {
     showComposerError("请先移除上传失败的文件");
     return;
@@ -2901,6 +3227,7 @@ async function sendMessage() {
   }
   conversation.backendKey = backendKey;
   const messageCreatedAt = Date.now();
+  const clientTurnId = randomId();
   const userMessage = {
     id: randomId(),
     role: "user",
@@ -2920,6 +3247,7 @@ async function sendMessage() {
     content: "",
     files: [],
     streaming: true,
+    clientTurnId,
     createdAt: messageCreatedAt + 1,
   };
   conversation.messages.push(userMessage, assistantMessage);
@@ -2940,29 +3268,80 @@ async function sendMessage() {
 
   const turnRequest = new AbortController();
   activeTurnRequest = turnRequest;
+  const turnPayload = {
+    client_turn_id: clientTurnId,
+    session_id: conversation.workspaceId || state.sessionId,
+    client_conversation_id: conversation.id,
+    thread_id: conversation.threadId,
+    external_conversation_id: conversation.externalConversationId,
+    external_context_key: conversation.externalContextKey,
+    message: userMessage.content,
+    history,
+    model: state.model,
+    effort: state.effort,
+    attachments: userMessage.attachments.map(({ id, name, source }) => ({ id, name, source })),
+    project_attachments: project?.useContext
+      ? project.files.map(({ id, name }) => ({ id, name }))
+      : [],
+    project_instructions: project?.useContext ? project.instructions : "",
+  };
+  const requestKind = backendKey.startsWith("external:")
+    ? "external"
+    : (isDirectImageRequest(turnPayload.message, turnPayload.attachments, turnPayload.project_attachments)
+      ? "direct_image"
+      : "codex");
+  if (requestKind === "external") activeTurn = { threadId: "external", turnId: clientTurnId };
+  if (requestKind === "direct_image") activeTurn = { threadId: "image", turnId: clientTurnId };
+  const streamState = {
+    cursor: 0,
+    hasCursor: false,
+    eventIds: new Set(),
+    finished: false,
+    initialPostUncertain: true,
+    initialPostResponseState: "awaiting",
+    initialPostAttemptedAt: Date.now(),
+    initialPostReplayAttempted: false,
+    requestKind,
+    requestPayload: turnPayload,
+  };
+  persistPendingTurn(conversation, assistantMessage, streamState, { immediate: true });
+  let keepPendingRecovery = false;
   try {
-    const response = await api("/api/turn", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
+    let response = null;
+    let initialStreamError = null;
+    try {
+      response = await postTurnRequest(turnPayload, turnRequest.signal);
+      streamState.initialPostUncertain = false;
+      streamState.initialPostResponseState = "received";
+      streamState.requestPayload = null;
+      persistPendingTurn(conversation, assistantMessage, streamState, { immediate: true });
+    } catch (error) {
+      const receivedHttpResponse = Number(error?.status) > 0;
+      streamState.initialPostResponseState = receivedHttpResponse ? "received" : "no_http_response";
+      if (receivedHttpResponse) {
+        streamState.initialPostUncertain = false;
+        streamState.requestPayload = null;
+      }
+      persistPendingTurn(conversation, assistantMessage, streamState, { immediate: true });
+      if (!isTurnConnectionError(error)) throw error;
+      initialStreamError = error;
+    }
+    await consumeStream(response, conversation, assistantMessage, {
+      clientTurnId,
       signal: turnRequest.signal,
-      body: JSON.stringify({
-        session_id: conversation.workspaceId || state.sessionId,
-        client_conversation_id: conversation.id,
-        thread_id: conversation.threadId,
-        external_conversation_id: conversation.externalConversationId,
-        external_context_key: conversation.externalContextKey,
-        message: userMessage.content,
-        history,
-        model: state.model,
-        effort: state.effort,
-        attachments: userMessage.attachments.map(({ id, name, source }) => ({ id, name, source })),
-        project_attachments: project?.useContext
-          ? project.files.map(({ id, name }) => ({ id, name }))
-          : [],
-        project_instructions: project?.useContext ? project.instructions : "",
-      }),
+      initialError: initialStreamError,
+      streamState,
+      resumeEnabled: ["external", "direct_image"].includes(requestKind),
+      requestInitial: ["external", "direct_image"].includes(requestKind)
+        ? (requestPayload, signal) => postTurnRequest(requestPayload, signal)
+        : null,
+      onProgress: (progress, persistOptions = {}) => persistPendingTurn(
+        conversation,
+        assistantMessage,
+        progress,
+        persistOptions,
+      ),
     });
-    await consumeStream(response, conversation, assistantMessage);
   } catch (error) {
     if (error?.name === "AbortError") {
       assistantMessage.content = stripInternalAnnotations(assistantMessage.content, { removeIncomplete: true }).trimEnd()
@@ -2976,6 +3355,14 @@ async function sendMessage() {
       elements.input.value = retryText;
       attachments = outgoingFiles;
       showComposerError(error.message);
+    } else if (error?.recoveryFailed) {
+      keepPendingRecovery = true;
+      pendingRecoveryWaiting = true;
+      assistantMessage.error = false;
+      assistantMessage.streaming = true;
+      assistantMessage.recoveryStatus = error.message;
+      flushPendingTurnSnapshot();
+      showComposerError(error.message);
     } else {
       if (backendKey.startsWith("external:")) {
         conversation.externalConversationId = null;
@@ -2987,27 +3374,309 @@ async function sendMessage() {
       assistantMessage.content = partial ? `${partial}\n\n> 回答传输中断：${detail}` : detail;
     }
   } finally {
+    if (!keepPendingRecovery) clearPendingTurn(clientTurnId);
+    if (!keepPendingRecovery) assistantMessage.recoveryStatus = "";
     assistantMessage.content = stripInternalAnnotations(assistantMessage.content, { removeIncomplete: true }).trimEnd();
-    assistantMessage.streaming = false;
+    assistantMessage.streaming = keepPendingRecovery;
     isSending = false;
-    activeTurn = null;
+    if (!keepPendingRecovery) activeTurn = null;
     if (activeTurnRequest === turnRequest) activeTurnRequest = null;
     conversation.updatedAt = Date.now();
     saveState();
     renderAll();
-    elements.stopButton.hidden = true;
-    elements.sendButton.hidden = false;
+    elements.stopButton.hidden = !keepPendingRecovery;
+    elements.sendButton.hidden = keepPendingRecovery;
     updateComposer();
     refreshQuota({ quiet: true });
   }
 }
 
-async function consumeStream(response, conversation, assistantMessage) {
+function resumePendingTurnOnce() {
+  if (pendingRecoveryPromise) return pendingRecoveryPromise;
+  pendingRecoveryPromise = Promise.resolve(resumePendingTurn())
+    .finally(() => {
+      pendingRecoveryPromise = null;
+    });
+  return pendingRecoveryPromise;
+}
+
+async function resumePendingTurn() {
+  if (isSending) return;
+  const pending = loadPendingTurn();
+  if (!pending) {
+    pendingRecoveryWaiting = false;
+    updateComposer();
+    return;
+  }
+  let conversation = state.conversations.find((item) => item.id === pending.conversationId);
+  if (!conversation) {
+    conversation = {
+      id: pending.conversationId,
+      workspaceId: state.sessionId,
+      projectId: null,
+      threadId: null,
+      externalConversationId: null,
+      externalContextKey: null,
+      codexThreadIds: [],
+      backendKey: String(pending.backendKey || ""),
+      title: "正在取回的回答",
+      messages: [],
+      updatedAt: Date.now(),
+      pinned: false,
+      pinnedAt: 0,
+    };
+    state.conversations.unshift(conversation);
+  }
+
+  let assistantMessage = conversation.messages.find(
+    (message) => message.id === pending.assistantMessageId && message.role === "assistant",
+  );
+  if (assistantMessage && !assistantMessage.streaming && !assistantMessage.recoveryStatus) {
+    clearPendingTurn(pending.clientTurnId);
+    pendingRecoveryWaiting = false;
+    updateComposer();
+    return;
+  }
+  if (!assistantMessage) {
+    assistantMessage = {
+      id: pending.assistantMessageId,
+      role: "assistant",
+      content: String(pending.content || ""),
+      files: Array.isArray(pending.files) ? pending.files : [],
+      mode: String(pending.mode || ""),
+      streaming: true,
+      clientTurnId: pending.clientTurnId,
+      createdAt: Number(pending.createdAt) || Date.now(),
+    };
+    conversation.messages.push(assistantMessage);
+  } else {
+    assistantMessage.content = String(assistantMessage.content || pending.content || "");
+    assistantMessage.files = Array.isArray(assistantMessage.files) && assistantMessage.files.length
+      ? assistantMessage.files
+      : (Array.isArray(pending.files) ? pending.files : []);
+    assistantMessage.mode = assistantMessage.mode || String(pending.mode || "");
+    assistantMessage.clientTurnId = pending.clientTurnId;
+    assistantMessage.streaming = true;
+    assistantMessage.error = false;
+  }
+
+  latestPendingTurnSnapshot = pending;
+  pendingRecoveryWaiting = false;
+  isSending = true;
+  autoScrollEnabled = true;
+  state.activeId = conversation.id;
+  activeTurn = pending.threadId && pending.turnId
+    ? { threadId: pending.threadId, turnId: pending.turnId }
+    : (pending.requestKind === "external"
+      ? { threadId: "external", turnId: pending.clientTurnId }
+      : (pending.requestKind === "direct_image"
+        ? { threadId: "image", turnId: pending.clientTurnId }
+        : null));
+  assistantMessage.recoveryStatus = "正在恢复未完成的回答……";
+  conversation.updatedAt = Date.now();
+  saveState();
+  renderAll();
+  elements.stopButton.hidden = false;
+  elements.sendButton.hidden = true;
+  updateComposer();
+
+  const turnRequest = new AbortController();
+  activeTurnRequest = turnRequest;
+  const streamState = {
+    cursor: Math.max(0, Number(pending.cursor) || 0),
+    hasCursor: Boolean(pending.hasCursor),
+    eventIds: new Set(Array.isArray(pending.eventIds) ? pending.eventIds : []),
+    finished: false,
+    initialPostUncertain: Boolean(pending.initialPostUncertain),
+    initialPostResponseState: String(pending.initialPostResponseState || "unknown"),
+    initialPostAttemptedAt: Number(pending.initialPostAttemptedAt) || 0,
+    initialPostReplayAttempted: Boolean(pending.initialPostReplayAttempted),
+    requestKind: String(pending.requestKind || "codex"),
+    requestPayload: pending.requestPayloadStored && pending.requestPayload
+      ? pending.requestPayload
+      : null,
+  };
+  const disconnected = new Error("回答连接意外中断，请重试");
+  disconnected.recoverableStreamError = true;
+  let keepPendingRecovery = false;
+  try {
+    await consumeStream(null, conversation, assistantMessage, {
+      clientTurnId: pending.clientTurnId,
+      signal: turnRequest.signal,
+      initialError: disconnected,
+      streamState,
+      resumeEnabled: ["external", "direct_image"].includes(pending.requestKind),
+      requestInitial: ["external", "direct_image"].includes(pending.requestKind)
+        ? (requestPayload, signal) => postTurnRequest(requestPayload, signal)
+        : null,
+      onProgress: (progress, persistOptions = {}) => persistPendingTurn(
+        conversation,
+        assistantMessage,
+        progress,
+        persistOptions,
+      ),
+    });
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      assistantMessage.content = stripInternalAnnotations(assistantMessage.content, { removeIncomplete: true }).trimEnd()
+        || "已停止生成。";
+      assistantMessage.error = false;
+    } else if (error?.recoveryFailed) {
+      keepPendingRecovery = true;
+      pendingRecoveryWaiting = true;
+      assistantMessage.error = false;
+      assistantMessage.streaming = true;
+      assistantMessage.recoveryStatus = error.message;
+      flushPendingTurnSnapshot();
+      showComposerError(error.message);
+    } else {
+      if (String(pending.backendKey || "").startsWith("external:")) {
+        conversation.externalConversationId = null;
+        conversation.externalContextKey = null;
+      }
+      assistantMessage.error = true;
+      const detail = userFacingError(error, error.status);
+      const partial = stripInternalAnnotations(assistantMessage.content, { removeIncomplete: true }).trimEnd();
+      assistantMessage.content = partial ? `${partial}\n\n> 回答取回失败：${detail}` : detail;
+    }
+  } finally {
+    if (!keepPendingRecovery) clearPendingTurn(pending.clientTurnId);
+    if (!keepPendingRecovery) assistantMessage.recoveryStatus = "";
+    assistantMessage.content = stripInternalAnnotations(assistantMessage.content, { removeIncomplete: true }).trimEnd();
+    assistantMessage.streaming = keepPendingRecovery;
+    isSending = false;
+    if (!keepPendingRecovery) activeTurn = null;
+    if (activeTurnRequest === turnRequest) activeTurnRequest = null;
+    conversation.updatedAt = Date.now();
+    saveState();
+    renderAll();
+    elements.stopButton.hidden = !keepPendingRecovery;
+    elements.sendButton.hidden = keepPendingRecovery;
+    updateComposer();
+    refreshQuota({ quiet: true });
+  }
+}
+
+async function consumeStream(response, conversation, assistantMessage, options = {}) {
+  const clientTurnId = String(options.clientTurnId || assistantMessage.clientTurnId || "").trim();
+  const signal = options.signal;
+  const maxAttempts = Math.max(0, Math.trunc(Number(options.maxAttempts ?? TURN_RESUME_MAX_ATTEMPTS)));
+  const resumeEnabled = options.resumeEnabled !== false;
+  const requestResume = options.requestResume || ((url, requestOptions) => api(url, requestOptions));
+  const requestInitial = typeof options.requestInitial === "function" ? options.requestInitial : null;
+  const waitBeforeResume = options.waitBeforeResume || waitForTurnResume;
+  const onProgress = options.onProgress || (() => {});
+  const streamState = options.streamState || {
+    cursor: 0,
+    hasCursor: false,
+    eventIds: new Set(),
+    finished: false,
+  };
+  let currentResponse = response;
+  let failure = options.initialError || null;
+  let attempts = 0;
+
+  while (true) {
+    if (signal?.aborted) throw abortError();
+    if (currentResponse) {
+      assistantMessage.recoveryStatus = "";
+      updateStreamingMessage(assistantMessage);
+      try {
+        await consumeStreamResponse(currentResponse, conversation, assistantMessage, streamState, onProgress);
+        if (streamState.finished) return;
+      } catch (error) {
+        failure = error;
+      }
+      currentResponse = null;
+    }
+
+    if (failure?.name === "AbortError") throw failure;
+    if (!resumeEnabled || !clientTurnId || !isTurnConnectionError(failure)) {
+      throw failure || new Error("回答连接意外中断，请重试");
+    }
+    if (attempts >= maxAttempts) {
+      assistantMessage.recoveryStatus = "";
+      const error = new Error("暂时无法连接；联网后刷新页面会继续取回，请勿重复发送");
+      error.recoveryFailed = true;
+      error.cause = failure;
+      throw error;
+    }
+
+    attempts += 1;
+    assistantMessage.recoveryStatus = `网络短暂中断，正在恢复回答（${attempts}/${maxAttempts}）……`;
+    updateStreamingMessage(assistantMessage);
+    await waitBeforeResume(attempts - 1, signal);
+
+    try {
+      currentResponse = await requestResume(turnResumeUrl(clientTurnId, streamState.cursor), {
+        method: "GET",
+        headers: { Accept: "application/x-ndjson" },
+        signal,
+      });
+      failure = null;
+    } catch (error) {
+      if (error?.name === "AbortError") throw error;
+      if (Number(error?.status) === 404) {
+        const replayBlockReason = initialPostReplayBlockReason(streamState);
+        if (streamState.initialPostUncertain && !replayBlockReason) {
+          if (!requestInitial || !streamState.requestPayload) {
+            throw missingTurnRecoveryError("服务器没有可恢复记录，且本机未能保留完整请求。为避免重复发送，请先核对官网或会话记录，再手动重试");
+          }
+          assistantMessage.recoveryStatus = "服务器未收到消息，正在安全补发……";
+          updateStreamingMessage(assistantMessage);
+          streamState.initialPostReplayAttempted = true;
+          onProgress(streamState, { immediate: true });
+          try {
+            currentResponse = await requestInitial(streamState.requestPayload, signal);
+            streamState.initialPostUncertain = false;
+            streamState.initialPostResponseState = "received";
+            streamState.requestPayload = null;
+            onProgress(streamState, { immediate: true });
+            failure = null;
+          } catch (initialError) {
+            const receivedHttpResponse = Number(initialError?.status) > 0;
+            streamState.initialPostResponseState = receivedHttpResponse ? "received" : "no_http_response";
+            if (receivedHttpResponse) {
+              streamState.initialPostUncertain = false;
+              streamState.requestPayload = null;
+            }
+            onProgress(streamState, { immediate: true });
+            if (initialError?.name === "AbortError") throw initialError;
+            if (!isTurnConnectionError(initialError)) throw initialError;
+            failure = initialError;
+            currentResponse = null;
+          }
+          continue;
+        }
+        throw missingTurnRecoveryError(replayBlockReason);
+      }
+      if (!isTurnConnectionError(error)) throw error;
+      failure = error;
+      currentResponse = null;
+    }
+  }
+}
+
+async function consumeStreamResponse(response, conversation, assistantMessage, streamState, onProgress = () => {}) {
+  if (!response?.body?.getReader) {
+    const error = new Error("回答连接意外中断，请重试");
+    error.recoverableStreamError = true;
+    throw error;
+  }
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
   while (true) {
-    const { value, done } = await reader.read();
+    let result;
+    try {
+      result = await reader.read();
+    } catch (cause) {
+      const error = new Error("回答连接意外中断，请重试");
+      error.recoverableStreamError = true;
+      error.cause = cause;
+      throw error;
+    }
+    const { value, done } = result;
     if (value) buffer += decoder.decode(value, { stream: !done });
     if (done) buffer += decoder.decode();
     const lines = buffer.split("\n");
@@ -3020,52 +3689,62 @@ async function consumeStream(response, conversation, assistantMessage) {
       } catch {
         throw new Error("回答数据格式异常，请重试");
       }
-      if (event.type === "started") {
-        if (!["external", "image"].includes(event.threadId)) {
-          conversation.threadId = event.threadId;
-          conversation.codexThreadIds = [...new Set([
-            ...(Array.isArray(conversation.codexThreadIds) ? conversation.codexThreadIds : []),
-            event.threadId,
-          ])];
-          conversation.updatedAt = Date.now();
-          saveState();
-        }
-        if (event.mode) assistantMessage.mode = event.mode;
-        activeTurn = { threadId: event.threadId, turnId: event.turnId };
-      } else if (event.type === "delta") {
-        assistantMessage.content += String(event.text || "");
-        updateStreamingMessage(assistantMessage);
-      } else if (event.type === "replace") {
-        assistantMessage.content = String(event.text || "");
-        updateStreamingMessage(assistantMessage);
-      } else if (event.type === "done") {
-        if (event.mode) assistantMessage.mode = event.mode;
-        if (event.externalConversationId && event.externalContextKey) {
-          conversation.externalConversationId = event.externalConversationId;
-          conversation.externalContextKey = event.externalContextKey;
-        } else if (["external", "image"].includes(assistantMessage.mode)) {
-          conversation.externalConversationId = null;
-          conversation.externalContextKey = null;
-        }
-        assistantMessage.files = event.files || [];
-        assistantMessage.usage = normalizeTokenUsage(event.usage);
-        assistantMessage.cost = normalizeCost(event.cost);
-        return;
-      } else if (event.type === "error") {
-        if (assistantMessage.mode === "external") {
-          conversation.externalConversationId = null;
-          conversation.externalContextKey = null;
-        }
-        assistantMessage.error = true;
-        const detail = userFacingError(event.message, event.status);
-        const partial = stripInternalAnnotations(assistantMessage.content, { removeIncomplete: true }).trimEnd();
-        assistantMessage.content = partial ? `${partial}\n\n> 回答传输中断：${detail}` : detail;
-        return;
-      }
+      if (!acceptTurnEvent(event, streamState)) continue;
+      applyTurnEvent(event, conversation, assistantMessage, streamState);
+      onProgress(streamState);
+      if (streamState.finished) return;
     }
-    if (done) break;
+    if (done) {
+      const error = new Error("回答连接意外中断，请重试");
+      error.recoverableStreamError = true;
+      throw error;
+    }
   }
-  throw new Error("回答连接意外中断，请重试");
+}
+
+function applyTurnEvent(event, conversation, assistantMessage, streamState) {
+  if (event.type === "started") {
+    if (!["external", "image"].includes(event.threadId)) {
+      conversation.threadId = event.threadId;
+      conversation.codexThreadIds = [...new Set([
+        ...(Array.isArray(conversation.codexThreadIds) ? conversation.codexThreadIds : []),
+        event.threadId,
+      ])];
+      conversation.updatedAt = Date.now();
+      saveState();
+    }
+    if (event.mode) assistantMessage.mode = event.mode;
+    activeTurn = { threadId: event.threadId, turnId: event.turnId };
+  } else if (event.type === "delta") {
+    assistantMessage.content += String(event.text || "");
+    updateStreamingMessage(assistantMessage);
+  } else if (event.type === "replace") {
+    assistantMessage.content = String(event.text || "");
+    updateStreamingMessage(assistantMessage);
+  } else if (event.type === "done") {
+    if (event.mode) assistantMessage.mode = event.mode;
+    if (event.externalConversationId && event.externalContextKey) {
+      conversation.externalConversationId = event.externalConversationId;
+      conversation.externalContextKey = event.externalContextKey;
+    } else if (["external", "image"].includes(assistantMessage.mode)) {
+      conversation.externalConversationId = null;
+      conversation.externalContextKey = null;
+    }
+    assistantMessage.files = Array.isArray(event.files) ? event.files : [];
+    assistantMessage.usage = normalizeTokenUsage(event.usage);
+    assistantMessage.cost = normalizeCost(event.cost);
+    streamState.finished = true;
+  } else if (event.type === "error") {
+    if (assistantMessage.mode === "external") {
+      conversation.externalConversationId = null;
+      conversation.externalContextKey = null;
+    }
+    assistantMessage.error = true;
+    const detail = userFacingError(event.message, event.status);
+    const partial = stripInternalAnnotations(assistantMessage.content, { removeIncomplete: true }).trimEnd();
+    assistantMessage.content = partial ? `${partial}\n\n> 回答传输中断：${detail}` : detail;
+    streamState.finished = true;
+  }
 }
 
 function updateStreamingMessage(message) {
@@ -3081,8 +3760,9 @@ function updateStreamingMessage(message) {
       `.message[data-message-id="${latest.id}"]`,
     );
     if (!article) return;
-    article.classList.remove("is-thinking");
-    article.querySelector(".message-body").innerHTML = renderMarkdown(latest.content);
+    const isThinking = Boolean(latest.streaming) && !String(latest.content || "").trim();
+    article.classList.toggle("is-thinking", isThinking);
+    renderAssistantMessageBody(article.querySelector(".message-body"), latest);
     if (autoScrollEnabled) {
       window.scrollTo({ top: document.documentElement.scrollHeight, behavior: "auto" });
     }
@@ -3090,16 +3770,45 @@ function updateStreamingMessage(message) {
 }
 
 async function stopCurrentTurn() {
-  if (!isSending) return;
+  if (!isSending && !pendingRecoveryWaiting) return;
+  const wasWaitingForRecovery = pendingRecoveryWaiting && !isSending;
   const turn = activeTurn;
-  activeTurnRequest?.abort();
+  if (!turn) {
+    showComposerError("回答任务仍在建立连接，暂时无法确认停止；请稍后再试");
+    return;
+  }
   elements.stopButton.disabled = true;
   try {
-    if (turn) {
-      await api(`/api/turn/${encodeURIComponent(turn.threadId)}/${encodeURIComponent(turn.turnId)}/interrupt`, { method: "POST" });
-    }
+    await api(`/api/turn/${encodeURIComponent(turn.threadId)}/${encodeURIComponent(turn.turnId)}/interrupt`, { method: "POST" });
   } catch (error) {
-    showComposerError(`停止请求未送达：${userFacingError(error, error.status)}`);
+    showComposerError(`未能确认停止，回答仍会继续恢复：${userFacingError(error, error.status)}`);
+    elements.stopButton.disabled = false;
+    return;
+  }
+
+  activeTurnRequest?.abort();
+  try {
+    if (wasWaitingForRecovery) {
+      const pending = latestPendingTurnSnapshot || loadPendingTurn();
+      const conversation = state.conversations.find((item) => item.id === pending?.conversationId);
+      const assistantMessage = conversation?.messages.find((message) => message.id === pending?.assistantMessageId);
+      if (assistantMessage) {
+        assistantMessage.content = stripInternalAnnotations(assistantMessage.content, { removeIncomplete: true }).trimEnd()
+          || "已停止生成。";
+        assistantMessage.streaming = false;
+        assistantMessage.recoveryStatus = "";
+        assistantMessage.error = false;
+        conversation.updatedAt = Date.now();
+      }
+      clearPendingTurn(pending?.clientTurnId || "");
+      pendingRecoveryWaiting = false;
+      activeTurn = null;
+      saveState();
+      renderAll();
+      elements.stopButton.hidden = true;
+      elements.sendButton.hidden = false;
+      updateComposer();
+    }
   } finally {
     elements.stopButton.disabled = false;
   }
@@ -3109,7 +3818,7 @@ elements.menuButton.addEventListener("click", openSidebar);
 elements.sidebarClose.addEventListener("click", closeSidebar);
 elements.scrim.addEventListener("click", closeSidebar);
 elements.newChat.addEventListener("click", () => {
-  if (isSending) return;
+  if (blockPendingRecoveryAction("新建聊天") || isSending) return;
   if (attachments.some((item) => item.loading)) {
     showComposerError("请等待文件上传完成后再新建聊天");
     return;
@@ -3120,7 +3829,7 @@ elements.newChat.addEventListener("click", () => {
   createConversation();
 });
 elements.newProject.addEventListener("click", () => {
-  if (isSending || attachments.some((item) => item.loading)) return;
+  if (blockPendingRecoveryAction("新建项目") || isSending || attachments.some((item) => item.loading)) return;
   closeHistoryMenu();
   createProject();
 });
@@ -3329,16 +4038,28 @@ window.addEventListener("resize", () => {
 }, { passive: true });
 window.addEventListener("blur", closeHistoryMenu);
 document.addEventListener("visibilitychange", () => {
+  if (document.hidden) flushPendingTurnSnapshot();
   if (!document.hidden && Date.now() - quotaLastFetched > 60_000) refreshQuota({ quiet: true });
   if (!document.hidden && Date.now() - latencyLastFetched > 3_000) refreshLatency();
-  if (!document.hidden) syncCloudConversations({ force: true });
+  if (!document.hidden && pendingRecoveryWaiting) {
+    void resumePendingTurnOnce();
+  } else if (!document.hidden) {
+    syncCloudConversations({ force: true });
+  }
 });
+window.addEventListener("pagehide", flushPendingTurnSnapshot);
 window.addEventListener("beforeunload", (event) => {
   if (!providerFormDirty) return;
   event.preventDefault();
   event.returnValue = "";
 });
-window.addEventListener("online", () => syncCloudConversations({ force: true }));
+window.addEventListener("online", () => {
+  if (pendingRecoveryWaiting) {
+    void resumePendingTurnOnce();
+    return;
+  }
+  syncCloudConversations({ force: true });
+});
 function hasDraggedFiles(event) {
   return Array.from(event.dataTransfer?.types || []).includes("Files");
 }
@@ -3389,6 +4110,7 @@ if (!sortedConversations().some((item) => item.id === state.activeId)) {
 }
 renderAll();
 resizeInput();
+void resumePendingTurnOnce();
 syncCloudConversations({ force: true, initial: true });
 checkAccount();
 refreshLatency();

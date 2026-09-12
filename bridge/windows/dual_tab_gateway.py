@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import errno
 import json
 import logging
 import math
@@ -19,6 +20,13 @@ DEFAULT_QUEUE_TIMEOUT_SECONDS = 60.0
 DEFAULT_MAX_QUEUED_REQUESTS = 32
 DEFAULT_HEALTH_TIMEOUT_SECONDS = 5.0
 
+_DOWNSTREAM_DISCONNECT_ERRNOS = {
+    errno.ECONNABORTED,
+    errno.ECONNRESET,
+    errno.EPIPE,
+}
+_DOWNSTREAM_DISCONNECT_WINERRORS = {64, 109, 10053, 10054}
+
 
 class GatewayQueueFull(Exception):
     """Raised when both workers and the bounded waiting queue are full."""
@@ -26,6 +34,32 @@ class GatewayQueueFull(Exception):
 
 class GatewayQueueTimeout(Exception):
     """Raised when a queued request does not receive a worker in time."""
+
+
+def downstream_client_disconnected(exc: BaseException) -> bool:
+    """Identify transport errors raised while writing to the caller."""
+
+    if isinstance(exc, ConnectionError):
+        return True
+    return isinstance(exc, OSError) and (
+        exc.errno in _DOWNSTREAM_DISCONNECT_ERRNOS
+        or getattr(exc, "winerror", None) in _DOWNSTREAM_DISCONNECT_WINERRORS
+    )
+
+
+async def await_downstream_io(operation) -> bool:
+    """Run one response operation and quietly classify a disconnected caller."""
+
+    try:
+        await operation
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        if not downstream_client_disconnected(exc):
+            raise
+        logger.info("downstream client disconnected: %s", type(exc).__name__)
+        return False
+    return True
 
 HOP_BY_HOP = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -358,12 +392,15 @@ class DualTabGateway:
                     status=upstream.status, reason=upstream.reason,
                     headers=filtered_headers(upstream.headers.items()),
                 )
-                await downstream.prepare(request)
+                if not await await_downstream_io(downstream.prepare(request)):
+                    return downstream
                 async for chunk in upstream.content.iter_chunked(64 * 1024):
-                    await downstream.write(chunk)
-                await downstream.write_eof()
+                    if not await await_downstream_io(downstream.write(chunk)):
+                        return downstream
+                if not await await_downstream_io(downstream.write_eof()):
+                    return downstream
                 return downstream
-        except (ConnectionResetError, asyncio.CancelledError):
+        except asyncio.CancelledError:
             raise
         except Exception as exc:
             logger.exception("backend %s failed", backend_index + 1)
@@ -383,11 +420,22 @@ class DualTabGateway:
                             "type": "upstream_error",
                         }
                     }
-                    await downstream.write(
+                    if not await await_downstream_io(downstream.write(
                         f"data: {json.dumps(payload)}\n\n".encode()
-                    )
-                    await downstream.write(b"data: [DONE]\n\n")
-                await downstream.write_eof()
+                    )):
+                        return downstream
+                    if not await await_downstream_io(
+                        downstream.write(b"data: [DONE]\n\n")
+                    ):
+                        return downstream
+                    if not await await_downstream_io(downstream.write_eof()):
+                        return downstream
+                    return downstream
+                # Headers for a non-SSE response have already reached the caller,
+                # so neither a replacement 502 nor a clean EOF can describe the
+                # truncated body correctly. Closing the connection lets clients
+                # detect an incomplete transfer instead of accepting it as whole.
+                downstream.force_close()
                 return downstream
             return web.json_response(
                 {"error": {"message": f"backend {backend_index + 1} unavailable: {exc}",

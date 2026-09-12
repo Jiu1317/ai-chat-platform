@@ -22,6 +22,7 @@ import unicodedata
 import uuid
 import zipfile
 from contextlib import asynccontextmanager, contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, AsyncIterator, Literal
 from urllib.parse import urlparse
@@ -129,6 +130,11 @@ EXTERNAL_ASSET_DOWNLOAD_TIMEOUT_SECONDS = 3 * 60
 EXTERNAL_ASSET_DOWNLOAD_ATTEMPTS = 3
 EXTERNAL_ASSET_ATTEMPT_TIMEOUT_SECONDS = 55
 EXTERNAL_RESPONSE_TIMEOUT_SECONDS = 20 * 60
+EXTERNAL_RESUME_TTL_SECONDS = 6 * 60 * 60
+EXTERNAL_RESUME_MAX_TURNS = 64
+EXTERNAL_RESUME_MAX_EVENT_BYTES = 2 * 1024 * 1024
+RESUMABLE_STOP_TOMBSTONE_TTL_SECONDS = 30 * 60
+RESUMABLE_STOP_TOMBSTONE_MAX_ENTRIES = 512
 EXTERNAL_ASSET_RETRYABLE_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504, 520, 522, 524}
 EXTERNAL_ASSET_PATH_RE = re.compile(r"^/v1/assets/[A-Za-z0-9_-]{16,256}$")
 EXTERNAL_ASSET_MARKDOWN_RE = re.compile(
@@ -141,6 +147,7 @@ TEXT_EXTENSIONS = {
 }
 ALLOWED_EXTENSIONS = IMAGE_EXTENSIONS | OFFICE_EXTENSIONS | TEXT_EXTENSIONS | {".pdf"}
 PROVIDER_ID_RE = re.compile(r"^[a-f0-9]{12}$")
+CLIENT_TURN_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 CODEX_MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$")
 IMAGE_REQUEST_RE = re.compile(
     r"(?:"
@@ -1620,6 +1627,21 @@ class CodexAppServer:
         self.backlog.pop(turn_id, None)
 
 
+@dataclass
+class ResumableExternalTurn:
+    user_id: str
+    client_turn_id: str
+    fingerprint: str
+    kind: str = "external"
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+    events: list[bytes] = field(default_factory=list)
+    event_bytes: int = 0
+    terminal: bool = False
+    task: asyncio.Task[Any] | None = None
+    condition: asyncio.Condition = field(default_factory=asyncio.Condition)
+
+
 codex = CodexAppServer()
 login_attempts: dict[str, dict[str, float | int]] = {}
 provider_write_lock = asyncio.Lock()
@@ -1628,6 +1650,9 @@ conversation_write_lock = asyncio.Lock()
 chunk_upload_locks: dict[str, asyncio.Lock] = {}
 chunk_upload_lock_times: dict[str, float] = {}
 external_turns: dict[str, tuple[str, asyncio.Task[Any]]] = {}
+resumable_external_turns: dict[tuple[str, str], ResumableExternalTurn] = {}
+resumable_stop_tombstones: dict[tuple[str, str], float] = {}
+resumable_external_turns_lock = asyncio.Lock()
 external_conversation_locks: dict[tuple[str, str], asyncio.Lock] = {}
 external_conversation_states: dict[tuple[str, str], dict[str, str]] = {}
 image_turns: dict[str, tuple[str, asyncio.Task[Any]]] = {}
@@ -1708,6 +1733,7 @@ async def _cleanup_loop() -> None:
                 "DELETE FROM message_events WHERE created_at <= ?",
                 (int(time.time()) - MESSAGE_LIMIT_WINDOW_SECONDS,),
             )
+        await _cleanup_resumable_external_turns()
 
 
 @asynccontextmanager
@@ -1725,6 +1751,11 @@ async def lifespan(_: FastAPI):
             for _owner, task in [*external_turns.values(), *image_turns.values()]
             if task is not current
         }
+        active_tasks.update(
+            record.task
+            for record in resumable_external_turns.values()
+            if record.task is not None and record.task is not current
+        )
         active_tasks.update(task for task in image_variant_tasks if task is not current)
         for task in active_tasks:
             if not task.done():
@@ -1732,6 +1763,8 @@ async def lifespan(_: FastAPI):
         if active_tasks:
             await asyncio.gather(*active_tasks, return_exceptions=True)
         external_turns.clear()
+        resumable_external_turns.clear()
+        resumable_stop_tombstones.clear()
         image_turns.clear()
         image_variant_tasks.clear()
         external_conversation_locks.clear()
@@ -3098,6 +3131,7 @@ class HistoryMessage(BaseModel):
 class TurnRequest(BaseModel):
     session_id: str = Field(pattern=r"^[a-f0-9]{32}$")
     client_conversation_id: str | None = Field(default=None, pattern=r"^[a-f0-9]{32}$")
+    client_turn_id: str | None = Field(default=None, pattern=r"^[a-f0-9]{32}$")
     thread_id: str | None = None
     external_conversation_id: str | None = Field(
         default=None,
@@ -5059,22 +5093,15 @@ async def _external_stream(
             external_context_key=context_key,
             completion_state=completion_state,
         )
-        try:
-            async with asyncio.timeout(EXTERNAL_RESPONSE_TIMEOUT_SECONDS):
-                async for event in _iter_with_heartbeat(source):
-                    if event is None:
-                        yield _ndjson({"type": "ping"})
-                    else:
-                        if site_key and completion_state.get("external_conversation_id"):
-                            external_conversation_states[site_key] = {
-                                "external_conversation_id": completion_state["external_conversation_id"],
-                                "external_context_key": completion_state["external_context_key"],
-                            }
-                        yield event
-        except TimeoutError:
-            yield _ndjson({"type": "error", "message": "API 回答超过 20 分钟，已自动停止"})
+        async for event in source:
+            if site_key and completion_state.get("external_conversation_id"):
+                external_conversation_states[site_key] = {
+                    "external_conversation_id": completion_state["external_conversation_id"],
+                    "external_context_key": completion_state["external_context_key"],
+                }
+            yield event
 
-    try:
+    async def run_serialized() -> AsyncIterator[bytes]:
         if lock:
             async with lock:
                 async for event in run_locked():
@@ -5082,10 +5109,380 @@ async def _external_stream(
         else:
             async for event in run_locked():
                 yield event
-    except asyncio.CancelledError:
-        yield _ndjson({"type": "done", "files": []})
+
+    try:
+        async with asyncio.timeout(EXTERNAL_RESPONSE_TIMEOUT_SECONDS):
+            async for event in _iter_with_heartbeat(run_serialized()):
+                yield _ndjson({"type": "ping"}) if event is None else event
+    except TimeoutError:
+        yield _ndjson({"type": "error", "message": "API 回答超过 20 分钟，已自动停止"})
     finally:
         external_turns.pop(turn_id, None)
+
+
+def _external_turn_fingerprint(
+    payload: TurnRequest, provider_id: str, model_id: str
+) -> str:
+    if hasattr(payload, "model_dump"):
+        body = payload.model_dump(mode="json", exclude={"client_turn_id"})
+    else:
+        body = payload.dict(exclude={"client_turn_id"})
+    canonical = json.dumps(
+        {"providerId": provider_id, "modelId": model_id, "payload": body},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _image_turn_fingerprint(payload: TurnRequest) -> str:
+    if hasattr(payload, "model_dump"):
+        body = payload.model_dump(mode="json", exclude={"client_turn_id"})
+    else:
+        body = payload.dict(exclude={"client_turn_id"})
+    canonical = json.dumps(
+        {"kind": "image", "payload": body},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _prune_resumable_stop_tombstones_locked(
+    now: float, *, make_room: bool = False
+) -> None:
+    expired = [
+        key
+        for key, stopped_at in resumable_stop_tombstones.items()
+        if now - stopped_at >= RESUMABLE_STOP_TOMBSTONE_TTL_SECONDS
+    ]
+    for key in expired:
+        resumable_stop_tombstones.pop(key, None)
+
+    limit = max(1, int(RESUMABLE_STOP_TOMBSTONE_MAX_ENTRIES))
+    if not make_room or len(resumable_stop_tombstones) < limit:
+        return
+    oldest = sorted(resumable_stop_tombstones.items(), key=lambda item: item[1])
+    for key, _stopped_at in oldest:
+        if len(resumable_stop_tombstones) < limit:
+            break
+        resumable_stop_tombstones.pop(key, None)
+
+
+def _prune_resumable_external_turns_locked(
+    now: float, *, make_room: bool = False
+) -> None:
+    expired = [
+        key
+        for key, record in resumable_external_turns.items()
+        if record.terminal and now - record.updated_at >= EXTERNAL_RESUME_TTL_SECONDS
+    ]
+    for key in expired:
+        resumable_external_turns.pop(key, None)
+
+    if not make_room or len(resumable_external_turns) < EXTERNAL_RESUME_MAX_TURNS:
+        return
+    completed = sorted(
+        (
+            (record.updated_at, key)
+            for key, record in resumable_external_turns.items()
+            if record.terminal
+        ),
+        key=lambda item: item[0],
+    )
+    for _updated_at, key in completed:
+        if len(resumable_external_turns) < EXTERNAL_RESUME_MAX_TURNS:
+            break
+        resumable_external_turns.pop(key, None)
+
+
+async def _cleanup_resumable_external_turns(*, now: float | None = None) -> None:
+    async with resumable_external_turns_lock:
+        current = time.time() if now is None else now
+        _prune_resumable_external_turns_locked(current)
+        _prune_resumable_stop_tombstones_locked(current)
+
+
+async def _cancel_or_tombstone_resumable_turn(
+    user_id: str, client_turn_id: str
+) -> asyncio.Task[Any] | None:
+    key = (user_id, client_turn_id)
+    record: ResumableExternalTurn | None = None
+    async with resumable_external_turns_lock:
+        now = time.time()
+        _prune_resumable_external_turns_locked(now)
+        _prune_resumable_stop_tombstones_locked(now)
+        record = resumable_external_turns.get(key)
+        if record is None:
+            _prune_resumable_stop_tombstones_locked(now, make_room=True)
+            resumable_stop_tombstones[key] = now
+            return None
+        task = record.task
+    await _append_resumable_external_event(
+        record,
+        _ndjson({
+            "type": "error",
+            "message": "已停止生成图片" if record.kind == "image" else "已停止回答",
+        }),
+    )
+    if task is not None and not task.done():
+        task.cancel()
+    return task
+
+
+async def _append_resumable_external_event(
+    record: ResumableExternalTurn, raw_event: bytes
+) -> bool:
+    try:
+        event = json.loads(raw_event.decode("utf-8"))
+        if not isinstance(event, dict):
+            raise TypeError("event is not an object")
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+        event = {"type": "error", "message": "回答流格式无效，请重试"}
+    if event.get("type") == "ping":
+        # Heartbeats are generated per connected reader and do not need replay.
+        return True
+
+    async with record.condition:
+        if record.terminal:
+            return False
+        event["cursor"] = len(record.events) + 1
+        encoded = _ndjson(event)
+        if record.event_bytes + len(encoded) > EXTERNAL_RESUME_MAX_EVENT_BYTES:
+            event = {
+                "type": "error",
+                "message": "回答超过断线恢复缓存上限，已自动停止",
+                "cursor": len(record.events) + 1,
+            }
+            encoded = _ndjson(event)
+        record.events.append(encoded)
+        record.event_bytes += len(encoded)
+        record.updated_at = time.time()
+        record.terminal = event.get("type") in {"done", "error"}
+        record.condition.notify_all()
+        return not record.terminal
+
+
+async def _run_resumable_external_turn(
+    record: ResumableExternalTurn,
+    payload: TurnRequest,
+    workspace: Path,
+    provider: dict[str, Any],
+    model_id: str,
+    provider_id: str,
+) -> None:
+    source: AsyncIterator[bytes] | None = None
+    try:
+        cloud_history = await asyncio.to_thread(
+            _cloud_context_history,
+            record.user_id,
+            payload.client_conversation_id,
+        )
+        context_history = _merged_context_history(cloud_history, payload.history)
+        source = _external_stream(
+            payload,
+            workspace,
+            provider,
+            model_id,
+            record.user_id,
+            provider_id,
+            context_history,
+        )
+        async for raw_event in source:
+            if not await _append_resumable_external_event(record, raw_event):
+                break
+    except asyncio.CancelledError:
+        await _append_resumable_external_event(
+            record,
+            _ndjson({"type": "error", "message": "已停止回答"}),
+        )
+    except Exception:
+        LOG.exception("Resumable external turn failed")
+        await _append_resumable_external_event(
+            record,
+            _ndjson({"type": "error", "message": "外部 API 暂时无法回答"}),
+        )
+    finally:
+        if source is not None:
+            try:
+                await source.aclose()
+            except Exception:
+                LOG.exception("Unable to close resumable external response stream")
+        if not record.terminal:
+            await _append_resumable_external_event(
+                record,
+                _ndjson({"type": "error", "message": "回答连接意外中断，请重试"}),
+            )
+
+
+async def _run_resumable_image_turn(
+    record: ResumableExternalTurn,
+    payload: TurnRequest,
+    workspace: Path,
+) -> None:
+    source: AsyncIterator[bytes] | None = None
+    try:
+        source = _image_stream(payload, workspace, record.user_id)
+        async for raw_event in source:
+            if not await _append_resumable_external_event(record, raw_event):
+                break
+    except asyncio.CancelledError:
+        await _append_resumable_external_event(
+            record,
+            _ndjson({"type": "error", "message": "已停止生成图片"}),
+        )
+    except Exception:
+        LOG.exception("Resumable image turn failed")
+        await _append_resumable_external_event(
+            record,
+            _ndjson({"type": "error", "message": "图片生成服务暂时无法回答"}),
+        )
+    finally:
+        if source is not None:
+            try:
+                await source.aclose()
+            except Exception:
+                LOG.exception("Unable to close resumable image response stream")
+        if not record.terminal:
+            await _append_resumable_external_event(
+                record,
+                _ndjson({"type": "error", "message": "图片生成连接意外中断，请重试"}),
+            )
+
+
+async def _start_or_reuse_resumable_external_turn(
+    payload: TurnRequest,
+    workspace: Path,
+    provider: dict[str, Any],
+    model_id: str,
+    user_id: str,
+    provider_id: str,
+) -> ResumableExternalTurn:
+    client_turn_id = str(payload.client_turn_id or "")
+    if not CLIENT_TURN_ID_RE.fullmatch(client_turn_id):
+        raise HTTPException(400, "客户端消息标识无效")
+    fingerprint = _external_turn_fingerprint(payload, provider_id, model_id)
+    key = (user_id, client_turn_id)
+    async with resumable_external_turns_lock:
+        now = time.time()
+        _prune_resumable_external_turns_locked(now)
+        existing = resumable_external_turns.get(key)
+        if existing is not None:
+            if not hmac.compare_digest(existing.fingerprint, fingerprint):
+                raise HTTPException(409, "客户端消息标识已用于另一条消息")
+            return existing
+        _prune_resumable_stop_tombstones_locked(now)
+        if key in resumable_stop_tombstones:
+            raise HTTPException(409, "该回答已经停止")
+        _prune_resumable_external_turns_locked(now, make_room=True)
+        if len(resumable_external_turns) >= EXTERNAL_RESUME_MAX_TURNS:
+            raise HTTPException(503, "正在恢复的回答过多，请稍后重试")
+        _reserve_message_slot(user_id)
+        record = ResumableExternalTurn(
+            user_id=user_id,
+            client_turn_id=client_turn_id,
+            fingerprint=fingerprint,
+        )
+        resumable_external_turns[key] = record
+        record.task = asyncio.create_task(
+            _run_resumable_external_turn(
+                record,
+                payload,
+                workspace,
+                provider,
+                model_id,
+                provider_id,
+            ),
+            name=f"external-turn-{client_turn_id[:8]}",
+        )
+        return record
+
+
+async def _start_or_reuse_resumable_image_turn(
+    payload: TurnRequest,
+    workspace: Path,
+    user_id: str,
+) -> ResumableExternalTurn:
+    client_turn_id = str(payload.client_turn_id or "")
+    if not CLIENT_TURN_ID_RE.fullmatch(client_turn_id):
+        raise HTTPException(400, "客户端消息标识无效")
+    fingerprint = _image_turn_fingerprint(payload)
+    key = (user_id, client_turn_id)
+    async with resumable_external_turns_lock:
+        now = time.time()
+        _prune_resumable_external_turns_locked(now)
+        existing = resumable_external_turns.get(key)
+        if existing is not None:
+            if not hmac.compare_digest(existing.fingerprint, fingerprint):
+                raise HTTPException(409, "客户端消息标识已用于另一条消息")
+            return existing
+        _prune_resumable_stop_tombstones_locked(now)
+        if key in resumable_stop_tombstones:
+            raise HTTPException(409, "该回答已经停止")
+        _prune_resumable_external_turns_locked(now, make_room=True)
+        if len(resumable_external_turns) >= EXTERNAL_RESUME_MAX_TURNS:
+            raise HTTPException(503, "正在恢复的回答过多，请稍后重试")
+        if not payload.attachments and not payload.project_attachments:
+            _reserve_message_slot(user_id)
+        record = ResumableExternalTurn(
+            user_id=user_id,
+            client_turn_id=client_turn_id,
+            fingerprint=fingerprint,
+            kind="image",
+        )
+        resumable_external_turns[key] = record
+        record.task = asyncio.create_task(
+            _run_resumable_image_turn(record, payload, workspace),
+            name=f"image-turn-{client_turn_id[:8]}",
+        )
+        return record
+
+
+async def _resumable_external_event_stream(
+    record: ResumableExternalTurn, cursor: int
+) -> AsyncIterator[bytes]:
+    """Replay after ``cursor`` consumed events; emitted cursors are 1-based counts."""
+    next_index = cursor
+    while True:
+        heartbeat = False
+        async with record.condition:
+            if next_index >= len(record.events) and not record.terminal:
+                try:
+                    await asyncio.wait_for(
+                        record.condition.wait(), timeout=LONG_TASK_HEARTBEAT_SECONDS
+                    )
+                except asyncio.TimeoutError:
+                    heartbeat = True
+            batch = list(record.events[next_index:])
+            terminal = record.terminal
+        if heartbeat and not batch:
+            yield _ndjson({"type": "ping", "cursor": next_index})
+            continue
+        for event in batch:
+            next_index += 1
+            yield event
+        if terminal and next_index >= len(record.events):
+            return
+
+
+async def _owned_resumable_external_turn(
+    user_id: str, client_turn_id: str, cursor: int
+) -> ResumableExternalTurn:
+    if not CLIENT_TURN_ID_RE.fullmatch(client_turn_id):
+        raise HTTPException(404, "可恢复的回答不存在或已经过期")
+    if cursor < 0:
+        raise HTTPException(400, "恢复游标不能小于 0")
+    await _cleanup_resumable_external_turns()
+    async with resumable_external_turns_lock:
+        record = resumable_external_turns.get((user_id, client_turn_id))
+    if record is None:
+        raise HTTPException(404, "可恢复的回答不存在或已经过期")
+    async with record.condition:
+        if cursor > len(record.events):
+            raise HTTPException(409, "恢复游标超过当前回答进度")
+    return record
 
 
 @app.post("/api/turn")
@@ -5094,10 +5491,29 @@ async def turn(request: Request, payload: TurnRequest):
     workspace = _session_path(user["id"], payload.session_id)
     _validate_user_content_size(payload, workspace)
     external = _decode_external_model(payload.model)
-    if external is None and _is_image_generation_request(payload.message):
+    if (
+        external is None
+        and not payload.attachments
+        and not payload.project_attachments
+        and _is_image_generation_request(payload.message)
+    ):
         await _clear_external_conversation_state(user["id"], payload.client_conversation_id)
-        if not payload.attachments and not payload.project_attachments:
-            _reserve_message_slot(user["id"])
+        if payload.client_turn_id:
+            record = await _start_or_reuse_resumable_image_turn(
+                payload,
+                workspace,
+                user["id"],
+            )
+            return StreamingResponse(
+                _resumable_external_event_stream(record, 0),
+                media_type="application/x-ndjson",
+                headers={
+                    "Cache-Control": "no-store",
+                    "X-Accel-Buffering": "no",
+                    "X-Client-Turn-ID": record.client_turn_id,
+                },
+            )
+        _reserve_message_slot(user["id"])
         return StreamingResponse(
             _image_stream(payload, workspace, user["id"]),
             media_type="application/x-ndjson",
@@ -5116,6 +5532,24 @@ async def turn(request: Request, payload: TurnRequest):
         ):
             _require_external_transfer_base_url()
 
+        if payload.client_turn_id:
+            record = await _start_or_reuse_resumable_external_turn(
+                payload,
+                workspace,
+                provider,
+                model_id,
+                user["id"],
+                provider_id,
+            )
+            return StreamingResponse(
+                _resumable_external_event_stream(record, 0),
+                media_type="application/x-ndjson",
+                headers={
+                    "Cache-Control": "no-store",
+                    "X-Accel-Buffering": "no",
+                    "X-Client-Turn-ID": record.client_turn_id,
+                },
+            )
         cloud_history = await asyncio.to_thread(
             _cloud_context_history,
             user["id"],
@@ -5219,6 +5653,26 @@ async def turn(request: Request, payload: TurnRequest):
     )
 
 
+@app.get("/api/turn/resume/{client_turn_id}")
+async def resume_external_turn(
+    request: Request, client_turn_id: str, cursor: int = 0
+):
+    """Resume after ``cursor`` durable events already consumed by this user."""
+    user = _require_auth(request)
+    record = await _owned_resumable_external_turn(
+        user["id"], client_turn_id, cursor
+    )
+    return StreamingResponse(
+        _resumable_external_event_stream(record, cursor),
+        media_type="application/x-ndjson",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Accel-Buffering": "no",
+            "X-Client-Turn-ID": record.client_turn_id,
+        },
+    )
+
+
 @app.post("/api/turn/{thread_id}/{turn_id}/interrupt")
 async def interrupt(request: Request, thread_id: str, turn_id: str):
     user = _require_auth(request)
@@ -5228,9 +5682,15 @@ async def interrupt(request: Request, thread_id: str, turn_id: str):
             raise HTTPException(403, "无权停止此生成任务")
         if owned_task and not owned_task[1].done():
             owned_task[1].cancel()
+        elif CLIENT_TURN_ID_RE.fullmatch(turn_id):
+            await _cancel_or_tombstone_resumable_turn(user["id"], turn_id)
         return {"ok": True}
     if thread_id == "external":
         owned_task = external_turns.get(turn_id)
+        if owned_task is None and CLIENT_TURN_ID_RE.fullmatch(turn_id):
+            task = await _cancel_or_tombstone_resumable_turn(user["id"], turn_id)
+            if task is not None:
+                owned_task = (user["id"], task)
         if owned_task and owned_task[0] != user["id"]:
             raise HTTPException(403, "无权停止此回答任务")
         if owned_task and not owned_task[1].done():

@@ -5,11 +5,28 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from aiohttp import client_exceptions
+
+_DOWNSTREAM_DISCONNECT_CASES = [
+    pytest.param(ConnectionResetError("connection reset"), id="connection-reset"),
+    pytest.param(BrokenPipeError("broken pipe"), id="broken-pipe"),
+]
+_aiohttp_client_reset = getattr(
+    client_exceptions, "ClientConnectionResetError", None
+)
+if _aiohttp_client_reset is not None:
+    _DOWNSTREAM_DISCONNECT_CASES.append(
+        pytest.param(
+            _aiohttp_client_reset("closing transport"),
+            id="aiohttp-client-connection-reset",
+        )
+    )
 
 
 def _load_gateway_module():
@@ -129,8 +146,14 @@ async def test_asset_proxy_returns_502_when_a_candidate_worker_is_unavailable():
 
 
 class _FailingContent:
-    def __init__(self):
+    def __init__(
+        self,
+        error: Exception | None = None,
+        first_chunk: bytes = b'data: {"choices": []}\n\n',
+    ):
         self.calls = 0
+        self.error = error or RuntimeError("upstream disconnected")
+        self.first_chunk = first_chunk
 
     def iter_chunked(self, _size):
         return self
@@ -141,8 +164,8 @@ class _FailingContent:
     async def __anext__(self):
         self.calls += 1
         if self.calls == 1:
-            return b'data: {"choices": []}\n\n'
-        raise RuntimeError("upstream disconnected")
+            return self.first_chunk
+        raise self.error
 
 
 class _Content:
@@ -169,15 +192,46 @@ class _Downstream:
         self.headers = dict(headers)
         self.prepared = False
         self.writes: list[bytes] = []
+        self.write_attempts = 0
         self.eof = False
+        self.eof_attempts = 0
+        self.force_closed = False
 
     async def prepare(self, _request):
         self.prepared = True
 
     async def write(self, chunk):
+        self.write_attempts += 1
         self.writes.append(chunk)
 
     async def write_eof(self):
+        self.eof_attempts += 1
+        self.eof = True
+
+    def force_close(self):
+        self.force_closed = True
+
+
+class _DisconnectingDownstream(_Downstream):
+    disconnect_error: Exception = ConnectionResetError("client disconnected")
+    disconnect_stage = "write"
+
+    async def prepare(self, request):
+        self.prepared = True
+        if self.disconnect_stage == "prepare":
+            raise self.disconnect_error
+        return await super().prepare(request)
+
+    async def write(self, chunk):
+        self.write_attempts += 1
+        if self.disconnect_stage == "write":
+            raise self.disconnect_error
+        self.writes.append(chunk)
+
+    async def write_eof(self):
+        self.eof_attempts += 1
+        if self.disconnect_stage == "write_eof":
+            raise self.disconnect_error
         self.eof = True
 
 
@@ -204,6 +258,151 @@ async def test_started_sse_stream_finishes_with_error_instead_of_second_response
     assert combined.endswith(b"data: [DONE]\n\n")
     assert downstream.eof is True
     assert gateway.available.qsize() == 2
+
+
+@pytest.mark.asyncio
+async def test_upstream_connection_reset_before_response_returns_502():
+    gateway = gateway_module.DualTabGateway(["http://one", "http://two"])
+    gateway.session = _Session(
+        contexts=[_Context(error=ConnectionResetError("upstream reset"))],
+        health_contexts=[_Context(response=_health_response())],
+    )
+
+    response = await gateway.proxy(_request("/v1/chat/completions"))
+
+    assert response.status == 502
+    assert b"upstream_error" in response.body
+    assert b"upstream reset" in response.body
+    assert gateway.available.qsize() == 2
+
+
+@pytest.mark.asyncio
+async def test_upstream_connection_reset_mid_sse_emits_error_and_done(monkeypatch):
+    gateway = gateway_module.DualTabGateway(["http://one", "http://two"])
+    upstream = SimpleNamespace(
+        status=200,
+        reason="OK",
+        headers={"Content-Type": "text/event-stream"},
+        content=_FailingContent(ConnectionResetError("upstream reset")),
+    )
+    gateway.session = _Session(
+        contexts=[_Context(response=upstream)],
+        health_contexts=[_Context(response=_health_response())],
+    )
+    monkeypatch.setattr(gateway_module.web, "StreamResponse", _Downstream)
+
+    downstream = await gateway.proxy(_request("/v1/chat/completions"))
+
+    combined = b"".join(downstream.writes)
+    assert b"upstream stream interrupted" in combined
+    assert combined.endswith(b"data: [DONE]\n\n")
+    assert downstream.eof is True
+    assert downstream.force_closed is False
+    assert gateway.available.qsize() == 2
+
+
+@pytest.mark.asyncio
+async def test_upstream_connection_reset_mid_non_sse_forces_close(monkeypatch):
+    gateway = gateway_module.DualTabGateway(["http://one", "http://two"])
+    upstream = SimpleNamespace(
+        status=200,
+        reason="OK",
+        headers={"Content-Type": "application/json"},
+        content=_FailingContent(
+            ConnectionResetError("upstream reset"),
+            first_chunk=b'{"partial":',
+        ),
+    )
+    gateway.session = _Session(
+        contexts=[_Context(response=upstream)],
+        health_contexts=[_Context(response=_health_response())],
+    )
+    monkeypatch.setattr(gateway_module.web, "StreamResponse", _Downstream)
+
+    downstream = await gateway.proxy(_request("/v1/chat/completions"))
+
+    assert downstream.writes == [b'{"partial":']
+    assert downstream.force_closed is True
+    assert downstream.eof_attempts == 0
+    assert gateway.available.qsize() == 2
+
+
+@pytest.mark.parametrize("disconnect_error", _DOWNSTREAM_DISCONNECT_CASES)
+@pytest.mark.asyncio
+async def test_downstream_disconnect_is_client_cancel_and_releases_worker(
+    monkeypatch, caplog, disconnect_error,
+):
+    gateway = gateway_module.DualTabGateway(["http://one", "http://two"])
+    upstream = SimpleNamespace(
+        status=200,
+        reason="OK",
+        headers={"Content-Type": "text/event-stream"},
+        content=_Content([b'data: {"choices": []}\n\n']),
+    )
+    gateway.session = _Session(
+        contexts=[_Context(response=upstream)],
+        health_contexts=[_Context(response=_health_response())],
+    )
+    monkeypatch.setattr(
+        _DisconnectingDownstream, "disconnect_error", disconnect_error
+    )
+    monkeypatch.setattr(_DisconnectingDownstream, "disconnect_stage", "write")
+    monkeypatch.setattr(
+        gateway_module.web, "StreamResponse", _DisconnectingDownstream
+    )
+
+    with caplog.at_level(logging.INFO):
+        downstream = await gateway.proxy(_request("/v1/chat/completions"))
+
+    assert isinstance(downstream, _DisconnectingDownstream)
+    assert downstream.write_attempts == 1
+    assert downstream.eof_attempts == 0
+    assert gateway.available.qsize() == 2
+    assert gateway.queued_requests == 0
+    assert gateway._not_ready_until == [0.0, 0.0]
+    assert not any(
+        "backend 1 failed" in record.getMessage() for record in caplog.records
+    )
+
+
+@pytest.mark.parametrize("disconnect_stage", ["prepare", "write_eof"])
+@pytest.mark.asyncio
+async def test_other_downstream_disconnect_boundaries_release_worker(
+    monkeypatch, caplog, disconnect_stage,
+):
+    gateway = gateway_module.DualTabGateway(["http://one", "http://two"])
+    upstream = SimpleNamespace(
+        status=200,
+        reason="OK",
+        headers={"Content-Type": "text/event-stream"},
+        content=_Content([b'data: {"choices": []}\n\n']),
+    )
+    gateway.session = _Session(
+        contexts=[_Context(response=upstream)],
+        health_contexts=[_Context(response=_health_response())],
+    )
+    monkeypatch.setattr(
+        _DisconnectingDownstream,
+        "disconnect_error",
+        ConnectionResetError("client disconnected"),
+    )
+    monkeypatch.setattr(
+        _DisconnectingDownstream, "disconnect_stage", disconnect_stage
+    )
+    monkeypatch.setattr(
+        gateway_module.web, "StreamResponse", _DisconnectingDownstream
+    )
+
+    with caplog.at_level(logging.INFO):
+        downstream = await gateway.proxy(_request("/v1/chat/completions"))
+
+    assert isinstance(downstream, _DisconnectingDownstream)
+    assert downstream.force_closed is False
+    assert gateway.available.qsize() == 2
+    assert gateway.queued_requests == 0
+    assert not any(
+        "backend 1 failed" in record.getMessage() for record in caplog.records
+    )
 
 
 @pytest.mark.asyncio
@@ -242,6 +441,20 @@ async def test_health_probe_has_bounded_read_timeout():
     assert response.status == 200
     assert payload["ready_backends"] == 1
     assert payload["backends"][0]["error"] == "TimeoutError"
+
+
+@pytest.mark.asyncio
+async def test_health_probe_connection_reset_marks_backend_unhealthy():
+    gateway = gateway_module.DualTabGateway(["http://one", "http://two"])
+    gateway.session = _Session(
+        health_contexts=[_Context(error=ConnectionResetError("worker reset"))]
+    )
+
+    result = await gateway.probe_backend(0)
+
+    assert result["ready"] is False
+    assert result["reachable"] is False
+    assert result["error"] == "ConnectionResetError"
 
 
 @pytest.mark.asyncio
