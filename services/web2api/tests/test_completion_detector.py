@@ -99,18 +99,23 @@ def test_driver_wires_completion():
     assert d._completion._driver is d, "detector's _driver must be the owner"
 
 
-# ── 3. Per-call results, no long-lived config across calls ────────────
+# ── 3. Per-call results plus minimal worker-local resilience state ───
 
 
-def test_detector_has_only_driver_and_transient_results():
-    """The detector holds _driver plus two transient per-call result attrs
-    (last_dom_text / had_non_text_content). No long-lived config migrates in."""
+def test_detector_has_only_expected_transient_and_resilience_state():
+    """Only the two backend 429 fields may persist across detector calls.
+
+    All result fields remain transient per-call state, and the exact-set
+    assertion continues to reject any other long-lived state.
+    """
     detector, _ = _make_detector()
     own = vars(detector)
     assert set(own) == {
         "_driver", "last_dom_text", "had_non_text_content",
         "completed_via_exact_action", "completed_via_stable_dom",
         "non_text_dom_assets",
+        "_backend_rate_limit_backoff_seconds",
+        "_backend_retry_not_before",
     }, (
         f"unexpected instance state on CompletionDetector: {set(own)}"
     )

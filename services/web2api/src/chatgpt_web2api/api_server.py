@@ -902,7 +902,11 @@ class APIServer:
             )
 
         model_slug = MODEL_MAP.get(model, model)
-        expect_non_text = wants_image_output(body, latest_user_text)
+        expect_non_text = wants_image_output(
+            body,
+            latest_user_text,
+            has_image_inputs=bool(image_references),
+        )
         # ChatGPT image tools can take many minutes before publishing their
         # first assistant asset, so all image-specific detector budgets share
         # the full 15-minute request window.

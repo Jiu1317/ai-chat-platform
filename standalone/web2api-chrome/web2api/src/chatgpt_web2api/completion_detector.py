@@ -17,9 +17,9 @@ The driver-reference collaborator seam: ``CompletionDetector`` holds a
 reference to its owning ``CDPDriver`` and reaches through it for the CDP
 transport (``_js_strict``), the backend completion signals
 (``_fetch_end_turn_for_turn`` / ``_get_live_conversation_id_best_effort``),
-and the in-flight conversation id (``_current_conv_id``, read-only). No state
-migrates into this module — it stays on the driver, and the detector is
-stateless beyond ``_driver``.
+and the in-flight conversation id (``_current_conv_id``, read-only). The
+detector owns only worker-local backend HTTP 429 cooldown state; all
+turn-specific observation state remains per-call.
 
 Boundary: this module is the generation-completion detection layer.
 ``send_and_stream`` orchestration (pre-count, type/send, the post-loop
@@ -36,8 +36,9 @@ baseline used to emit the ``_fetch_text_for_turn`` suffix delta) and
 re-derived without re-running the poll, so after the generator exhausts the
 driver reads ``self._completion.last_dom_text`` /
 ``self._completion.had_non_text_content``. These are transient per-call results
-(reset at the start of each call), not long-lived configuration; the detector
-holds no state across calls beyond ``_driver``.
+(reset at the start of each call), not long-lived configuration. Only the
+backend HTTP 429 cooldown intentionally survives into the next worker-local
+call.
 
 Call-rule inside CompletionDetector method bodies — every internal call routes
 through ``self._driver`` (NOT ``self``) to preserve monkeypatch interception on
@@ -111,6 +112,24 @@ DOM_TERMINAL_STABILITY_SECONDS = 2.0
 # spanning at least six seconds.
 STRICT_TERMINAL_CONFIRMATIONS = 3
 STRICT_TERMINAL_STABILITY_SECONDS = 6.0
+
+# Conversation projections share an account-level rate budget. A fixed
+# three-second retry loop turns a single HTTP 429 into sustained throttling,
+# so consecutive 429s use a bounded exponential cooldown. While cooling
+# down, phase 2 preserves the same safety semantics as the failed request:
+# only an exact current-turn action may complete through the DOM fallback.
+BACKEND_RATE_LIMIT_BACKOFF_INITIAL_SECONDS = 15.0
+BACKEND_RATE_LIMIT_BACKOFF_MAX_SECONDS = 120.0
+
+
+def _next_backend_rate_limit_backoff_seconds(previous: float) -> float:
+    """Return the next bounded delay for consecutive backend HTTP 429s."""
+    if previous <= 0:
+        return BACKEND_RATE_LIMIT_BACKOFF_INITIAL_SECONDS
+    return min(
+        max(BACKEND_RATE_LIMIT_BACKOFF_INITIAL_SECONDS, previous * 2.0),
+        BACKEND_RATE_LIMIT_BACKOFF_MAX_SECONDS,
+    )
 
 
 def append_only_delta(emitted: str, observed: str) -> str:
@@ -330,11 +349,11 @@ class CompletionDetector:
     so the public ``send_and_stream`` yield sequence is byte-equivalent to
     pre-extraction.
 
-    Stateless beyond ``_driver`` across calls — every loop variable is a method
-    local. Per-call results (``last_dom_text`` / ``had_non_text_content`` /
+    Per-call results (``last_dom_text`` / ``had_non_text_content`` /
     ``non_text_dom_assets``) are exposed as instance attributes for the
     driver's post-loop tail to read; they are reset at the start of each call
-    and carry no state between calls.
+    and carry no state between calls. Backend HTTP 429 cooldown/backoff is the
+    sole worker-local state intentionally retained across calls.
     """
 
     def __init__(self, driver) -> None:
@@ -345,6 +364,39 @@ class CompletionDetector:
         self.completed_via_exact_action: bool = False
         self.completed_via_stable_dom: bool = False
         self.non_text_dom_assets: list[dict] = []
+        # The detector is constructed once per worker. Preserve an active
+        # backend cooldown across turns so the next request does not
+        # immediately repeat an account-level 429.
+        self._backend_rate_limit_backoff_seconds: float = 0.0
+        self._backend_retry_not_before: float = 0.0
+
+    @staticmethod
+    def _backend_error_is_rate_limited(error: object) -> bool:
+        """Return whether a backend projection failure represents HTTP 429."""
+        lowered = str(error or "").lower()
+        return "http 429" in lowered or "status 429" in lowered
+
+    def _record_backend_probe_outcome(self, *, rate_limited: bool) -> None:
+        """Advance or clear the worker-local projection cooldown."""
+        if rate_limited:
+            self._backend_rate_limit_backoff_seconds = (
+                _next_backend_rate_limit_backoff_seconds(
+                    self._backend_rate_limit_backoff_seconds
+                )
+            )
+            self._backend_retry_not_before = (
+                time.monotonic() + self._backend_rate_limit_backoff_seconds
+            )
+            logger.warning(
+                "end_turn backend rate limited; retrying in %.0fs",
+                self._backend_rate_limit_backoff_seconds,
+            )
+            return
+
+        # A successful or otherwise valid non-429 response breaks the
+        # consecutive-rate-limit sequence.
+        self._backend_rate_limit_backoff_seconds = 0.0
+        self._backend_retry_not_before = 0.0
 
     async def _probe_non_text_dom_state(self, d) -> dict:
         """Read global image completion evidence for either detector phase.
@@ -649,7 +701,14 @@ class CompletionDetector:
             # backend turn and finish as soon as end_turn is authoritative.
             # This is read-only and cannot duplicate the submitted message.
             now = time.monotonic()
-            if expect_non_text and now - phase_1_backend_check >= 3.0:
+            phase_1_backend_in_rate_limit_backoff = (
+                now < self._backend_retry_not_before
+            )
+            if (
+                expect_non_text
+                and not phase_1_backend_in_rate_limit_backoff
+                and now - phase_1_backend_check >= 3.0
+            ):
                 phase_1_backend_check = now
                 try:
                     if not phase_1_conv_id:
@@ -660,7 +719,18 @@ class CompletionDetector:
                             turn_anchor,
                             had_non_text_content=True,
                         )
-                        if collapse_to_end_turn_status(end_result) == "complete":
+                        status = collapse_to_end_turn_status(end_result)
+                        diagnostic = end_result.diagnostic or {}
+                        response_rate_limited = bool(
+                            status == "fetch_failed"
+                            and self._backend_error_is_rate_limited(
+                                diagnostic.get("error")
+                            )
+                        )
+                        self._record_backend_probe_outcome(
+                            rate_limited=response_rate_limited
+                        )
+                        if status == "complete":
                             self.had_non_text_content = True
                             logger.info(
                                 "Backend non-text turn completed before assistant DOM appeared: %s",
@@ -670,6 +740,9 @@ class CompletionDetector:
                 except AuthExpiredError:
                     raise
                 except Exception as e:
+                    self._record_backend_probe_outcome(
+                        rate_limited=self._backend_error_is_rate_limited(e)
+                    )
                     logger.debug("Phase-1 backend completion probe failed: %s", e)
 
             if now - last_progress > phase_1_stall_budget:
@@ -1106,8 +1179,22 @@ class CompletionDetector:
             # backend_fetch_failed so the DOM fallback below is unlocked this poll.
             backend_fetch_failed = False
             backend_rate_limited = False
+            backend_now = time.monotonic()
+            backend_in_rate_limit_backoff = (
+                backend_now < self._backend_retry_not_before
+            )
+            if backend_in_rate_limit_backoff:
+                # Preserve the failed-429 safety gate on every skipped poll.
+                # Broad action selectors can match an older turn, while the
+                # exact current-turn selector remains safe to accept below.
+                backend_fetch_failed = True
+                backend_rate_limited = True
+                strict_terminal_signature = None
+                strict_terminal_confirmations = 0
+                strict_terminal_first_seen = None
             if (
                 conv_id_for_check
+                and not backend_in_rate_limit_backoff
                 and (
                     last_dom_text
                     or saw_thinking
@@ -1119,9 +1206,9 @@ class CompletionDetector:
                         and not expect_non_text
                     )
                 )
-                and time.monotonic() - last_backend_check > 3.0
+                and backend_now - last_backend_check > 3.0
             ):
-                last_backend_check = time.monotonic()
+                last_backend_check = backend_now
                 try:
                     # A2: anchored tri-state completion. The selector returns
                     # a rich TurnEndResult; collapse_to_end_turn_status maps
@@ -1136,6 +1223,14 @@ class CompletionDetector:
                     )
                     status = collapse_to_end_turn_status(end_result)
                     diagnostic = end_result.diagnostic or {}
+                    backend_error = str(diagnostic.get("error") or "").lower()
+                    response_rate_limited = bool(
+                        status == "fetch_failed"
+                        and self._backend_error_is_rate_limited(backend_error)
+                    )
+                    self._record_backend_probe_outcome(
+                        rate_limited=response_rate_limited
+                    )
                     assistant_node = str(diagnostic.get("assistant_node") or "")
                     current_node = str(diagnostic.get("current_node") or "")
                     node_status = str(diagnostic.get("status") or "")
@@ -1236,14 +1331,11 @@ class CompletionDetector:
                             conv_id_for_check,
                         )
                     if status == "fetch_failed":
+                        strict_terminal_signature = None
+                        strict_terminal_confirmations = 0
+                        strict_terminal_first_seen = None
                         backend_fetch_failed = True
-                        backend_error = str(
-                            (end_result.diagnostic or {}).get("error") or ""
-                        ).lower()
-                        backend_rate_limited = (
-                            "http 429" in backend_error
-                            or "status 429" in backend_error
-                        )
+                        backend_rate_limited = response_rate_limited
                         logger.debug(
                             "end_turn fetch failed (status=%s): %s",
                             end_result.status, end_result.diagnostic,
@@ -1262,9 +1354,11 @@ class CompletionDetector:
                     strict_terminal_first_seen = None
                     backend_fetch_failed = True
                     backend_error = str(e).lower()
-                    backend_rate_limited = (
-                        "http 429" in backend_error
-                        or "status 429" in backend_error
+                    backend_rate_limited = self._backend_error_is_rate_limited(
+                        backend_error
+                    )
+                    self._record_backend_probe_outcome(
+                        rate_limited=backend_rate_limited
                     )
                     logger.debug("end_turn fetch raised (ignored): %s", e)
 
@@ -1429,10 +1523,22 @@ class CompletionDetector:
                     # detector would have given up. Before raising, check the
                     # backend one more time.
                     turn_id = getattr(turn_anchor, "captured_id", None)
-                    reconciled = await self._reconcile_before_stall(
-                        d, conv_id_for_check, turn_anchor,
-                        had_non_text_content,
-                    )
+                    if time.monotonic() < self._backend_retry_not_before:
+                        # The normal projection probe already established an
+                        # account-level 429. Do not defeat its cooldown with a
+                        # back-to-back "final" fetch; the safe DOM/asset
+                        # reconciliation below remains available.
+                        logger.info(
+                            "Skipping final backend reconciliation during "
+                            "rate-limit cooldown (remaining=%.1fs)",
+                            self._backend_retry_not_before - time.monotonic(),
+                        )
+                        reconciled = False
+                    else:
+                        reconciled = await self._reconcile_before_stall(
+                            d, conv_id_for_check, turn_anchor,
+                            had_non_text_content,
+                        )
                     if reconciled:
                         logger.info(
                             "Phase-2 %s reconciled after stall — generation "

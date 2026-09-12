@@ -72,8 +72,141 @@ def test_wants_image_output(payload, text):
     assert wants_image_output(payload, text) is True
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"modalities": ["text", "image"]},
+        {"response_format": {"type": "image_url"}},
+        {"model": "gpt-image-1"},
+    ],
+)
+def test_explicit_image_output_overrides_prompt_negation(payload):
+    assert wants_image_output(payload, "不要生成图片，只描述") is True
+
+
 def test_image_analysis_is_not_image_generation():
     assert wants_image_output({}, "分析这张图片里有什么") is False
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "可以合并这两张图片吗",
+        "把这两张图拼接在一起",
+        "融合并叠加这几张照片",
+        "编辑这张图片并去除背景",
+        "修改这张图，给它换背景",
+        "Merge and stitch these images together",
+        "Create a composite from these photos",
+        "Edit this picture and remove the background",
+        "把它们合并到一起",
+        "合并它们",
+        "把这俩拼起来",
+        "把两张拼起来",
+        "combine both into one",
+        "merge them",
+        "先比较再合并成一张新图",
+        "Remove the watermark from this image",
+        "去掉这张图上的水印",
+        "给人物加一顶帽子",
+        "Remove the watermark",
+        "把水印去掉",
+        "Crop it to a square",
+        "把它裁成正方形",
+        "先分析，再编辑这张图片",
+        "First analyze, then edit this image",
+        "不要裁剪，直接合并这两张图",
+        "Do not crop them; merge them instead",
+        "不要裁剪而是合并这两张图",
+        "Do not crop them but merge them instead",
+        "不要裁剪。直接合并这两张图",
+        "Do not crop them. Merge them instead.",
+        "不要裁剪！\n直接合并这两张图",
+        "Could you crop this to a square?",
+        "Make it square",
+        "Analyze this image and edit it",
+    ],
+)
+def test_image_edit_intent_requires_and_accepts_image_inputs(text):
+    assert wants_image_output({}, text, has_image_inputs=True) is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Compare these images and merge them",
+        "Describe this image and edit it",
+        "将第一张和第二张合并",
+        "把两张图片放到一起",
+        "这两张照片合到一起",
+    ],
+)
+def test_additional_image_edit_phrasings_are_attachment_gated(text):
+    assert wants_image_output({}, text, has_image_inputs=True) is True
+    assert wants_image_output({}, text, has_image_inputs=False) is False
+
+
+@pytest.mark.parametrize("has_image_inputs", [False, True])
+def test_plain_chinese_image_generation_negation_stays_text_only(has_image_inputs):
+    assert wants_image_output(
+        {}, "不生成图片，只描述", has_image_inputs=has_image_inputs
+    ) is False
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "分析这两张图片里有什么",
+        "比较这两张图片的差异",
+        "看图后修改这段文案",
+        "解释一下这两张图片是如何合成的",
+        "请比较合并前后的两张图片有什么差异",
+        "不要编辑这张图片，只需描述",
+        "不要生成图片，只描述",
+        "请从这张图提取文字并合并成一段摘要",
+        "Compare these two images and describe the differences",
+        "Review the image, then edit this caption",
+        "Explain how to edit these images",
+        "Was this image edited?",
+        "Do not edit this image; just describe it",
+        "Don't generate an image, just describe",
+        "Merge the text from these images into one summary",
+        "提取这两张图片里的文字并合并成一段",
+        "把两张图片里的文字合并到一个文档",
+        "Extract the text from these images and merge it into one paragraph",
+        "先识别图片文字，再合并成摘要",
+        "这张图片是AI生成的吗",
+        "Did AI generate this image?",
+        "告诉我如何生成图片",
+        "不需要生成图片，只描述",
+        "如何生成图片？",
+        "How do I generate an image?",
+        "Did you generate this image?",
+        "不必生成图片，只描述",
+    ],
+)
+def test_image_analysis_and_comparison_with_inputs_remain_text_only(text):
+    assert wants_image_output({}, text, has_image_inputs=True) is False
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "请写一份合并图片的教程",
+        "如何用 Photoshop 去背景",
+        "Explain how to edit and combine images",
+        "不要生成图片，只描述",
+        "Don't generate an image, just describe",
+        "告诉我如何生成图片",
+        "不需要生成图片，只描述",
+        "如何生成图片？",
+        "How do I generate an image?",
+        "Did you generate this image?",
+        "不必生成图片，只描述",
+    ],
+)
+def test_image_prompt_without_inputs_remains_text_only(text):
+    assert wants_image_output({}, text, has_image_inputs=False) is False
 
 
 def test_parse_responses_input_image_shape():

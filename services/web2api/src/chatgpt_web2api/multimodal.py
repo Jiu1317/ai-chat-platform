@@ -48,6 +48,282 @@ _IMAGE_OUTPUT_PATTERNS = (
         re.IGNORECASE,
     ),
 )
+_ZH_IMAGE_NOUN = (
+    r"(?:图片|图像|照片|相片|参考图|原图|底图|素材图|附件图|新图|成图|"
+    r"(?:这|那)(?:一|两|三|四|五|六|七|八|九|十|几|\d+)?张图|"
+    r"(?:这些|那些)图|第(?:一|二|三|四|五|六|七|八|九|十|\d+)张图|"
+    r"(?:一|两|三|四|五|六|七|八|九|十|几|\d+)张图)"
+)
+_ZH_COMPOSITE_VERB = r"(?:合并|拼(?:接)?|融合|组合|叠加|合成)"
+_ZH_EDIT_VERB = r"(?:编辑|修改|裁(?:剪|成)|旋转|缩放|调色|美化|修图)"
+_ZH_CREATE_VERB = r"(?:生成|画|绘制|创作|制作|做)"
+_EN_IMAGE_NOUN = r"(?:images?|pictures?|photos?|photographs?|reference\s+images?|artworks?)"
+_EN_COMPOSITE_VERB = (
+    r"(?:merg(?:e|ed|es|ing)|combin(?:e|ed|es|ing)|"
+    r"stitch(?:ed|es|ing)?|composit(?:e|ed|es|ing)|"
+    r"overlay(?:s|ed|ing)?|overlaid|blend(?:ed|s|ing)?|fus(?:e|ed|es|ing))"
+)
+_EN_EDIT_VERB = (
+    r"(?:edit(?:ed|s|ing)?|modif(?:y|ied|ies|ying)|"
+    r"crop(?:ped|s|ping)?|rotat(?:e|ed|es|ing)|resiz(?:e|ed|es|ing)|retouch(?:ed|es|ing)?)"
+)
+_EN_CREATE_VERB = (
+    r"(?:generat(?:e|ed|es|ing)|creat(?:e|ed|es|ing)|"
+    r"draw(?:n|s|ing)?|mak(?:e|es|ing)|render(?:ed|s|ing)?)"
+)
+_IMAGE_ACTION_CLAUSE_SPLIT_RE = re.compile(
+    r"[。！？.!?，,；;\r\n]+|而是|但是|\bbut\b",
+    re.IGNORECASE,
+)
+_IMAGE_EDIT_PATTERNS = (
+    re.compile(
+        rf"(?:{_ZH_COMPOSITE_VERB}|{_ZH_EDIT_VERB})"
+        rf"[^。！？\n]{{0,32}}{_ZH_IMAGE_NOUN}"
+    ),
+    re.compile(
+        rf"{_ZH_IMAGE_NOUN}[^。！？\n]{{0,16}}{_ZH_COMPOSITE_VERB}"
+    ),
+    re.compile(
+        rf"(?:把|将)[^。！？\n]{{0,16}}{_ZH_IMAGE_NOUN}"
+        rf"[^。！？\n]{{0,24}}{_ZH_EDIT_VERB}"
+    ),
+    re.compile(
+        rf"{_ZH_IMAGE_NOUN}(?:进行|做|需要|需|请|帮我|给我|来)?"
+        rf"(?:一下|下)?{_ZH_EDIT_VERB}"
+    ),
+    re.compile(
+        r"(?:去(?:除|掉)?|移除|删除|抠除|替换|更换|换)"
+        r"[^。！？\n]{0,12}(?:背景|底色)"
+    ),
+    re.compile(
+        r"(?:背景|底色)[^。！？\n]{0,12}"
+        r"(?:去掉|去除|移除|删除|抠除|替换|更换)"
+    ),
+    re.compile(r"抠图"),
+    re.compile(
+        rf"\b(?:{_EN_COMPOSITE_VERB}|{_EN_EDIT_VERB})\b"
+        rf"[^.!?\n]{{0,60}}\b{_EN_IMAGE_NOUN}\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\b{_EN_IMAGE_NOUN}\b[^.!?\n]{{0,30}}"
+        rf"\b{_EN_COMPOSITE_VERB}\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\b{_EN_IMAGE_NOUN}\b\s*"
+        rf"(?:needs?\s+to\s+be|should\s+be|to\s+be)?\s*"
+        rf"\b{_EN_EDIT_VERB}\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"(?:把|将)?(?:它们|这俩|这两张|这几张|这些|两张)"
+        rf"[^。！？\n]{{0,10}}{_ZH_COMPOSITE_VERB}"
+    ),
+    re.compile(
+        r"(?:把|将)?第(?:一|二|三|四|五|六|七|八|九|十|\d+)张"
+        r"(?:图|图片|照片)?(?:和|与|及)"
+        r"第(?:一|二|三|四|五|六|七|八|九|十|\d+)张"
+        r"(?:图|图片|照片)?[^。！？\n]{0,10}"
+        rf"{_ZH_COMPOSITE_VERB}"
+    ),
+    re.compile(
+        rf"{_ZH_COMPOSITE_VERB}[^。！？\n]{{0,10}}"
+        r"(?:它们|这俩|这两张|这几张|这些|两张)"
+    ),
+    re.compile(
+        rf"(?:把|将)?{_ZH_IMAGE_NOUN}[^。！？\n]{{0,12}}"
+        r"(?:放|摆|排)(?:在|到)?一起"
+    ),
+    re.compile(
+        rf"{_ZH_IMAGE_NOUN}[^。！？\n]{{0,10}}合(?:在|到)?一起"
+    ),
+    re.compile(
+        rf"\b{_EN_COMPOSITE_VERB}\b[^.!?\n]{{0,16}}"
+        r"\b(?:them|both|these|those|the\s+two)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:去掉|去除|移除|删除|抠除)[^。！？\n]{0,20}"
+        rf"{_ZH_IMAGE_NOUN}(?:中|里|上|内|的)"
+    ),
+    re.compile(
+        rf"\b(?:remove|erase|delete)\b[^.!?\n]{{0,24}}"
+        r"\b(?:watermarks?|logos?|objects?|people|person)\b"
+        rf"[^.!?\n]{{0,40}}\b{_EN_IMAGE_NOUN}\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:给|为)(?:图中|照片中|画面中)?"
+        r"(?:人物|人像|角色|主体|模特|人)[^。！？\n]{0,12}"
+        r"(?:加上?|添加|戴上|换上)[^。！？\n]{0,20}"
+        r"(?:帽子|眼镜|衣服|服装|配饰|饰品|物件)"
+    ),
+    re.compile(
+        r"(?:去掉|去除|移除|删除|抠除)[^。！？\n]{0,8}"
+        r"(?:水印|标志|logo)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:水印|标志|logo)[^。！？\n]{0,8}"
+        r"(?:去掉|去除|移除|删除|抠除)",
+        re.IGNORECASE,
+    ),
+    re.compile(rf"(?:把|将)?(?:它|其)[^。！？\n]{{0,12}}{_ZH_EDIT_VERB}"),
+    re.compile(
+        rf"\b{_EN_EDIT_VERB}\b[^.!?\n]{{0,12}}\b(?:it|them)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:make|crop)\b[^.!?\n]{0,12}"
+        r"\b(?:it|them|this|these|those)\b[^.!?\n]{0,16}"
+        r"\b(?:square|portrait|landscape)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:remove|erase|delete)\b[^.!?\n]{0,24}"
+        r"\b(?:watermarks?|logos?)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:remove|erase|replace|change)\b.{0,40}\b(?:background|backdrop)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bbackground\s+(?:removal|replacement)\b", re.IGNORECASE),
+)
+_IMAGE_PROMPT_NEGATION_PATTERNS = (
+    re.compile(
+        rf"(?:不要|不用|无需|不需要|不必|不|别|切勿|禁止)"
+        rf"[^。！？，,；;\n]{{0,16}}"
+        rf"(?:生成|画|绘制|创作|制作|做|{_ZH_COMPOSITE_VERB}|"
+        rf"{_ZH_EDIT_VERB}|去掉|去除|移除|删除|添加)"
+    ),
+    re.compile(
+        rf"\b(?:do\s+not|don['’]t|never|no\s+need\s+to)\b"
+        rf"[^.!?,;\n]{{0,16}}\b(?:{_EN_CREATE_VERB}|"
+        rf"{_EN_COMPOSITE_VERB}|{_EN_EDIT_VERB})\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"^\s*(?:was|were|is|are|has|have)\b[^.!?\n]{{0,60}}"
+        rf"\b{_EN_IMAGE_NOUN}\b[^.!?\n]{{0,24}}"
+        rf"\b(?:been\s+)?{_EN_EDIT_VERB}\b[^.!?\n]*\s*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"{_ZH_IMAGE_NOUN}[^。！？\n]{{0,12}}(?:被|是否)"
+        rf"[^。！？\n]{{0,12}}{_ZH_EDIT_VERB}[^。！？\n]{{0,8}}(?:吗|过吗)"
+    ),
+    re.compile(
+        rf"{_ZH_IMAGE_NOUN}[^。！？\n]{{0,20}}(?:是|是否|是不是)"
+        r"[^。！？\n]{0,12}(?:AI|人工智能)?[^。！？\n]{0,8}"
+        rf"{_ZH_CREATE_VERB}[^。！？\n]{{0,8}}(?:吗|么)"
+    ),
+    re.compile(
+        rf"^\s*did\b[^.!?\n]{{0,32}}"
+        r"\b(?:ai|artificial\s+intelligence)\b"
+        rf"[^.!?\n]{{0,24}}\b{_EN_CREATE_VERB}\b"
+        rf"[^.!?\n]{{0,40}}\b{_EN_IMAGE_NOUN}\b[^.!?\n]*\s*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"^\s*did\s+(?:you|we|they|he|she|it)\b[^.!?\n]{{0,40}}"
+        rf"\b{_EN_CREATE_VERB}\b[^.!?\n]{{0,40}}"
+        rf"\b{_EN_IMAGE_NOUN}\b[^.!?\n]*\s*$",
+        re.IGNORECASE,
+    ),
+)
+_IMAGE_TEXT_ONLY_INTENT_PATTERNS = (
+    re.compile(
+        rf"(?:解释|说明|讲解|描述|告诉(?:我)?)[^。！？\n]{{0,60}}"
+        rf"(?:如何|怎么|怎样)[^。！？\n]{{0,40}}"
+        rf"(?:{_ZH_CREATE_VERB}|{_ZH_COMPOSITE_VERB}|{_ZH_EDIT_VERB})"
+    ),
+    re.compile(
+        rf"(?:如何|怎么|怎样)[^。！？\n]{{0,40}}{_ZH_CREATE_VERB}"
+        rf"[^。！？\n]{{0,40}}{_ZH_IMAGE_NOUN}"
+    ),
+    re.compile(
+        r"(?:比较|对比)[^。！？\n]{0,80}(?:差异|区别|不同|异同|有什么变化)"
+    ),
+    re.compile(
+        rf"(?:分析|描述|说明|解释|比较|对比|识别)"
+        rf"[^。！？\n]{{0,60}}{_ZH_IMAGE_NOUN}"
+    ),
+    re.compile(
+        r"(?:合并|组合|汇总|整合)[^。！？\n]{0,24}"
+        r"(?:文字|文本|文案|内容)[^。！？\n]{0,40}"
+        r"(?:摘要|总结|文档|段落|回答|答复)"
+    ),
+    re.compile(
+        rf"{_ZH_IMAGE_NOUN}[^。！？\n]{{0,24}}"
+        r"(?:提取|读取|识别|转写)[^。！？\n]{0,16}"
+        r"(?:文字|文本|文案|内容)[^。！？\n]{0,40}"
+        r"(?:摘要|总结|文档|段落|回答|答复)"
+    ),
+    re.compile(
+        rf"{_ZH_IMAGE_NOUN}[^。！？\n]{{0,24}}"
+        r"(?:文字|文本|文案|内容)[^。！？\n]{0,36}"
+        r"(?:合并|组合|汇总|整合)[^。！？\n]{0,36}"
+        r"(?:一段(?:话)?|摘要|总结|文档|段落)"
+    ),
+    re.compile(
+        rf"\b(?:explain|describe|show|tell)\b[^.!?\n]{{0,40}}"
+        rf"\bhow(?:\s+to)?\b[^.!?\n]{{0,40}}"
+        rf"\b(?:{_EN_CREATE_VERB}|{_EN_COMPOSITE_VERB}|{_EN_EDIT_VERB})\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bhow(?:\s+(?:do|can|should|would)\s+(?:i|we|you)|\s+to)\b"
+        rf"[^.!?\n]{{0,40}}\b{_EN_CREATE_VERB}\b"
+        rf"[^.!?\n]{{0,40}}\b{_EN_IMAGE_NOUN}\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:compare|contrast)\b[^.!?\n]{0,80}"
+        r"\b(?:differences?|changes?|before\s+and\s+after)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\b(?:analyze|analyse|describe|explain|compare|identify)\b"
+        rf"[^.!?\n]{{0,60}}\b{_EN_IMAGE_NOUN}\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:merge|combine)\b[^.!?\n]{0,32}"
+        r"\b(?:text|words|captions?|content|information)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:extract|read|recognize|transcribe)\b[^.!?\n]{0,80}"
+        r"\b(?:text|words|captions?|content)\b[^.!?\n]{0,80}"
+        rf"\b{_EN_COMPOSITE_VERB}\b[^.!?\n]{{0,40}}"
+        r"\b(?:paragraph|summary|document)\b",
+        re.IGNORECASE,
+    ),
+)
+_IMAGE_TRANSFORM_AFTER_TEXT_PATTERNS = (
+    re.compile(
+        r"(?:先|首先)[^。！？\n]{0,40}"
+        r"(?:比较|对比|分析|描述|识别)[^。！？\n]{0,40}"
+        r"(?:再|然后|接着|随后)[^。！？\n]{0,40}"
+        rf"(?:{_ZH_COMPOSITE_VERB}|{_ZH_EDIT_VERB})"
+    ),
+    re.compile(
+        r"\b(?:first|initially)\b[^.!?\n]{0,60}"
+        r"\b(?:compare|analyze|analyse|describe|identify)\b[^.!?\n]{0,60}"
+        r"\b(?:then|next|afterwards)\b[^.!?\n]{0,60}"
+        rf"\b(?:{_EN_COMPOSITE_VERB}|{_EN_EDIT_VERB})\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\b(?:analyze|analyse|inspect|review|compare|contrast|describe)\b"
+        rf"[^.!?\n]{{0,60}}"
+        rf"\b{_EN_IMAGE_NOUN}\b[^.!?\n]{{0,40}}\b(?:and|then)\b"
+        rf"[^.!?\n]{{0,20}}\b(?:{_EN_EDIT_VERB}|{_EN_COMPOSITE_VERB})\b",
+        re.IGNORECASE,
+    ),
+)
 
 
 class ImageInputError(ValueError):
@@ -92,12 +368,19 @@ def parse_content_parts(content) -> tuple[str, list[ImageReference]]:
     return "\n".join(p for p in text_parts if p), images
 
 
-def wants_image_output(payload: dict, latest_user_text: str) -> bool:
+def wants_image_output(
+    payload: dict,
+    latest_user_text: str,
+    has_image_inputs: bool = False,
+) -> bool:
     """Detect an image-output request from explicit OpenAI fields or prompt text.
 
     Chat Completions clients do not all expose the same image-output switch, so
     explicit ``modalities``/``response_format`` signals take precedence and a
     conservative multilingual prompt fallback covers ordinary chat clients.
+    Broad editing verbs are considered image-output intent only when the
+    current request actually includes image inputs. This keeps image-analysis,
+    comparison, and no-attachment tutorial prompts on the text-response path.
     The result only changes completion observation and timeout behavior; it
     does not rewrite the user's prompt.
     """
@@ -122,7 +405,36 @@ def wants_image_output(payload: dict, latest_user_text: str) -> bool:
         return True
 
     text = latest_user_text.strip()
-    return bool(text and any(pattern.search(text) for pattern in _IMAGE_OUTPUT_PATTERNS))
+    if not text:
+        return False
+    clauses = (
+        clause.strip()
+        for clause in _IMAGE_ACTION_CLAUSE_SPLIT_RE.split(text)
+        if clause.strip()
+    )
+    for clause in clauses:
+        if any(
+            pattern.search(clause)
+            for pattern in _IMAGE_PROMPT_NEGATION_PATTERNS
+        ):
+            continue
+        is_text_only = any(
+            pattern.search(clause)
+            for pattern in _IMAGE_TEXT_ONLY_INTENT_PATTERNS
+        )
+        is_explicit_sequence = any(
+            pattern.search(clause)
+            for pattern in _IMAGE_TRANSFORM_AFTER_TEXT_PATTERNS
+        )
+        if is_text_only and not is_explicit_sequence:
+            continue
+        if any(pattern.search(clause) for pattern in _IMAGE_OUTPUT_PATTERNS):
+            return True
+        if has_image_inputs and any(
+            pattern.search(clause) for pattern in _IMAGE_EDIT_PATTERNS
+        ):
+            return True
+    return False
 
 
 def _sniff_image_type(data: bytes) -> str | None:

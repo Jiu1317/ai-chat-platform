@@ -25,8 +25,11 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from chatgpt_web2api.completion_detector import (
+    BACKEND_RATE_LIMIT_BACKOFF_INITIAL_SECONDS,
+    BACKEND_RATE_LIMIT_BACKOFF_MAX_SECONDS,
     CompletionDetector,
     DetectorBudgets,
+    _next_backend_rate_limit_backoff_seconds,
 )
 from chatgpt_web2api.turn_anchor import TurnAnchor, TurnEndResult
 
@@ -719,6 +722,458 @@ async def test_fetch_failure_between_matches_restarts_confirmation(monkeypatch):
 
     assert driver._fetch_end_turn_for_turn.await_count == 5
     assert 15 <= t[0] < 25
+
+
+def test_backend_429_backoff_is_exponential_and_bounded():
+    delay = 0.0
+    observed = []
+    for _ in range(5):
+        delay = _next_backend_rate_limit_backoff_seconds(delay)
+        observed.append(delay)
+
+    assert observed == [15.0, 30.0, 60.0, 120.0, 120.0]
+    assert observed[0] == BACKEND_RATE_LIMIT_BACKOFF_INITIAL_SECONDS
+    assert max(observed) == BACKEND_RATE_LIMIT_BACKOFF_MAX_SECONDS
+
+
+@pytest.mark.parametrize("raise_exception", [False, True])
+@pytest.mark.asyncio
+async def test_phase1_backend_429_honors_exponential_cooldown(
+    monkeypatch, raise_exception
+):
+    from chatgpt_web2api.cdp_driver import GenerationStuckError
+
+    budgets = DetectorBudgets(
+        first_content_timeout_seconds=40,
+        stream_idle_timeout_seconds=40,
+        hard_timeout_seconds=45,
+    )
+    detector, driver = _make_detector(budgets=budgets)
+
+    async def phase1_only_dom(expr):
+        if "innerText" in expr:
+            return '{"text": ""}'
+        if "actionCount" in expr:
+            return json.dumps({
+                "generationActive": True,
+                "actionCount": 0,
+                "assets": [],
+            })
+        return "0"
+
+    driver._js_strict = phase1_only_dom
+    call_times = []
+
+    async def rate_limited(*args, **kwargs):
+        call_times.append(time.monotonic())
+        if raise_exception:
+            raise RuntimeError("projection HTTP 429")
+        return TurnEndResult(
+            status="fetch_failed",
+            diagnostic={"error": "projection status 429"},
+        )
+
+    driver._fetch_end_turn_for_turn = AsyncMock(side_effect=rate_limited)
+    _install_fast_clock(monkeypatch)
+
+    with pytest.raises(GenerationStuckError) as exc_info:
+        async for _ in detector.stream_until_complete(
+            initial_count=0,
+            timeout=45,
+            turn_anchor=TurnAnchor(
+                sent_text="merge these images",
+                mode="captured_id",
+                captured_user_message_id="u-current",
+            ),
+            budgets=budgets,
+            model="gpt-5-6-thinking",
+            expect_non_text=True,
+            has_input_attachments=True,
+        ):
+            pass
+
+    assert exc_info.value.phase == "phase_1_appear"
+    assert len(call_times) == 2
+    assert call_times[1] - call_times[0] >= 15.0
+
+
+@pytest.mark.asyncio
+async def test_backend_429_is_not_polled_every_three_seconds(monkeypatch):
+    from chatgpt_web2api.cdp_driver import GenerationStuckError
+
+    budgets = DetectorBudgets(
+        first_content_timeout_seconds=40,
+        stream_idle_timeout_seconds=40,
+        hard_timeout_seconds=45,
+    )
+    detector, driver = _make_detector(budgets=budgets)
+    driver._js_strict = _ScriptedPoll([
+        _phase2_poll_payload(current_assistant_present=True)
+    ])
+    call_times = []
+
+    async def rate_limited(*args, **kwargs):
+        call_times.append(time.monotonic())
+        return TurnEndResult(
+            status="fetch_failed",
+            diagnostic={"error": "projection HTTP 429"},
+        )
+
+    driver._fetch_end_turn_for_turn = AsyncMock(side_effect=rate_limited)
+    _install_fast_clock(monkeypatch)
+
+    with pytest.raises(GenerationStuckError):
+        async for _ in detector.stream_until_complete(
+            initial_count=0,
+            timeout=45,
+            turn_anchor=TurnAnchor(
+                sent_text="merge these images",
+                mode="captured_id",
+                captured_user_message_id="u-current",
+            ),
+            budgets=budgets,
+            model="gpt-5-6-thinking",
+            has_input_attachments=True,
+        ):
+            pass
+
+    # A three-second loop would make about 13 calls in this window. Two normal
+    # probes must occur (rather than passing vacuously on zero/one call), while
+    # the next exponential retry remains beyond the 40-second stall.
+    assert len(call_times) == 2
+    assert call_times[1] - call_times[0] >= 15.0
+
+
+@pytest.mark.asyncio
+async def test_stall_does_not_bypass_active_429_cooldown(monkeypatch):
+    from chatgpt_web2api.cdp_driver import GenerationStuckError
+
+    budgets = DetectorBudgets(
+        first_content_timeout_seconds=4,
+        stream_idle_timeout_seconds=4,
+        hard_timeout_seconds=10,
+    )
+    detector, driver = _make_detector(budgets=budgets)
+    driver._js_strict = _ScriptedPoll([
+        _phase2_poll_payload(current_assistant_present=True)
+    ])
+    call_times = []
+
+    async def rate_limited(*args, **kwargs):
+        call_times.append(time.monotonic())
+        return TurnEndResult(
+            status="fetch_failed",
+            diagnostic={"error": "HTTP 429 too many requests"},
+        )
+
+    driver._fetch_end_turn_for_turn = AsyncMock(side_effect=rate_limited)
+    _install_fast_clock(monkeypatch)
+
+    with pytest.raises(GenerationStuckError):
+        async for _ in detector.stream_until_complete(
+            initial_count=0,
+            timeout=10,
+            turn_anchor=TurnAnchor(
+                sent_text="merge these images",
+                mode="captured_id",
+                captured_user_message_id="u-current",
+            ),
+            budgets=budgets,
+            model="auto",
+        ):
+            pass
+
+    # The scheduled fetch lands just before the stall. Final reconciliation
+    # must not immediately issue a second request inside its 15-second delay.
+    assert call_times == [3.5]
+
+
+@pytest.mark.asyncio
+async def test_valid_non_429_response_resets_429_backoff(monkeypatch):
+    budgets = DetectorBudgets(
+        first_content_timeout_seconds=45,
+        stream_idle_timeout_seconds=45,
+        hard_timeout_seconds=50,
+    )
+    detector, driver = _make_detector(budgets=budgets)
+    _install_fast_clock(monkeypatch)
+
+    async def clock_driven_dom(expr):
+        if "getBoundingClientRect" in expr:
+            return _phase2_poll_payload(
+                text="merged result",
+                current_assistant_present=True,
+            )
+        if "innerText" in expr:
+            return '{"text": ""}'
+        return "1"
+
+    driver._js_strict = clock_driven_dom
+    call_times = []
+    results = [
+        TurnEndResult(
+            status="fetch_failed",
+            diagnostic={"error": "HTTP 429"},
+        ),
+        TurnEndResult(status="not_ready"),
+        TurnEndResult(
+            status="fetch_failed",
+            diagnostic={"error": "status 429"},
+        ),
+        _strict_end_result(text="merged result"),
+    ]
+
+    async def sequenced_backend(*args, **kwargs):
+        call_times.append(time.monotonic())
+        return results[min(len(call_times) - 1, len(results) - 1)]
+
+    driver._fetch_end_turn_for_turn = AsyncMock(side_effect=sequenced_backend)
+
+    async for _ in detector.stream_until_complete(
+        initial_count=0,
+        timeout=50,
+        turn_anchor=TurnAnchor(
+            sent_text="merge these images",
+            mode="captured_id",
+            captured_user_message_id="u-current",
+        ),
+        budgets=budgets,
+        model="auto",
+    ):
+        pass
+
+    # The strict terminal fixture needs later confirmations; only the first
+    # four calls define the reset sequence under test.
+    assert len(call_times) >= 4
+    assert call_times[1] - call_times[0] >= 15.0
+    assert 3.0 < call_times[2] - call_times[1] < 4.0
+    assert 15.0 <= call_times[3] - call_times[2] < 16.0
+
+
+@pytest.mark.asyncio
+async def test_exact_current_turn_action_completes_during_429_backoff(monkeypatch):
+    budgets = DetectorBudgets(
+        first_content_timeout_seconds=40,
+        stream_idle_timeout_seconds=40,
+        hard_timeout_seconds=45,
+    )
+    detector, driver = _make_detector(budgets=budgets)
+    t = _install_fast_clock(monkeypatch)
+
+    async def clock_driven_dom(expr):
+        if "getBoundingClientRect" in expr:
+            return _phase2_poll_payload(
+                text="merged result",
+                current_assistant_present=True,
+                # A broad old action appears first; only the exact current-turn
+                # action that appears later may complete while rate limited.
+                has_action=t[0] >= 4.0,
+                has_exact_action=t[0] >= 6.0,
+            )
+        if "innerText" in expr:
+            return '{"text": ""}'
+        return "1"
+
+    driver._js_strict = clock_driven_dom
+    driver._fetch_end_turn_for_turn = AsyncMock(return_value=TurnEndResult(
+        status="fetch_failed",
+        diagnostic={"error": "HTTP 429"},
+    ))
+    chunks = []
+
+    async for chunk in detector.stream_until_complete(
+        initial_count=0,
+        timeout=45,
+        turn_anchor=TurnAnchor(
+            sent_text="merge these images",
+            mode="captured_id",
+            captured_user_message_id="u-current",
+        ),
+        budgets=budgets,
+        model="gpt-5-6-thinking",
+        has_input_attachments=True,
+    ):
+        chunks.append(chunk.delta)
+
+    assert t[0] >= 6.0
+    assert t[0] < 18.5
+    assert driver._fetch_end_turn_for_turn.await_count == 1
+    assert chunks == ["merged result"]
+    assert detector.completed_via_exact_action is True
+
+
+@pytest.mark.asyncio
+async def test_same_detector_next_stream_inherits_active_429_cooldown(monkeypatch):
+    budgets = DetectorBudgets(
+        first_content_timeout_seconds=20,
+        stream_idle_timeout_seconds=20,
+        hard_timeout_seconds=25,
+    )
+    detector, driver = _make_detector(budgets=budgets)
+    t = _install_fast_clock(monkeypatch)
+    call_times = []
+
+    async def rate_limited(*args, **kwargs):
+        call_times.append(time.monotonic())
+        return TurnEndResult(
+            status="fetch_failed",
+            diagnostic={"error": "HTTP 429"},
+        )
+
+    driver._fetch_end_turn_for_turn = AsyncMock(side_effect=rate_limited)
+
+    async def first_stream_dom(expr):
+        if "getBoundingClientRect" in expr:
+            return _phase2_poll_payload(
+                text="first answer",
+                current_assistant_present=True,
+                has_action=t[0] >= 4.0,
+                has_exact_action=t[0] >= 4.0,
+            )
+        if "innerText" in expr:
+            return '{"text": ""}'
+        return "1"
+
+    driver._js_strict = first_stream_dom
+    async for _ in detector.stream_until_complete(
+        initial_count=0,
+        timeout=25,
+        turn_anchor=TurnAnchor(
+            sent_text="first",
+            mode="captured_id",
+            captured_user_message_id="u-first",
+        ),
+        budgets=budgets,
+        model="gpt-4o",
+    ):
+        pass
+
+    assert call_times == [3.5]
+    assert t[0] < detector._backend_retry_not_before
+    second_exact_at = t[0] + 1.0
+
+    async def second_stream_dom(expr):
+        if "getBoundingClientRect" in expr:
+            return _phase2_poll_payload(
+                text="second answer",
+                current_assistant_present=True,
+                has_action=t[0] >= second_exact_at,
+                has_exact_action=t[0] >= second_exact_at,
+            )
+        if "innerText" in expr:
+            return '{"text": ""}'
+        return "1"
+
+    driver._js_strict = second_stream_dom
+    async for _ in detector.stream_until_complete(
+        initial_count=0,
+        timeout=25,
+        turn_anchor=TurnAnchor(
+            sent_text="second",
+            mode="captured_id",
+            captured_user_message_id="u-second",
+        ),
+        budgets=budgets,
+        model="gpt-4o",
+    ):
+        pass
+
+    assert t[0] == second_exact_at
+    assert t[0] < detector._backend_retry_not_before
+    assert call_times == [3.5]
+
+
+@pytest.mark.asyncio
+async def test_next_image_stream_phase1_inherits_429_cooldown_without_final_probe(
+    monkeypatch,
+):
+    from chatgpt_web2api.cdp_driver import GenerationStuckError
+
+    first_budgets = DetectorBudgets(
+        first_content_timeout_seconds=20,
+        stream_idle_timeout_seconds=20,
+        hard_timeout_seconds=25,
+    )
+    detector, driver = _make_detector(budgets=first_budgets)
+    t = _install_fast_clock(monkeypatch)
+    call_times = []
+
+    async def rate_limited(*args, **kwargs):
+        call_times.append(time.monotonic())
+        return TurnEndResult(
+            status="fetch_failed",
+            diagnostic={"error": "HTTP 429"},
+        )
+
+    driver._fetch_end_turn_for_turn = AsyncMock(side_effect=rate_limited)
+
+    async def first_stream_dom(expr):
+        if "getBoundingClientRect" in expr:
+            return _phase2_poll_payload(
+                text="first answer",
+                current_assistant_present=True,
+                has_action=t[0] >= 4.0,
+                has_exact_action=t[0] >= 4.0,
+            )
+        if "innerText" in expr:
+            return '{"text": ""}'
+        return "1"
+
+    driver._js_strict = first_stream_dom
+    async for _ in detector.stream_until_complete(
+        initial_count=0,
+        timeout=25,
+        turn_anchor=TurnAnchor(
+            sent_text="first",
+            mode="captured_id",
+            captured_user_message_id="u-first",
+        ),
+        budgets=first_budgets,
+        model="gpt-4o",
+    ):
+        pass
+
+    assert call_times == [3.5]
+    assert t[0] < detector._backend_retry_not_before
+
+    async def second_phase1_only_dom(expr):
+        if "innerText" in expr:
+            return '{"text": ""}'
+        if "actionCount" in expr:
+            return json.dumps({
+                "generationActive": True,
+                "actionCount": 0,
+                "assets": [],
+            })
+        return "0"
+
+    driver._js_strict = second_phase1_only_dom
+    second_budgets = DetectorBudgets(
+        first_content_timeout_seconds=4,
+        stream_idle_timeout_seconds=4,
+        hard_timeout_seconds=10,
+    )
+    with pytest.raises(GenerationStuckError) as exc_info:
+        async for _ in detector.stream_until_complete(
+            initial_count=0,
+            timeout=10,
+            turn_anchor=TurnAnchor(
+                sent_text="merge these images",
+                mode="captured_id",
+                captured_user_message_id="u-second",
+            ),
+            budgets=second_budgets,
+            model="gpt-5-6-thinking",
+            expect_non_text=True,
+            has_input_attachments=True,
+        ):
+            pass
+
+    assert exc_info.value.phase == "phase_1_appear"
+    assert t[0] < detector._backend_retry_not_before
+    # Phase 1 must neither poll during the inherited cooldown nor issue a
+    # last-second reconciliation when its appearance budget expires.
+    assert call_times == [3.5]
 
 
 # ── 3. Hard cap wins over active DOM signal ─────────────────────────────
