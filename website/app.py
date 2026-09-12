@@ -17,6 +17,7 @@ import secrets
 import shutil
 import socket
 import sqlite3
+import threading
 import time
 import unicodedata
 import uuid
@@ -119,17 +120,19 @@ IMAGE_PREVIEW_QUALITY = 76
 IMAGE_COMPRESSED_MAX_EDGE = 2048
 IMAGE_COMPRESSED_QUALITY = 88
 IMAGE_DERIVATIVE_VERSION = "v1"
-TRANSFER_URL_TTL_SECONDS = 15 * 60
+TRANSFER_URL_TTL_SECONDS = 30 * 60
 TRANSFER_IMAGE_MAX_EDGE = 1600
 TRANSFER_IMAGE_QUALITY = 82
 TRANSFER_IMAGE_COMPRESS_MIN_BYTES = 256 * 1024
 TRANSFER_CACHE_DIR = ".transfer-cache"
+TRANSFER_CACHE_RETENTION_SECONDS = TRANSFER_URL_TTL_SECONDS + 10 * 60
 LONG_TASK_HEARTBEAT_SECONDS = 15.0
 IMAGE_BRIDGE_REQUEST_TIMEOUT_SECONDS = 20 * 60
-EXTERNAL_ASSET_DOWNLOAD_TIMEOUT_SECONDS = 3 * 60
+EXTERNAL_ASSET_DOWNLOAD_TIMEOUT_SECONDS = 8 * 60
 EXTERNAL_ASSET_DOWNLOAD_ATTEMPTS = 3
-EXTERNAL_ASSET_ATTEMPT_TIMEOUT_SECONDS = 55
-EXTERNAL_RESPONSE_TIMEOUT_SECONDS = 20 * 60
+EXTERNAL_ASSET_ATTEMPT_TIMEOUT_SECONDS = 150
+EXTERNAL_RESPONSE_TIMEOUT_SECONDS = 40 * 60
+SHUTDOWN_DRAIN_TIMEOUT_SECONDS = 44 * 60
 EXTERNAL_RESUME_TTL_SECONDS = 6 * 60 * 60
 EXTERNAL_RESUME_MAX_TURNS = 64
 EXTERNAL_RESUME_MAX_EVENT_BYTES = 2 * 1024 * 1024
@@ -138,7 +141,7 @@ RESUMABLE_STOP_TOMBSTONE_MAX_ENTRIES = 512
 EXTERNAL_ASSET_RETRYABLE_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504, 520, 522, 524}
 EXTERNAL_ASSET_PATH_RE = re.compile(r"^/v1/assets/[A-Za-z0-9_-]{16,256}$")
 EXTERNAL_ASSET_MARKDOWN_RE = re.compile(
-    r"!\[([^\]\r\n]{0,120})\]\((https?://[^)\s]+)\)", re.IGNORECASE)
+    r"(!?)\[([^\]\r\n]{0,120})\]\((https?://[^)\s]+)\)", re.IGNORECASE)
 OFFICE_EXTENSIONS = {".docx", ".xlsx", ".pptx"}
 TEXT_EXTENSIONS = {
     ".txt", ".md", ".csv", ".json", ".py", ".js", ".ts", ".tsx", ".jsx",
@@ -244,6 +247,7 @@ def _normalized_username(value: str) -> str:
 def _database_connection():
     database = sqlite3.connect(CONVERSATIONS_PATH, timeout=10)
     try:
+        database.execute("PRAGMA foreign_keys=ON")
         with database:
             yield database
     finally:
@@ -372,6 +376,36 @@ def _init_conversations_db() -> None:
                 FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
             )"""
         )
+        database.execute(
+            """CREATE TABLE IF NOT EXISTS resumable_turns (
+                user_id TEXT NOT NULL,
+                client_turn_id TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                terminal INTEGER NOT NULL DEFAULT 0,
+                event_bytes INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY(user_id, client_turn_id)
+            )"""
+        )
+        database.execute(
+            """CREATE TABLE IF NOT EXISTS resumable_turn_events (
+                user_id TEXT NOT NULL,
+                client_turn_id TEXT NOT NULL,
+                cursor INTEGER NOT NULL,
+                payload BLOB NOT NULL,
+                PRIMARY KEY(user_id, client_turn_id, cursor)
+            )"""
+        )
+        database.execute(
+            """CREATE TABLE IF NOT EXISTS resumable_stop_tombstones (
+                user_id TEXT NOT NULL,
+                client_turn_id TEXT NOT NULL,
+                stopped_at REAL NOT NULL,
+                PRIMARY KEY(user_id, client_turn_id)
+            )"""
+        )
         for table in ("conversations", "conversation_tombstones", "projects", "project_tombstones"):
             _ensure_column(database, table, "user_id", "TEXT")
             if owner_id:
@@ -385,6 +419,10 @@ def _init_conversations_db() -> None:
         database.execute(
             "CREATE INDEX IF NOT EXISTS idx_message_events_user_created "
             "ON message_events(user_id, created_at)"
+        )
+        database.execute(
+            "CREATE INDEX IF NOT EXISTS idx_resumable_turns_updated "
+            "ON resumable_turns(updated_at DESC)"
         )
         database.execute("DELETE FROM site_sessions WHERE expires_at < ?", (int(time.time()),))
         if owner_id:
@@ -510,7 +548,7 @@ def _normalize_cloud_conversation(raw: dict[str, Any]) -> dict[str, Any]:
     for index, item in enumerate(raw_messages[-MAX_CLOUD_MESSAGES:]):
         if not isinstance(item, dict) or item.get("role") not in {"user", "assistant"}:
             continue
-        content = str(item.get("content") or "")[:60_000]
+        content = _clip_context_text(item.get("content"), 60_000)
         total_content += len(content)
         if total_content > MAX_CLOUD_CONTENT_CHARS:
             raise HTTPException(413, "单个聊天记录过大，请拆分为多个对话")
@@ -627,6 +665,52 @@ def _normalize_cloud_conversation(raw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _merge_cloud_conversation(
+    existing: dict[str, Any], incoming: dict[str, Any]
+) -> dict[str, Any]:
+    """Merge immutable messages from concurrent browser snapshots."""
+    existing_updated = int(existing.get("updatedAt") or 0)
+    incoming_updated = int(incoming.get("updatedAt") or 0)
+    preferred = incoming if incoming_updated >= existing_updated else existing
+    secondary = existing if preferred is incoming else incoming
+    merged = dict(preferred)
+
+    positions: dict[str, int] = {}
+    messages: dict[str, dict[str, Any]] = {}
+    for snapshot in (secondary, preferred):
+        for item in snapshot.get("messages", []):
+            if not isinstance(item, dict):
+                continue
+            message_id = str(item.get("id") or "")
+            if not SESSION_RE.fullmatch(message_id):
+                continue
+            if message_id not in positions:
+                positions[message_id] = len(positions)
+            messages[message_id] = item
+    ordered = sorted(
+        messages.values(),
+        key=lambda item: (
+            int(item.get("createdAt") or 0),
+            positions[str(item.get("id") or "")],
+        ),
+    )
+    merged["messages"] = ordered[-MAX_CLOUD_MESSAGES:]
+    merged["updatedAt"] = max(existing_updated, incoming_updated)
+
+    thread_ids: list[str] = []
+    for snapshot in (existing, incoming):
+        for thread_id in snapshot.get("codexThreadIds", []):
+            if thread_id not in thread_ids:
+                thread_ids.append(thread_id)
+            if len(thread_ids) >= 50:
+                break
+    preferred_thread = str(preferred.get("threadId") or "")
+    if preferred_thread and preferred_thread not in thread_ids:
+        thread_ids.append(preferred_thread)
+    merged["codexThreadIds"] = thread_ids[:50]
+    return merged
+
+
 def _normalize_cloud_project(raw: dict[str, Any]) -> dict[str, Any]:
     project_id = str(raw.get("id") or "")
     workspace_id = str(raw.get("workspaceId") or "")
@@ -637,12 +721,31 @@ def _normalize_cloud_project(raw: dict[str, Any]) -> dict[str, Any]:
     created_at = _cloud_timestamp(raw.get("createdAt"), updated_at) or updated_at
     name = re.sub(r"\s+", " ", str(raw.get("name") or "新项目")).strip()[:60] or "新项目"
     instructions = str(raw.get("instructions") or "").strip()[:MAX_PROJECT_INSTRUCTIONS]
+    removed_file_ids: list[str] = []
+    for value in raw.get("removedFileIds") if isinstance(raw.get("removedFileIds"), list) else []:
+        file_id = str(value or "")
+        if (
+            file_id
+            and len(file_id) <= 180
+            and "/" not in file_id
+            and "\\" not in file_id
+            and file_id not in removed_file_ids
+        ):
+            removed_file_ids.append(file_id)
+        if len(removed_file_ids) >= 200:
+            break
     files: list[dict[str, Any]] = []
     for item in raw.get("files") if isinstance(raw.get("files"), list) else []:
         if not isinstance(item, dict):
             continue
         file_id = str(item.get("id") or "")
-        if not file_id or len(file_id) > 180 or "/" in file_id or "\\" in file_id:
+        if (
+            not file_id
+            or len(file_id) > 180
+            or "/" in file_id
+            or "\\" in file_id
+            or file_id in removed_file_ids
+        ):
             continue
         files.append({
             "id": file_id,
@@ -659,9 +762,43 @@ def _normalize_cloud_project(raw: dict[str, Any]) -> dict[str, Any]:
         "instructions": instructions,
         "useContext": bool(raw.get("useContext")),
         "files": files,
+        "removedFileIds": removed_file_ids,
         "createdAt": created_at,
         "updatedAt": updated_at,
     }
+
+
+def _merge_cloud_project(
+    existing: dict[str, Any], incoming: dict[str, Any]
+) -> dict[str, Any]:
+    existing_updated = int(existing.get("updatedAt") or 0)
+    incoming_updated = int(incoming.get("updatedAt") or 0)
+    preferred = incoming if incoming_updated >= existing_updated else existing
+    secondary = existing if preferred is incoming else incoming
+    merged = dict(preferred)
+
+    removed: list[str] = []
+    for snapshot in (existing, incoming):
+        for file_id in snapshot.get("removedFileIds", []):
+            if file_id not in removed:
+                removed.append(file_id)
+            if len(removed) >= 200:
+                break
+    removed_set = set(removed)
+    files: dict[str, dict[str, Any]] = {}
+    for snapshot in (secondary, preferred):
+        for item in snapshot.get("files", []):
+            file_id = str(item.get("id") or "") if isinstance(item, dict) else ""
+            if file_id and file_id not in removed_set:
+                files[file_id] = item
+    merged["files"] = list(files.values())[:MAX_PROJECT_FILES]
+    merged["removedFileIds"] = removed
+    merged["updatedAt"] = max(existing_updated, incoming_updated)
+    merged["createdAt"] = min(
+        int(existing.get("createdAt") or existing_updated),
+        int(incoming.get("createdAt") or incoming_updated),
+    )
+    return merged
 
 
 def _cloud_state(database: sqlite3.Connection, user_id: str) -> dict[str, Any]:
@@ -723,22 +860,28 @@ def _sync_cloud_conversations(
             if conversation["id"] in tombstones:
                 continue
             row = database.execute(
-                "SELECT user_id, updated_at FROM conversations WHERE id = ?", (conversation["id"],)
+                "SELECT user_id, updated_at, payload FROM conversations WHERE id = ?",
+                (conversation["id"],),
             ).fetchone()
             if row is not None and str(row[0]) != user_id:
                 raise HTTPException(409, "聊天记录标识已被占用，请新建对话")
-            if row is None or conversation["updatedAt"] > row[1]:
-                database.execute(
-                    """INSERT INTO conversations (id, user_id, payload, updated_at) VALUES (?, ?, ?, ?)
-                    ON CONFLICT(id) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at
-                    WHERE conversations.user_id = excluded.user_id""",
-                    (
-                        conversation["id"],
-                        user_id,
-                        json.dumps(conversation, ensure_ascii=False, separators=(",", ":")),
-                        conversation["updatedAt"],
-                    ),
-                )
+            if row is not None:
+                try:
+                    stored = _normalize_cloud_conversation(json.loads(str(row[2])))
+                except (TypeError, ValueError, json.JSONDecodeError, HTTPException):
+                    stored = conversation
+                conversation = _merge_cloud_conversation(stored, conversation)
+            database.execute(
+                """INSERT INTO conversations (id, user_id, payload, updated_at) VALUES (?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at
+                WHERE conversations.user_id = excluded.user_id""",
+                (
+                    conversation["id"],
+                    user_id,
+                    json.dumps(conversation, ensure_ascii=False, separators=(",", ":")),
+                    conversation["updatedAt"],
+                ),
+            )
             for thread_id in conversation["codexThreadIds"]:
                 _claim_codex_thread(database, user_id, thread_id)
         project_tombstones = {row[0] for row in database.execute(
@@ -748,22 +891,28 @@ def _sync_cloud_conversations(
             if project["id"] in project_tombstones:
                 continue
             row = database.execute(
-                "SELECT user_id, updated_at FROM projects WHERE id = ?", (project["id"],)
+                "SELECT user_id, updated_at, payload FROM projects WHERE id = ?",
+                (project["id"],),
             ).fetchone()
             if row is not None and str(row[0]) != user_id:
                 raise HTTPException(409, "项目标识已被占用，请新建项目")
-            if row is None or project["updatedAt"] > row[1]:
-                database.execute(
-                    """INSERT INTO projects (id, user_id, payload, updated_at) VALUES (?, ?, ?, ?)
-                    ON CONFLICT(id) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at
-                    WHERE projects.user_id = excluded.user_id""",
-                    (
-                        project["id"],
-                        user_id,
-                        json.dumps(project, ensure_ascii=False, separators=(",", ":")),
-                        project["updatedAt"],
-                    ),
-                )
+            if row is not None:
+                try:
+                    stored = _normalize_cloud_project(json.loads(str(row[2])))
+                except (TypeError, ValueError, json.JSONDecodeError, HTTPException):
+                    stored = project
+                project = _merge_cloud_project(stored, project)
+            database.execute(
+                """INSERT INTO projects (id, user_id, payload, updated_at) VALUES (?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at
+                WHERE projects.user_id = excluded.user_id""",
+                (
+                    project["id"],
+                    user_id,
+                    json.dumps(project, ensure_ascii=False, separators=(",", ":")),
+                    project["updatedAt"],
+                ),
+            )
         state = _cloud_state(database, user_id)
         database.commit()
     return state
@@ -1024,7 +1173,44 @@ def _session_path(user_id: str, session_id: str) -> Path:
 
 def _safe_filename(name: str) -> str:
     clean = SAFE_FILE_RE.sub("_", Path(name or "file").name).strip("._")
-    return clean[:120] or "file"
+    clean = clean or "file"
+    suffix = Path(clean).suffix
+    stem = clean[:-len(suffix)] if suffix else clean
+    suffix_bytes = len(suffix.encode("utf-8"))
+    if not stem or suffix_bytes >= 120:
+        suffix = ""
+        stem = clean
+        suffix_bytes = 0
+    budget = 120 - suffix_bytes
+    used = 0
+    clipped: list[str] = []
+    for character in stem:
+        width = len(character.encode("utf-8"))
+        if used + width > budget:
+            break
+        clipped.append(character)
+        used += width
+    safe_stem = "".join(clipped).rstrip("._") or "file"
+    return safe_stem + suffix
+
+
+def _stored_upload_name(original: str) -> str:
+    """Return a collision-resistant, filesystem-byte-safe stored filename."""
+    safe = _safe_filename(original)
+    prefix = f"{uuid.uuid4().hex[:10]}-"
+    suffix = Path(safe).suffix
+    stem = safe[:-len(suffix)] if suffix else safe
+    budget = 120 - len(prefix.encode("utf-8")) - len(suffix.encode("utf-8"))
+    used = 0
+    clipped: list[str] = []
+    for character in stem:
+        width = len(character.encode("utf-8"))
+        if used + width > budget:
+            break
+        clipped.append(character)
+        used += width
+    safe_stem = "".join(clipped).rstrip("._") or "file"
+    return prefix + safe_stem + suffix
 
 
 def _file_media_type(target: Path) -> str:
@@ -1194,6 +1380,9 @@ def _prepare_transfer_image(source: Path, upload_root: Path) -> Path:
             cache_root.mkdir(mode=0o700, parents=True, exist_ok=True)
             cache_root.chmod(0o700)
             target = cache_root / f"{key}.webp"
+            with transfer_cache_lock:
+                if target.is_file():
+                    target.touch()
             if not target.is_file() or target.stat().st_size == 0:
                 compressed = image.copy()
                 compressed.thumbnail(
@@ -1207,6 +1396,8 @@ def _prepare_transfer_image(source: Path, upload_root: Path) -> Path:
                 and max(width, height) <= TRANSFER_IMAGE_MAX_EDGE
             ):
                 return source
+            with transfer_cache_lock:
+                target.touch()
             return target
     except HTTPException:
         raise
@@ -1220,11 +1411,13 @@ def _prepare_transfer_image(source: Path, upload_root: Path) -> Path:
 async def _prepare_transfer_images(
     sources: list[Path], upload_root: Path
 ) -> list[Path]:
-    semaphore = asyncio.Semaphore(2)
-
     async def prepare(source: Path) -> Path:
-        async with semaphore:
-            return await asyncio.to_thread(_prepare_transfer_image, source, upload_root)
+        return await _run_bounded_thread(
+            transfer_image_prepare_semaphore,
+            _prepare_transfer_image,
+            source,
+            upload_root,
+        )
 
     return await asyncio.gather(*(prepare(source) for source in sources))
 
@@ -1235,6 +1428,15 @@ def _transfer_image_url(
     target: Path,
     upload_root: Path,
 ) -> str:
+    cache_root = (upload_root.resolve() / TRANSFER_CACHE_DIR).resolve()
+    if target.parent.resolve() == cache_root:
+        with transfer_cache_lock:
+            try:
+                target.touch()
+            except OSError as exc:
+                raise HTTPException(
+                    410, "参考图临时缓存已经失效，请重新发送"
+                ) from exc
     relative_path = target.resolve().relative_to(upload_root.resolve()).as_posix()
     token = _create_transfer_token(user_id, session_id, relative_path)
     return f"{_validated_transfer_base_url()}/api/transfer-image/{token}"
@@ -1500,26 +1702,54 @@ class CodexProtocolError(RuntimeError):
 class CodexAppServer:
     def __init__(self) -> None:
         self.process: asyncio.subprocess.Process | None = None
-        self.pending: dict[int, asyncio.Future[Any]] = {}
+        self.pending: dict[int, tuple[asyncio.Future[Any], int]] = {}
         self.streams: dict[str, asyncio.Queue[dict[str, Any]]] = {}
         self.backlog: dict[str, list[dict[str, Any]]] = {}
         self.loaded_threads: set[str] = set()
+        self._generation = 0
+        self._transport_closed = True
+        self._generation_failures: dict[int, str] = {}
+        self._turn_generations: dict[str, int] = {}
+        self._stream_generations: dict[str, int] = {}
         self._next_id = 1
         self._write_lock = asyncio.Lock()
         self._start_lock = asyncio.Lock()
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
 
+    def _transport_is_healthy(self) -> bool:
+        return bool(
+            self.process
+            and self.process.returncode is None
+            and not self._transport_closed
+            and self._reader_task
+            and not self._reader_task.done()
+        )
+
+    @staticmethod
+    async def _stop_process_instance(process: asyncio.subprocess.Process) -> None:
+        if process.returncode is not None:
+            return
+        process.terminate()
+        try:
+            await asyncio.wait_for(process.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+
     async def ensure_started(self) -> None:
-        if self.process and self.process.returncode is None:
+        if self._transport_is_healthy():
             return
         async with self._start_lock:
-            if self.process and self.process.returncode is None:
+            if self._transport_is_healthy():
                 return
+            previous = self.process
+            if previous and previous.returncode is None:
+                await self._stop_process_instance(previous)
             env = os.environ.copy()
             env["CODEX_HOME"] = str(CODEX_HOME)
             env["HOME"] = str(DATA_DIR / "home")
-            self.process = await asyncio.create_subprocess_exec(
+            process = await asyncio.create_subprocess_exec(
                 CODEX_BIN,
                 "app-server",
                 "--stdio",
@@ -1528,8 +1758,16 @@ class CodexAppServer:
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
             )
-            self._reader_task = asyncio.create_task(self._reader())
-            self._stderr_task = asyncio.create_task(self._read_stderr())
+            self.process = process
+            self._generation += 1
+            generation = self._generation
+            self._transport_closed = False
+            self._generation_failures.pop(generation, None)
+            # Threads are loaded into one app-server process. A replacement
+            # process must resume them again before starting another turn.
+            self.loaded_threads.clear()
+            self._reader_task = asyncio.create_task(self._reader(process, generation))
+            self._stderr_task = asyncio.create_task(self._read_stderr(process))
             await self.request(
                 "initialize",
                 {
@@ -1541,63 +1779,138 @@ class CodexAppServer:
             await self.notify("initialized", {})
 
     async def stop(self) -> None:
-        if self.process and self.process.returncode is None:
-            self.process.terminate()
-            try:
-                await asyncio.wait_for(self.process.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                self.process.kill()
-                await self.process.wait()
+        process = self.process
+        if process is not None:
+            await self._stop_process_instance(process)
+        if self.process is process:
+            self._transport_closed = True
 
-    async def _read_stderr(self) -> None:
-        assert self.process and self.process.stderr
-        while line := await self.process.stderr.readline():
+    async def _read_stderr(self, process: asyncio.subprocess.Process) -> None:
+        assert process.stderr
+        while line := await process.stderr.readline():
             LOG.info("codex: %s", line.decode(errors="replace").rstrip())
 
-    async def _reader(self) -> None:
-        assert self.process and self.process.stdout
-        while line := await self.process.stdout.readline():
-            try:
-                message = json.loads(line)
-            except json.JSONDecodeError:
-                LOG.warning("Ignoring malformed app-server output")
-                continue
-            if "id" in message and ("result" in message or "error" in message):
-                future = self.pending.pop(message["id"], None)
-                if future and not future.done():
-                    if "error" in message:
-                        future.set_exception(CodexProtocolError(message["error"].get("message", "Codex 请求失败")))
-                    else:
-                        future.set_result(message.get("result"))
-                continue
-            if "id" in message and "method" in message:
-                await self._decline_server_request(message)
-                continue
-            method = message.get("method", "")
-            params = message.get("params") or {}
-            turn_id = params.get("turnId") or (params.get("turn") or {}).get("id")
-            if turn_id:
-                event = {"method": method, "params": params}
-                queue = self.streams.get(turn_id)
-                if queue:
-                    await queue.put(event)
-                else:
-                    self.backlog.setdefault(turn_id, []).append(event)
+    @staticmethod
+    def _disconnect_event(message: str) -> dict[str, Any]:
+        return {
+            "method": "codex/appServerDisconnected",
+            "params": {
+                "message": message,
+                "recoverable": True,
+                "code": "codex_app_server_disconnected",
+            },
+        }
 
-    async def _decline_server_request(self, message: dict[str, Any]) -> None:
+    async def _reader(
+        self,
+        process: asyncio.subprocess.Process,
+        generation: int,
+    ) -> None:
+        assert process.stdout
+        failure_message = "Codex 后台进程连接意外中断，请重试"
+        try:
+            while line := await process.stdout.readline():
+                try:
+                    message = json.loads(line)
+                except json.JSONDecodeError:
+                    LOG.warning("Ignoring malformed app-server output")
+                    continue
+                if "id" in message and ("result" in message or "error" in message):
+                    pending = self.pending.get(message["id"])
+                    if pending and pending[1] == generation:
+                        self.pending.pop(message["id"], None)
+                        future = pending[0]
+                        if not future.done():
+                            if "error" in message:
+                                error = message.get("error") or {}
+                                future.set_exception(
+                                    CodexProtocolError(
+                                        error.get("message", "Codex 请求失败")
+                                    )
+                                )
+                            else:
+                                result = message.get("result")
+                                if isinstance(result, dict):
+                                    turn = result.get("turn")
+                                    turn_id = (
+                                        str(turn.get("id") or "")
+                                        if isinstance(turn, dict)
+                                        else ""
+                                    )
+                                    if turn_id:
+                                        self._turn_generations[turn_id] = generation
+                                future.set_result(result)
+                    continue
+                if "id" in message and "method" in message:
+                    await self._decline_server_request(message, process)
+                    continue
+                method = message.get("method", "")
+                params = message.get("params") or {}
+                turn_id = params.get("turnId") or (params.get("turn") or {}).get("id")
+                if turn_id:
+                    turn_id = str(turn_id)
+                    self._turn_generations.setdefault(turn_id, generation)
+                    event = {"method": method, "params": params}
+                    queue = self.streams.get(turn_id)
+                    if (
+                        queue is not None
+                        and self._stream_generations.get(turn_id) == generation
+                    ):
+                        await queue.put(event)
+                    else:
+                        self.backlog.setdefault(turn_id, []).append(event)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOG.exception("Codex app-server reader failed")
+        finally:
+            self._generation_failures[generation] = failure_message
+            for request_id, pending in list(self.pending.items()):
+                future, pending_generation = pending
+                if pending_generation != generation:
+                    continue
+                if self.pending.get(request_id) is pending:
+                    self.pending.pop(request_id, None)
+                if not future.done():
+                    future.set_exception(CodexProtocolError(failure_message))
+            disconnect = self._disconnect_event(failure_message)
+            for turn_id, queue in list(self.streams.items()):
+                if self._stream_generations.get(turn_id) == generation:
+                    queue.put_nowait(disconnect)
+            if self.process is process and self._generation == generation:
+                self._transport_closed = True
+
+    async def _decline_server_request(
+        self,
+        message: dict[str, Any],
+        process: asyncio.subprocess.Process,
+    ) -> None:
         method = message.get("method", "")
         if "requestApproval" in method or "request_approval" in method:
             result: dict[str, Any] = {"decision": "decline"}
         else:
             result = {"error": "此私人聊天站未启用交互式工具"}
-        await self._write({"id": message["id"], "result": result})
+        await self._write({"id": message["id"], "result": result}, process)
 
-    async def _write(self, payload: dict[str, Any]) -> None:
-        assert self.process and self.process.stdin
+    async def _write(
+        self,
+        payload: dict[str, Any],
+        process: asyncio.subprocess.Process | None = None,
+    ) -> None:
+        target = process or self.process
+        if target is None or target.stdin is None or target.returncode is not None:
+            raise CodexProtocolError("Codex 后台进程未连接，请重试")
         data = (json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
-        async with self._write_lock:
-            self.process.stdin.write(data)
-            await self.process.stdin.drain()
+        try:
+            async with self._write_lock:
+                if target.returncode is not None:
+                    raise CodexProtocolError("Codex 后台进程连接已经中断，请重试")
+                target.stdin.write(data)
+                await target.stdin.drain()
+        except CodexProtocolError:
+            raise
+        except (BrokenPipeError, ConnectionError, OSError) as exc:
+            raise CodexProtocolError("Codex 后台进程连接已经中断，请重试") from exc
 
     async def request(self, method: str, params: dict[str, Any] | None = None, timeout: int = 60) -> Any:
         if method != "initialize":
@@ -1605,26 +1918,45 @@ class CodexAppServer:
         request_id = self._next_id
         self._next_id += 1
         future = asyncio.get_running_loop().create_future()
-        self.pending[request_id] = future
-        await self._write({"id": request_id, "method": method, "params": params or {}})
+        process = self.process
+        generation = self._generation
+        if process is None or self._transport_closed:
+            raise CodexProtocolError("Codex 后台进程未连接，请重试")
+        pending = (future, generation)
+        self.pending[request_id] = pending
         try:
+            await self._write(
+                {"id": request_id, "method": method, "params": params or {}},
+                process,
+            )
             return await asyncio.wait_for(future, timeout=timeout)
         finally:
-            self.pending.pop(request_id, None)
+            if self.pending.get(request_id) is pending:
+                self.pending.pop(request_id, None)
 
     async def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
-        await self._write({"method": method, "params": params or {}})
+        process = self.process
+        if process is None or self._transport_closed:
+            raise CodexProtocolError("Codex 后台进程未连接，请重试")
+        await self._write({"method": method, "params": params or {}}, process)
 
     def register_stream(self, turn_id: str) -> asyncio.Queue[dict[str, Any]]:
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        generation = self._turn_generations.get(turn_id, self._generation)
         self.streams[turn_id] = queue
+        self._stream_generations[turn_id] = generation
         for event in self.backlog.pop(turn_id, []):
             queue.put_nowait(event)
+        failure = self._generation_failures.get(generation)
+        if failure:
+            queue.put_nowait(self._disconnect_event(failure))
         return queue
 
     def unregister_stream(self, turn_id: str) -> None:
         self.streams.pop(turn_id, None)
         self.backlog.pop(turn_id, None)
+        self._stream_generations.pop(turn_id, None)
+        self._turn_generations.pop(turn_id, None)
 
 
 @dataclass
@@ -1642,6 +1974,223 @@ class ResumableExternalTurn:
     condition: asyncio.Condition = field(default_factory=asyncio.Condition)
 
 
+def _ensure_resumable_tables(database: sqlite3.Connection) -> None:
+    database.execute(
+        """CREATE TABLE IF NOT EXISTS resumable_turns (
+            user_id TEXT NOT NULL,
+            client_turn_id TEXT NOT NULL,
+            fingerprint TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            terminal INTEGER NOT NULL DEFAULT 0,
+            event_bytes INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            PRIMARY KEY(user_id, client_turn_id)
+        )"""
+    )
+    database.execute(
+        """CREATE TABLE IF NOT EXISTS resumable_turn_events (
+            user_id TEXT NOT NULL,
+            client_turn_id TEXT NOT NULL,
+            cursor INTEGER NOT NULL,
+            payload BLOB NOT NULL,
+            PRIMARY KEY(user_id, client_turn_id, cursor)
+        )"""
+    )
+    database.execute(
+        """CREATE TABLE IF NOT EXISTS resumable_stop_tombstones (
+            user_id TEXT NOT NULL,
+            client_turn_id TEXT NOT NULL,
+            stopped_at REAL NOT NULL,
+            PRIMARY KEY(user_id, client_turn_id)
+        )"""
+    )
+
+
+def _persist_resumable_start_sync(record: ResumableExternalTurn) -> None:
+    with _database_connection() as database:
+        _ensure_resumable_tables(database)
+        database.execute(
+            "DELETE FROM resumable_turn_events WHERE user_id = ? AND client_turn_id = ?",
+            (record.user_id, record.client_turn_id),
+        )
+        database.execute(
+            """INSERT OR REPLACE INTO resumable_turns
+            (user_id, client_turn_id, fingerprint, kind, terminal, event_bytes,
+             created_at, updated_at)
+            VALUES (?, ?, ?, ?, 0, 0, ?, ?)""",
+            (
+                record.user_id,
+                record.client_turn_id,
+                record.fingerprint,
+                record.kind,
+                record.created_at,
+                record.updated_at,
+            ),
+        )
+
+
+def _persist_resumable_event_sync(
+    record: ResumableExternalTurn,
+    cursor: int,
+    encoded: bytes,
+) -> None:
+    with _database_connection() as database:
+        _ensure_resumable_tables(database)
+        database.execute(
+            """INSERT OR REPLACE INTO resumable_turn_events
+            (user_id, client_turn_id, cursor, payload) VALUES (?, ?, ?, ?)""",
+            (record.user_id, record.client_turn_id, cursor, encoded),
+        )
+        database.execute(
+            """UPDATE resumable_turns
+            SET terminal = ?, event_bytes = ?, updated_at = ?
+            WHERE user_id = ? AND client_turn_id = ?""",
+            (
+                int(record.terminal),
+                record.event_bytes,
+                record.updated_at,
+                record.user_id,
+                record.client_turn_id,
+            ),
+        )
+
+
+def _persist_resumable_tombstone_sync(
+    user_id: str, client_turn_id: str, stopped_at: float
+) -> None:
+    with _database_connection() as database:
+        _ensure_resumable_tables(database)
+        database.execute(
+            """INSERT OR REPLACE INTO resumable_stop_tombstones
+            (user_id, client_turn_id, stopped_at) VALUES (?, ?, ?)""",
+            (user_id, client_turn_id, stopped_at),
+        )
+
+
+def _delete_persisted_resumable_sync(
+    keys: list[tuple[str, str]],
+) -> None:
+    if not keys:
+        return
+    with _database_connection() as database:
+        _ensure_resumable_tables(database)
+        database.executemany(
+            "DELETE FROM resumable_turn_events WHERE user_id = ? AND client_turn_id = ?",
+            keys,
+        )
+        database.executemany(
+            "DELETE FROM resumable_turns WHERE user_id = ? AND client_turn_id = ?",
+            keys,
+        )
+
+
+def _purge_persisted_resumable_sync(now: float) -> None:
+    turn_cutoff = now - EXTERNAL_RESUME_TTL_SECONDS
+    tombstone_cutoff = now - RESUMABLE_STOP_TOMBSTONE_TTL_SECONDS
+    with _database_connection() as database:
+        _ensure_resumable_tables(database)
+        expired = [
+            (str(row[0]), str(row[1]))
+            for row in database.execute(
+                "SELECT user_id, client_turn_id FROM resumable_turns "
+                "WHERE terminal = 1 AND updated_at <= ?",
+                (turn_cutoff,),
+            )
+        ]
+        if expired:
+            database.executemany(
+                "DELETE FROM resumable_turn_events "
+                "WHERE user_id = ? AND client_turn_id = ?",
+                expired,
+            )
+            database.executemany(
+                "DELETE FROM resumable_turns WHERE user_id = ? AND client_turn_id = ?",
+                expired,
+            )
+        database.execute(
+            "DELETE FROM resumable_stop_tombstones WHERE stopped_at <= ?",
+            (tombstone_cutoff,),
+        )
+
+
+def _restore_resumable_turns_sync(
+    now: float | None = None,
+) -> tuple[
+    dict[tuple[str, str], ResumableExternalTurn],
+    dict[tuple[str, str], float],
+]:
+    current = time.time() if now is None else now
+    _purge_persisted_resumable_sync(current)
+    restored: dict[tuple[str, str], ResumableExternalTurn] = {}
+    tombstones: dict[tuple[str, str], float] = {}
+    interrupted: list[tuple[ResumableExternalTurn, int, bytes]] = []
+    with _database_connection() as database:
+        _ensure_resumable_tables(database)
+        rows = list(
+            database.execute(
+                """SELECT user_id, client_turn_id, fingerprint, kind, terminal,
+                event_bytes, created_at, updated_at
+                FROM resumable_turns ORDER BY updated_at DESC LIMIT ?""",
+                (EXTERNAL_RESUME_MAX_TURNS,),
+            )
+        )
+        for row in rows:
+            user_id, client_turn_id, fingerprint, kind = map(str, row[:4])
+            if (
+                not CLIENT_TURN_ID_RE.fullmatch(client_turn_id)
+                or not re.fullmatch(r"[a-f0-9]{64}", fingerprint)
+                or kind not in {"external", "image", "codex"}
+            ):
+                continue
+            events = [
+                bytes(event_row[0])
+                for event_row in database.execute(
+                    """SELECT payload FROM resumable_turn_events
+                    WHERE user_id = ? AND client_turn_id = ?
+                    ORDER BY cursor ASC""",
+                    (user_id, client_turn_id),
+                )
+                if isinstance(event_row[0], (bytes, bytearray))
+            ]
+            record = ResumableExternalTurn(
+                user_id=user_id,
+                client_turn_id=client_turn_id,
+                fingerprint=fingerprint,
+                kind=kind,
+                created_at=float(row[6]),
+                updated_at=float(row[7]),
+                events=events,
+                event_bytes=sum(len(event) for event in events),
+                terminal=bool(row[4]),
+            )
+            if not record.terminal:
+                event = {
+                    "type": "error",
+                    "message": "服务重启中断了未完成的回答，请重新发送",
+                    "cursor": len(record.events) + 1,
+                }
+                encoded = _ndjson(event)
+                record.events.append(encoded)
+                record.event_bytes += len(encoded)
+                record.updated_at = current
+                record.terminal = True
+                interrupted.append((record, len(record.events), encoded))
+            restored[(user_id, client_turn_id)] = record
+        for row in database.execute(
+            "SELECT user_id, client_turn_id, stopped_at "
+            "FROM resumable_stop_tombstones WHERE stopped_at > ?",
+            (current - RESUMABLE_STOP_TOMBSTONE_TTL_SECONDS,),
+        ):
+            tombstones[(str(row[0]), str(row[1]))] = float(row[2])
+    # Persist restart-interruption markers after the read connection is closed.
+    # Opening a second writer from inside the read transaction can otherwise
+    # produce a transient ``database is locked`` error during startup.
+    for record, cursor, encoded in interrupted:
+        _persist_resumable_event_sync(record, cursor, encoded)
+    return restored, tombstones
+
+
 codex = CodexAppServer()
 login_attempts: dict[str, dict[str, float | int]] = {}
 provider_write_lock = asyncio.Lock()
@@ -1655,10 +2204,56 @@ resumable_stop_tombstones: dict[tuple[str, str], float] = {}
 resumable_external_turns_lock = asyncio.Lock()
 external_conversation_locks: dict[tuple[str, str], asyncio.Lock] = {}
 external_conversation_states: dict[tuple[str, str], dict[str, str]] = {}
+codex_workspace_locks: dict[tuple[str, str], asyncio.Lock] = {}
 image_turns: dict[str, tuple[str, asyncio.Task[Any]]] = {}
 image_variant_lock = asyncio.Lock()
 attachment_extract_semaphore = asyncio.Semaphore(2)
+transfer_image_prepare_semaphore = asyncio.Semaphore(2)
+transfer_cache_lock = threading.Lock()
 image_variant_tasks: set[asyncio.Task[Any]] = set()
+bounded_thread_tasks: set[asyncio.Task[Any]] = set()
+
+
+def _consume_bounded_thread_result(task: asyncio.Task[Any]) -> None:
+    bounded_thread_tasks.discard(task)
+    if task.cancelled():
+        return
+    try:
+        task.exception()
+    except (asyncio.CancelledError, Exception):
+        # The original caller observes the exception when still connected.
+        # If it was cancelled, consuming it here avoids a late warning.
+        pass
+
+
+async def _run_bounded_thread(
+    semaphore: asyncio.Semaphore,
+    function: Any,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """Run blocking transfer work without releasing capacity on cancellation."""
+    await semaphore.acquire()
+    loop = asyncio.get_running_loop()
+
+    def run() -> Any:
+        try:
+            return function(*args, **kwargs)
+        finally:
+            try:
+                loop.call_soon_threadsafe(semaphore.release)
+            except RuntimeError:
+                # The process is already tearing down after its drain deadline.
+                pass
+
+    try:
+        task = asyncio.create_task(asyncio.to_thread(run))
+    except BaseException:
+        semaphore.release()
+        raise
+    bounded_thread_tasks.add(task)
+    task.add_done_callback(_consume_bounded_thread_result)
+    return await asyncio.shield(task)
 
 
 async def _clear_external_conversation_state(user_id: str, conversation_id: str | None) -> None:
@@ -1718,27 +2313,89 @@ def _record_login_failure(client: str, now: float) -> tuple[bool, int]:
     return False, LOGIN_MAX_FAILURES - failures
 
 
+def _cleanup_transfer_cache(
+    upload_root: Path, *, now: float | None = None
+) -> int:
+    cache_root = (upload_root / TRANSFER_CACHE_DIR).resolve()
+    if not cache_root.is_dir():
+        return 0
+    cutoff = (time.time() if now is None else now) - TRANSFER_CACHE_RETENTION_SECONDS
+    removed = 0
+    with transfer_cache_lock:
+        try:
+            candidates = list(cache_root.iterdir())
+        except OSError:
+            return 0
+        for target in candidates:
+            try:
+                if target.is_file() and target.stat().st_mtime < cutoff:
+                    target.unlink()
+                    removed += 1
+            except OSError:
+                # An active FileResponse can hold the file open on Windows.
+                # Leave it for the next cleanup pass.
+                continue
+    return removed
+
+
 async def _cleanup_loop() -> None:
     while True:
         await asyncio.sleep(60 * 60)
-        cutoff = time.time() - SESSION_TTL_SECONDS
-        for user_root in WORKSPACE_ROOT.iterdir():
-            if not user_root.is_dir() or not SESSION_RE.fullmatch(user_root.name):
-                continue
-            for child in user_root.iterdir():
-                if child.is_dir() and SESSION_RE.fullmatch(child.name) and child.stat().st_mtime < cutoff:
-                    shutil.rmtree(child)
-        with _database_connection() as database:
-            database.execute(
-                "DELETE FROM message_events WHERE created_at <= ?",
-                (int(time.time()) - MESSAGE_LIMIT_WINDOW_SECONDS,),
-            )
-        await _cleanup_resumable_external_turns()
+        try:
+            cutoff = time.time() - SESSION_TTL_SECONDS
+            for user_root in WORKSPACE_ROOT.iterdir():
+                if not user_root.is_dir() or not SESSION_RE.fullmatch(user_root.name):
+                    continue
+                for child in user_root.iterdir():
+                    if not child.is_dir() or not SESSION_RE.fullmatch(child.name):
+                        continue
+                    if child.stat().st_mtime < cutoff:
+                        shutil.rmtree(child)
+                        continue
+                    upload_root = child / "uploads"
+                    if upload_root.is_dir():
+                        _cleanup_stale_uploads(upload_root)
+                        _cleanup_transfer_cache(upload_root)
+            with _database_connection() as database:
+                database.execute(
+                    "DELETE FROM message_events WHERE created_at <= ?",
+                    (int(time.time()) - MESSAGE_LIMIT_WINDOW_SECONDS,),
+                )
+            await _cleanup_resumable_external_turns()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # A workspace may disappear while an account/session is being
+            # removed. Keep the periodic cleaner alive for the next pass.
+            LOG.exception("Periodic workspace cleanup failed")
+
+
+async def _drain_background_tasks(tasks: set[asyncio.Task[Any]]) -> None:
+    """Let in-flight answer/file tasks finish before a planned service stop."""
+    pending = {task for task in tasks if not task.done()}
+    if pending:
+        LOG.info("Waiting for %d background transfer task(s) to finish", len(pending))
+        _done, pending = await asyncio.wait(
+            pending,
+            timeout=SHUTDOWN_DRAIN_TIMEOUT_SECONDS,
+        )
+    for task in pending:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     _prepare_directories()
+    try:
+        restored_turns, restored_tombstones = await asyncio.to_thread(
+            _restore_resumable_turns_sync
+        )
+        resumable_external_turns.update(restored_turns)
+        resumable_stop_tombstones.update(restored_tombstones)
+    except Exception:
+        LOG.exception("Unable to restore resumable answer records")
     cleanup = asyncio.create_task(_cleanup_loop())
     try:
         yield
@@ -1757,18 +2414,17 @@ async def lifespan(_: FastAPI):
             if record.task is not None and record.task is not current
         )
         active_tasks.update(task for task in image_variant_tasks if task is not current)
-        for task in active_tasks:
-            if not task.done():
-                task.cancel()
-        if active_tasks:
-            await asyncio.gather(*active_tasks, return_exceptions=True)
+        active_tasks.update(task for task in bounded_thread_tasks if task is not current)
+        await _drain_background_tasks(active_tasks)
         external_turns.clear()
         resumable_external_turns.clear()
         resumable_stop_tombstones.clear()
         image_turns.clear()
         image_variant_tasks.clear()
+        bounded_thread_tasks.clear()
         external_conversation_locks.clear()
         external_conversation_states.clear()
+        codex_workspace_locks.clear()
         chunk_upload_locks.clear()
         chunk_upload_lock_times.clear()
         await codex.stop()
@@ -2882,7 +3538,7 @@ async def upload_files(
                 raise HTTPException(400, "上传暂存路径无效")
             size, batch_size = await _stream_upload_to_path(upload, temporary, batch_size)
             while True:
-                stored_name = f"{uuid.uuid4().hex[:10]}-{original}"
+                stored_name = _stored_upload_name(original)
                 target = (upload_root / stored_name).resolve()
                 if target.parent == upload_root and not target.exists():
                     break
@@ -2915,7 +3571,7 @@ async def init_chunk_upload(request: Request, payload: ChunkUploadInitRequest):
     while True:
         upload_id = uuid.uuid4().hex
         part_path, metadata_path = _chunk_upload_paths(upload_root, upload_id)
-        stored_name = f"{uuid.uuid4().hex[:10]}-{original}"
+        stored_name = _stored_upload_name(original)
         final_path = (upload_root / stored_name).resolve()
         if not part_path.exists() and not metadata_path.exists() and not final_path.exists():
             break
@@ -3047,6 +3703,36 @@ async def complete_chunk_upload(
             result["source"] = "composer_text"
             result["preview"] = _composer_text_preview(final_path, str(metadata["original"]))
     return {"files": [result]}
+
+
+@app.delete("/api/uploads/{upload_id}")
+async def cancel_chunk_upload(request: Request, upload_id: str, session_id: str):
+    """Idempotently remove a cancelled or failed chunked upload."""
+    user = _require_auth(request)
+    root = _session_path(user["id"], session_id)
+    upload_root = (root / "uploads").resolve()
+    part_path, metadata_path = _chunk_upload_paths(upload_root, upload_id)
+    lock = _chunk_upload_lock(upload_id)
+    async with lock:
+        final_path: Path | None = None
+        try:
+            _metadata, part_path, metadata_path, final_path = _load_chunk_upload(
+                upload_root, upload_id
+            )
+        except HTTPException as exc:
+            if exc.status_code != 404:
+                raise
+        await _await_upload_io(
+            _remove_paths,
+            *(
+                path
+                for path in (part_path, metadata_path, final_path)
+                if path is not None
+            ),
+        )
+    chunk_upload_locks.pop(upload_id, None)
+    chunk_upload_lock_times.pop(upload_id, None)
+    return {"ok": True}
 
 @app.get("/api/transfer-image/{token}")
 async def transfer_image(token: str):
@@ -3235,7 +3921,7 @@ def _cloud_context_history(user_id: str, conversation_id: str | None) -> list[Hi
         result.append(HistoryMessage(
             id=message_id if SESSION_RE.fullmatch(message_id) else None,
             role=item["role"],
-            content=content[:60_000],
+            content=_clip_context_text(content, 60_000),
         ))
     return result[-MAX_CLOUD_MESSAGES:]
 
@@ -3830,13 +4516,13 @@ async def _attachment_inputs_async(
     workspace: Path,
     **options: Any,
 ) -> list[dict[str, Any]]:
-    async with attachment_extract_semaphore:
-        return await asyncio.to_thread(
-            _attachment_inputs,
-            payload,
-            workspace,
-            **options,
-        )
+    return await _run_bounded_thread(
+        attachment_extract_semaphore,
+        _attachment_inputs,
+        payload,
+        workspace,
+        **options,
+    )
 
 
 def _payload_has_images(payload: TurnRequest, workspace: Path) -> bool:
@@ -4554,7 +5240,12 @@ def _openai_image_candidates(
     candidates: list[dict[str, str]] = []
     seen: set[str] = set()
 
-    def add_candidate(url_value: Any, name_value: Any = "image") -> None:
+    def add_candidate(
+        url_value: Any,
+        name_value: Any = "image",
+        asset_type: str = "image",
+        mime_type: Any = "",
+    ) -> None:
         url = str(url_value or "").strip()
         if (
             not url
@@ -4563,22 +5254,40 @@ def _openai_image_candidates(
         ):
             return
         seen.add(url)
-        candidates.append({
+        candidate = {
             "url": url,
             "name": _safe_filename(str(name_value or "image")),
-        })
+        }
+        if asset_type == "file":
+            candidate["type"] = "file"
+            normalized_mime = str(mime_type or "").split(";", 1)[0].strip().lower()
+            if 0 < len(normalized_mime) <= 100 and "/" in normalized_mime:
+                candidate["mime_type"] = normalized_mime
+        candidates.append(candidate)
 
     for container in containers:
         attachments = container.get("attachments")
         if isinstance(attachments, list):
             for attachment in attachments:
-                if not isinstance(attachment, dict) or attachment.get("type") != "image":
+                if not isinstance(attachment, dict):
                     continue
-                add_candidate(attachment.get("url"), attachment.get("name"))
+                asset_type = str(attachment.get("type") or "").lower()
+                if asset_type not in {"image", "file"}:
+                    continue
+                add_candidate(
+                    attachment.get("url"),
+                    attachment.get("name") or ("image" if asset_type == "image" else "attachment"),
+                    asset_type,
+                    attachment.get("mime_type"),
+                )
         content = container.get("content")
         if isinstance(content, str):
             for match in EXTERNAL_ASSET_MARKDOWN_RE.finditer(content):
-                add_candidate(match.group(2), match.group(1))
+                add_candidate(
+                    match.group(3),
+                    match.group(2),
+                    "image" if match.group(1) else "file",
+                )
     return candidates
 
 
@@ -4634,6 +5343,7 @@ async def _persist_external_image(
     workspace: Path,
 ) -> dict[str, Any]:
     url = await _validated_external_asset_url(candidate["url"], provider_base)
+    is_image = str(candidate.get("type") or "image").lower() != "file"
     output_root = (workspace / "outputs").resolve()
     output_root.mkdir(parents=True, exist_ok=True)
     temporary = output_root / f".external-{uuid.uuid4().hex}.part"
@@ -4645,38 +5355,86 @@ async def _persist_external_image(
                 async with client.stream(
                     "GET",
                     url,
-                    headers={"accept": "image/avif,image/webp,image/png,image/jpeg,*/*;q=0.1"},
+                    headers={
+                        "accept": (
+                            "image/avif,image/webp,image/png,image/jpeg,*/*;q=0.1"
+                            if is_image
+                            else "*/*"
+                        )
+                    },
                 ) as response:
                     if response.status_code != 200:
                         if response.status_code in EXTERNAL_ASSET_RETRYABLE_STATUS_CODES:
                             last_error = RuntimeError(
-                                f"图片下载服务暂时不可用（{response.status_code}）"
+                                f"附件下载服务暂时不可用（{response.status_code}）"
                             )
                             if attempt + 1 < EXTERNAL_ASSET_DOWNLOAD_ATTEMPTS:
                                 await asyncio.sleep(0.5 * (2 ** attempt))
                                 continue
-                        raise RuntimeError(f"图片下载失败（{response.status_code}）")
+                        raise RuntimeError(f"附件下载失败（{response.status_code}）")
                     try:
                         content_length = int(response.headers.get("content-length") or 0)
                     except (TypeError, ValueError):
                         content_length = 0
                     if content_length > MAX_OUTPUT_FILE_BYTES:
-                        raise RuntimeError("生成图片超过 30 MB")
+                        raise RuntimeError("生成附件超过 30 MB")
                     size = 0
                     content_hash = hashlib.sha256()
                     with temporary.open("wb") as output:
                         async for chunk in response.aiter_bytes(64 * 1024):
                             size += len(chunk)
                             if size > MAX_OUTPUT_FILE_BYTES:
-                                raise RuntimeError("生成图片超过 30 MB")
+                                raise RuntimeError("生成附件超过 30 MB")
                             output.write(chunk)
                             content_hash.update(chunk)
                 if size == 0:
-                    last_error = RuntimeError("生成图片为空")
+                    last_error = RuntimeError("生成附件为空")
                     if attempt + 1 < EXTERNAL_ASSET_DOWNLOAD_ATTEMPTS:
                         await asyncio.sleep(0.5 * (2 ** attempt))
                         continue
                     break
+                content_encoding = str(
+                    response.headers.get("content-encoding") or ""
+                ).strip().lower()
+                if (
+                    content_length
+                    and content_encoding in {"", "identity"}
+                    and size != content_length
+                ):
+                    last_error = RuntimeError("生成附件下载不完整")
+                    if attempt + 1 < EXTERNAL_ASSET_DOWNLOAD_ATTEMPTS:
+                        await asyncio.sleep(0.5 * (2 ** attempt))
+                        continue
+                    break
+                response_type = str(response.headers.get("content-type") or "")
+                response_type = response_type.split(";", 1)[0].strip().lower()
+                digest = content_hash.hexdigest()
+                if not is_image:
+                    original = _safe_filename(candidate.get("name") or "attachment")
+                    suffix = Path(original).suffix.lower()
+                    if not suffix:
+                        guessed = mimetypes.guess_extension(response_type) or ".bin"
+                        suffix = guessed if re.fullmatch(r"\.[a-z0-9]{1,12}", guessed) else ".bin"
+                        original = _safe_filename(original + suffix)
+                    media_type = (
+                        response_type
+                        if 0 < len(response_type) <= 100 and "/" in response_type
+                        else (mimetypes.guess_type(original)[0] or "application/octet-stream")
+                    )
+                    storage_name = f"external-{digest}{suffix}"
+                    target = (output_root / storage_name).resolve()
+                    if target.parent != output_root:
+                        raise RuntimeError("附件输出路径无效")
+                    if not target.is_file():
+                        os.replace(temporary, target)
+                    target.chmod(0o600)
+                    return {
+                        "name": original,
+                        "size": size,
+                        "path": storage_name,
+                        "mediaType": media_type,
+                        "inline": False,
+                    }
                 try:
                     image_format, width, height = await asyncio.to_thread(
                         _inspect_image_file, temporary
@@ -4698,7 +5456,6 @@ async def _persist_external_image(
                     raise RuntimeError("图片服务返回了不支持的格式")
                 extension, media_type = formats[image_format]
                 stem = Path(_safe_filename(candidate.get("name") or "image")).stem[:80]
-                digest = content_hash.hexdigest()
                 filename = f"{stem or 'image'}-{digest[:10]}{extension}"
                 storage_name = f"external-{digest}{extension}"
                 target = (output_root / storage_name).resolve()
@@ -4725,7 +5482,7 @@ async def _persist_external_image(
                     await asyncio.sleep(0.5 * (2 ** attempt))
                     continue
                 break
-        raise RuntimeError("生成图片下载失败，请稍后重试") from last_error
+        raise RuntimeError("生成附件下载失败，请稍后重试") from last_error
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -4873,6 +5630,7 @@ async def _external_response_stream(
         response_parts: list[str] = []
         asset_candidates: dict[str, dict[str, str]] = {}
         token_usage: dict[str, Any] | None = None
+        authoritative_final_text: str | None = None
         captured_conversation_id = ""
         terminal_success = False
         async with httpx.AsyncClient(timeout=httpx.Timeout(920.0, connect=15.0), follow_redirects=False) as client:
@@ -4890,6 +5648,10 @@ async def _external_response_stream(
                         yield _ndjson({"type": "error", "message": "API 返回的回答格式无效"})
                         return
                     if isinstance(data, dict):
+                        if protocol != "anthropic" and isinstance(
+                            data.get("final_text"), str
+                        ):
+                            authoritative_final_text = data["final_text"]
                         stream_error = _openai_stream_error(data) if protocol != "anthropic" else ""
                         if stream_error:
                             yield _ndjson({"type": "error", "message": stream_error})
@@ -4938,6 +5700,10 @@ async def _external_response_stream(
                         except json.JSONDecodeError:
                             continue
                         if isinstance(data, dict):
+                            if protocol != "anthropic" and isinstance(
+                                data.get("final_text"), str
+                            ):
+                                authoritative_final_text = data["final_text"]
                             stream_error = _openai_stream_error(data) if protocol != "anthropic" else ""
                             if data.get("type") == "error" and protocol == "anthropic":
                                 error = data.get("error") if isinstance(data.get("error"), dict) else {}
@@ -4989,27 +5755,57 @@ async def _external_response_stream(
                 candidates = list(asset_candidates.values())
                 files: list[dict[str, Any]] = []
                 failed_assets = 0
-                final_text = "".join(response_parts)
+                streamed_text = "".join(response_parts)
+                visible_streamed_text = (
+                    _strip_external_asset_markdown(streamed_text, candidates)
+                    if candidates
+                    else streamed_text
+                )
+                final_source_text = (
+                    authoritative_final_text
+                    if authoritative_final_text is not None
+                    else streamed_text
+                )
+                final_text = (
+                    _strip_external_asset_markdown(final_source_text, candidates)
+                    if candidates
+                    else final_source_text
+                )
                 if candidates:
-                    final_text = _strip_external_asset_markdown(
-                        final_text, candidates
-                    )
                     files, failed_assets = await _persist_external_images(
                         candidates, str(provider["baseUrl"]), workspace
                     )
+                    has_images = any(
+                        str(item.get("mediaType") or "").startswith("image/")
+                        for item in files
+                    )
+                    has_documents = any(
+                        not str(item.get("mediaType") or "").startswith("image/")
+                        for item in files
+                    )
                     if files and not final_text:
-                        final_text = "图片已生成。"
+                        final_text = "图片已生成。" if has_images and not has_documents else "文件已生成。"
                     if failed_assets:
                         notice = (
-                            "部分图片保存失败，请稍后重试。"
+                            "部分附件保存失败，请稍后重试。"
                             if files
-                            else "图片已生成，但下载到网站失败，请稍后重试。"
+                            else "附件已生成，但下载到网站失败，请稍后重试。"
                         )
                         final_text = "\n\n".join(
                             part for part in (final_text, notice) if part
                         )
+                if (
+                    candidates
+                    or failed_assets
+                    or (
+                        authoritative_final_text is not None
+                        and final_text != visible_streamed_text
+                    )
+                ):
                     yield _ndjson({"type": "replace", "text": final_text})
                     delivered = bool(final_text)
+                else:
+                    delivered = delivered or bool(final_text)
                 if delivered or files:
                     usage = _turn_usage(payload, final_text, token_usage)
                     event = {
@@ -5018,7 +5814,10 @@ async def _external_response_stream(
                         "usage": usage,
                         "cost": _turn_cost(usage, provider),
                     }
-                    if files:
+                    if any(
+                        str(item.get("mediaType") or "").startswith("image/")
+                        for item in files
+                    ):
                         event["mode"] = "image"
                     committed_conversation_id = (
                         captured_conversation_id or _valid_external_conversation_id(reuse_conversation_id)
@@ -5115,7 +5914,7 @@ async def _external_stream(
             async for event in _iter_with_heartbeat(run_serialized()):
                 yield _ndjson({"type": "ping"}) if event is None else event
     except TimeoutError:
-        yield _ndjson({"type": "error", "message": "API 回答超过 20 分钟，已自动停止"})
+        yield _ndjson({"type": "error", "message": "API 回答超过 40 分钟，已自动停止"})
     finally:
         external_turns.pop(turn_id, None)
 
@@ -5150,6 +5949,165 @@ def _image_turn_fingerprint(payload: TurnRequest) -> str:
     return hashlib.sha256(canonical).hexdigest()
 
 
+def _codex_turn_fingerprint(payload: TurnRequest) -> str:
+    if hasattr(payload, "model_dump"):
+        body = payload.model_dump(mode="json", exclude={"client_turn_id"})
+    else:
+        body = payload.dict(exclude={"client_turn_id"})
+    canonical = json.dumps(
+        {"kind": "codex", "payload": body},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+async def _codex_response_stream_body(
+    payload: TurnRequest,
+    workspace: Path,
+    user_id: str,
+) -> AsyncIterator[bytes]:
+    turn_id = ""
+    output_baseline = _output_file_snapshot(workspace)
+    response_parts: list[str] = []
+    try:
+        inputs = await _attachment_inputs_async(
+            payload,
+            workspace,
+            max_text_chars=MAX_CONTEXT_TEXT_CHARS,
+        )
+        thread_id = await _ensure_thread(payload, workspace, user_id)
+        result = await codex.request(
+            "turn/start",
+            {
+                "threadId": thread_id,
+                "input": inputs,
+                "model": payload.model,
+                "effort": payload.effort,
+                "approvalPolicy": "never",
+                "sandboxPolicy": {
+                    "type": "workspaceWrite",
+                    "writableRoots": [str(workspace)],
+                    "networkAccess": False,
+                    "excludeSlashTmp": True,
+                    "excludeTmpdirEnvVar": True,
+                },
+                "runtimeWorkspaceRoots": [str(workspace)],
+            },
+            timeout=45,
+        )
+        turn_id = result["turn"]["id"]
+        queue = codex.register_stream(turn_id)
+        yield _ndjson({"type": "started", "threadId": thread_id, "turnId": turn_id})
+        while True:
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=15)
+            except asyncio.TimeoutError:
+                yield _ndjson({"type": "ping"})
+                continue
+            method = str(event.get("method") or "")
+            params = event.get("params") or {}
+            if method == "codex/appServerDisconnected":
+                yield _ndjson(
+                    {
+                        "type": "error",
+                        "message": params.get(
+                            "message", "Codex 后台进程连接意外中断，请重试"
+                        ),
+                        "recoverable": bool(params.get("recoverable", True)),
+                        "code": params.get(
+                            "code", "codex_app_server_disconnected"
+                        ),
+                    }
+                )
+                break
+            if method == "item/agentMessage/delta":
+                delta = str(params.get("delta", ""))
+                response_parts.append(delta)
+                yield _ndjson({"type": "delta", "text": delta})
+            elif method == "turn/completed":
+                turn_data = params.get("turn") or {}
+                if turn_data.get("status") == "failed":
+                    error = turn_data.get("error") or {}
+                    yield _ndjson(
+                        {
+                            "type": "error",
+                            "message": error.get("message", "回答失败"),
+                        }
+                    )
+                else:
+                    usage = _turn_usage(
+                        payload,
+                        "".join(response_parts),
+                        _extract_token_usage(turn_data),
+                    )
+                    yield _ndjson(
+                        {
+                            "type": "done",
+                            "files": _output_files(workspace, output_baseline),
+                            "usage": usage,
+                            "cost": _turn_cost(
+                                usage,
+                                subscription=True,
+                                model_id=payload.model,
+                            ),
+                        }
+                    )
+                break
+    except (CodexProtocolError, HTTPException) as exc:
+        yield _ndjson(
+            {"type": "error", "message": getattr(exc, "detail", str(exc))}
+        )
+    except Exception:
+        LOG.exception("Turn failed")
+        yield _ndjson(
+            {"type": "error", "message": "服务暂时无法回答，请稍后重试"}
+        )
+    finally:
+        if turn_id:
+            codex.unregister_stream(turn_id)
+
+
+async def _codex_response_stream_locked(
+    payload: TurnRequest,
+    workspace: Path,
+    user_id: str,
+) -> AsyncIterator[bytes]:
+    source = _codex_response_stream_body(payload, workspace, user_id)
+    try:
+        async with asyncio.timeout(EXTERNAL_RESPONSE_TIMEOUT_SECONDS):
+            async for event in source:
+                yield event
+    except asyncio.TimeoutError:
+        yield _ndjson(
+            {
+                "type": "error",
+                "message": "Codex 回答等待超过 40 分钟，请重试",
+                "recoverable": True,
+                "code": "codex_turn_timeout",
+            }
+        )
+    finally:
+        await source.aclose()
+
+
+async def _codex_response_stream(
+    payload: TurnRequest,
+    workspace: Path,
+    user_id: str,
+) -> AsyncIterator[bytes]:
+    key = (user_id, str(workspace.resolve()))
+    lock = codex_workspace_locks.setdefault(key, asyncio.Lock())
+    source = _codex_response_stream_locked(payload, workspace, user_id)
+    async with lock:
+        try:
+            async for event in source:
+                yield event
+        finally:
+            await source.aclose()
+
+
 def _prune_resumable_stop_tombstones_locked(
     now: float, *, make_room: bool = False
 ) -> None:
@@ -5174,6 +6132,7 @@ def _prune_resumable_stop_tombstones_locked(
 def _prune_resumable_external_turns_locked(
     now: float, *, make_room: bool = False
 ) -> None:
+    removed: list[tuple[str, str]] = []
     expired = [
         key
         for key, record in resumable_external_turns.items()
@@ -5181,28 +6140,38 @@ def _prune_resumable_external_turns_locked(
     ]
     for key in expired:
         resumable_external_turns.pop(key, None)
+        removed.append(key)
 
-    if not make_room or len(resumable_external_turns) < EXTERNAL_RESUME_MAX_TURNS:
-        return
-    completed = sorted(
-        (
-            (record.updated_at, key)
-            for key, record in resumable_external_turns.items()
-            if record.terminal
-        ),
-        key=lambda item: item[0],
-    )
-    for _updated_at, key in completed:
-        if len(resumable_external_turns) < EXTERNAL_RESUME_MAX_TURNS:
-            break
-        resumable_external_turns.pop(key, None)
+    if make_room and len(resumable_external_turns) >= EXTERNAL_RESUME_MAX_TURNS:
+        completed = sorted(
+            (
+                (record.updated_at, key)
+                for key, record in resumable_external_turns.items()
+                if record.terminal
+            ),
+            key=lambda item: item[0],
+        )
+        for _updated_at, key in completed:
+            if len(resumable_external_turns) < EXTERNAL_RESUME_MAX_TURNS:
+                break
+            resumable_external_turns.pop(key, None)
+            removed.append(key)
+    if removed:
+        try:
+            _delete_persisted_resumable_sync(removed)
+        except Exception:
+            LOG.exception("Unable to delete expired resumable answer records")
 
 
 async def _cleanup_resumable_external_turns(*, now: float | None = None) -> None:
+    current = time.time() if now is None else now
     async with resumable_external_turns_lock:
-        current = time.time() if now is None else now
         _prune_resumable_external_turns_locked(current)
         _prune_resumable_stop_tombstones_locked(current)
+    try:
+        await asyncio.to_thread(_purge_persisted_resumable_sync, current)
+    except Exception:
+        LOG.exception("Unable to purge persisted resumable answer records")
 
 
 async def _cancel_or_tombstone_resumable_turn(
@@ -5218,6 +6187,15 @@ async def _cancel_or_tombstone_resumable_turn(
         if record is None:
             _prune_resumable_stop_tombstones_locked(now, make_room=True)
             resumable_stop_tombstones[key] = now
+            try:
+                await asyncio.to_thread(
+                    _persist_resumable_tombstone_sync,
+                    user_id,
+                    client_turn_id,
+                    now,
+                )
+            except Exception:
+                LOG.exception("Unable to persist stopped answer marker")
             return None
         task = record.task
     await _append_resumable_external_event(
@@ -5261,6 +6239,15 @@ async def _append_resumable_external_event(
         record.event_bytes += len(encoded)
         record.updated_at = time.time()
         record.terminal = event.get("type") in {"done", "error"}
+        try:
+            await asyncio.to_thread(
+                _persist_resumable_event_sync,
+                record,
+                len(record.events),
+                encoded,
+            )
+        except Exception:
+            LOG.exception("Unable to persist resumable answer event")
         record.condition.notify_all()
         return not record.terminal
 
@@ -5352,6 +6339,45 @@ async def _run_resumable_image_turn(
             )
 
 
+async def _run_resumable_codex_turn(
+    record: ResumableExternalTurn,
+    payload: TurnRequest,
+    workspace: Path,
+) -> None:
+    source: AsyncIterator[bytes] | None = None
+    try:
+        source = _codex_response_stream(
+            payload,
+            workspace,
+            record.user_id,
+        )
+        async for raw_event in source:
+            if not await _append_resumable_external_event(record, raw_event):
+                break
+    except asyncio.CancelledError:
+        await _append_resumable_external_event(
+            record,
+            _ndjson({"type": "error", "message": "已停止回答"}),
+        )
+    except Exception:
+        LOG.exception("Resumable Codex turn failed")
+        await _append_resumable_external_event(
+            record,
+            _ndjson({"type": "error", "message": "服务暂时无法回答，请稍后重试"}),
+        )
+    finally:
+        if source is not None:
+            try:
+                await source.aclose()
+            except Exception:
+                LOG.exception("Unable to close resumable Codex response stream")
+        if not record.terminal:
+            await _append_resumable_external_event(
+                record,
+                _ndjson({"type": "error", "message": "回答连接意外中断，请重试"}),
+            )
+
+
 async def _start_or_reuse_resumable_external_turn(
     payload: TurnRequest,
     workspace: Path,
@@ -5386,6 +6412,10 @@ async def _start_or_reuse_resumable_external_turn(
             fingerprint=fingerprint,
         )
         resumable_external_turns[key] = record
+        try:
+            await asyncio.to_thread(_persist_resumable_start_sync, record)
+        except Exception:
+            LOG.exception("Unable to persist resumable external answer")
         record.task = asyncio.create_task(
             _run_resumable_external_turn(
                 record,
@@ -5433,9 +6463,56 @@ async def _start_or_reuse_resumable_image_turn(
             kind="image",
         )
         resumable_external_turns[key] = record
+        try:
+            await asyncio.to_thread(_persist_resumable_start_sync, record)
+        except Exception:
+            LOG.exception("Unable to persist resumable image answer")
         record.task = asyncio.create_task(
             _run_resumable_image_turn(record, payload, workspace),
             name=f"image-turn-{client_turn_id[:8]}",
+        )
+        return record
+
+
+async def _start_or_reuse_resumable_codex_turn(
+    payload: TurnRequest,
+    workspace: Path,
+    user_id: str,
+) -> ResumableExternalTurn:
+    client_turn_id = str(payload.client_turn_id or "")
+    if not CLIENT_TURN_ID_RE.fullmatch(client_turn_id):
+        raise HTTPException(400, "客户端消息标识无效")
+    fingerprint = _codex_turn_fingerprint(payload)
+    key = (user_id, client_turn_id)
+    async with resumable_external_turns_lock:
+        now = time.time()
+        _prune_resumable_external_turns_locked(now)
+        existing = resumable_external_turns.get(key)
+        if existing is not None:
+            if not hmac.compare_digest(existing.fingerprint, fingerprint):
+                raise HTTPException(409, "客户端消息标识已用于另一条消息")
+            return existing
+        _prune_resumable_stop_tombstones_locked(now)
+        if key in resumable_stop_tombstones:
+            raise HTTPException(409, "该回答已经停止")
+        _prune_resumable_external_turns_locked(now, make_room=True)
+        if len(resumable_external_turns) >= EXTERNAL_RESUME_MAX_TURNS:
+            raise HTTPException(503, "正在恢复的回答过多，请稍后重试")
+        _reserve_message_slot(user_id)
+        record = ResumableExternalTurn(
+            user_id=user_id,
+            client_turn_id=client_turn_id,
+            fingerprint=fingerprint,
+            kind="codex",
+        )
+        resumable_external_turns[key] = record
+        try:
+            await asyncio.to_thread(_persist_resumable_start_sync, record)
+        except Exception:
+            LOG.exception("Unable to persist resumable Codex answer")
+        record.task = asyncio.create_task(
+            _run_resumable_codex_turn(record, payload, workspace),
+            name=f"codex-turn-{client_turn_id[:8]}",
         )
         return record
 
@@ -5573,81 +6650,24 @@ async def turn(request: Request, payload: TurnRequest):
     if payload.model in _read_disabled_codex_models():
         raise HTTPException(400, "该 Codex 模型已被管理员关闭，请选择其他模型")
     await _clear_external_conversation_state(user["id"], payload.client_conversation_id)
-    inputs = await _attachment_inputs_async(
-        payload,
-        workspace,
-        max_text_chars=MAX_CONTEXT_TEXT_CHARS,
-    )
+    if payload.client_turn_id:
+        record = await _start_or_reuse_resumable_codex_turn(
+            payload,
+            workspace,
+            user["id"],
+        )
+        return StreamingResponse(
+            _resumable_external_event_stream(record, 0),
+            media_type="application/x-ndjson",
+            headers={
+                "Cache-Control": "no-store",
+                "X-Accel-Buffering": "no",
+                "X-Client-Turn-ID": record.client_turn_id,
+            },
+        )
     _reserve_message_slot(user["id"])
-    async def stream() -> AsyncIterator[bytes]:
-        turn_id = ""
-        output_baseline = _output_file_snapshot(workspace)
-        response_parts: list[str] = []
-        try:
-            thread_id = await _ensure_thread(payload, workspace, user["id"])
-            result = await codex.request(
-                "turn/start",
-                {
-                    "threadId": thread_id,
-                    "input": inputs,
-                    "model": payload.model,
-                    "effort": payload.effort,
-                    "approvalPolicy": "never",
-                    "sandboxPolicy": {
-                        "type": "workspaceWrite",
-                        "writableRoots": [str(workspace)],
-                        "networkAccess": False,
-                        "excludeSlashTmp": True,
-                        "excludeTmpdirEnvVar": True,
-                    },
-                    "runtimeWorkspaceRoots": [str(workspace)],
-                },
-                timeout=45,
-            )
-            turn_id = result["turn"]["id"]
-            queue = codex.register_stream(turn_id)
-            yield _ndjson({"type": "started", "threadId": thread_id, "turnId": turn_id})
-            while True:
-                try:
-                    event = await asyncio.wait_for(queue.get(), timeout=15)
-                except asyncio.TimeoutError:
-                    yield _ndjson({"type": "ping"})
-                    continue
-                method = event["method"]
-                params = event["params"]
-                if method == "item/agentMessage/delta":
-                    delta = str(params.get("delta", ""))
-                    response_parts.append(delta)
-                    yield _ndjson({"type": "delta", "text": delta})
-                elif method == "turn/completed":
-                    turn_data = params.get("turn") or {}
-                    if turn_data.get("status") == "failed":
-                        error = turn_data.get("error") or {}
-                        yield _ndjson({"type": "error", "message": error.get("message", "回答失败")})
-                    else:
-                        usage = _turn_usage(
-                            payload,
-                            "".join(response_parts),
-                            _extract_token_usage(turn_data),
-                        )
-                        yield _ndjson({
-                            "type": "done",
-                            "files": _output_files(workspace, output_baseline),
-                            "usage": usage,
-                            "cost": _turn_cost(usage, subscription=True, model_id=payload.model),
-                        })
-                    break
-        except (CodexProtocolError, HTTPException) as exc:
-            yield _ndjson({"type": "error", "message": getattr(exc, "detail", str(exc))})
-        except Exception:
-            LOG.exception("Turn failed")
-            yield _ndjson({"type": "error", "message": "服务暂时无法回答，请稍后重试"})
-        finally:
-            if turn_id:
-                codex.unregister_stream(turn_id)
-
     return StreamingResponse(
-        stream(),
+        _codex_response_stream(payload, workspace, user["id"]),
         media_type="application/x-ndjson",
         headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
     )
@@ -5696,6 +6716,10 @@ async def interrupt(request: Request, thread_id: str, turn_id: str):
         if owned_task and not owned_task[1].done():
             owned_task[1].cancel()
         return {"ok": True}
+    if thread_id == "codex":
+        if CLIENT_TURN_ID_RE.fullmatch(turn_id):
+            await _cancel_or_tombstone_resumable_turn(user["id"], turn_id)
+        return {"ok": True}
     _require_codex_thread_owner(user["id"], thread_id)
     await codex.request(
         "turn/interrupt",
@@ -5712,6 +6736,7 @@ async def download_file(
     file_path: str,
     inline: bool = False,
     variant: Literal["original", "preview", "compressed"] = "original",
+    download_name: str | None = None,
 ):
     user = _require_auth(request)
     workspace = _session_path(user["id"], session_id)
@@ -5721,7 +6746,11 @@ async def download_file(
         raise HTTPException(404, "文件不存在")
     is_image = target.suffix.lower() in IMAGE_EXTENSIONS
     selected = target
-    download_name = target.name
+    requested_name = _safe_filename(download_name) if download_name else target.name
+    target_suffix = target.suffix
+    if target_suffix and Path(requested_name).suffix.lower() != target_suffix.lower():
+        requested_name = f"{Path(requested_name).stem}{target_suffix}"
+    response_name = requested_name
     media_type = _file_media_type(target)
     if variant != "original":
         if not is_image:
@@ -5732,20 +6761,23 @@ async def download_file(
             selected = variants["previewPath" if variant == "preview" else "compressedPath"]
             media_type = "image/webp"
             if variant == "compressed":
-                download_name = f"{target.stem}-高清.webp"
+                response_name = f"{Path(requested_name).stem}-高清.webp"
         except Exception as exc:
             LOG.warning("Image variant failed for %s: %s", target.name, exc)
             if variant == "compressed":
                 raise HTTPException(500, "高清压缩版生成失败，请下载原图") from exc
     response_inline = variant == "preview" or (inline and is_image)
     headers = {
-        "Cache-Control": "private, max-age=31536000, immutable",
+        # Codex may intentionally overwrite an output using the same filename.
+        # Revalidate so a stable URL never serves the previous file forever;
+        # FileResponse still supplies ETag/Last-Modified for cheap 304 replies.
+        "Cache-Control": "private, max-age=0, must-revalidate",
         "Vary": "Cookie",
         "X-Content-Type-Options": "nosniff",
     }
     return FileResponse(
         selected,
-        filename=download_name,
+        filename=response_name,
         media_type=media_type,
         headers=headers,
         content_disposition_type="inline" if response_inline else "attachment",

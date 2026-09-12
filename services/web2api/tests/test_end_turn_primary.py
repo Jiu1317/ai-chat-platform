@@ -106,6 +106,51 @@ async def test_end_turn_wins_over_no_has_action(monkeypatch):
     assert d._fetch_end_turn_for_turn.await_count >= 1
 
 
+@pytest.mark.asyncio
+async def test_terminal_chunk_carries_backend_text_when_final_rewrites_dom(
+    monkeypatch,
+):
+    d = _make_driver()
+    _install_virtual_clock(monkeypatch)
+    state = {"phase1": 0, "phase2": 0}
+
+    def phase2(n):
+        text = "Draft answer." if n > 2 else ""
+        return {
+            "text": text,
+            "md_text": text,
+            "html_len": 50,
+            "child_count": 1,
+            "has_action": False,
+            "is_thinking": False,
+        }
+
+    d._js_strict = _phase1_then_phase2_js(state, phase2_factory=phase2)
+    d.type_message = AsyncMock()
+    d.click_send = AsyncMock()
+    d._fetch_text_for_turn = AsyncMock(
+        return_value=TurnTextResult(
+            status="matched",
+            text="Final answer with corrected wording.",
+        )
+    )
+    d._fetch_end_turn_for_turn = AsyncMock(
+        return_value=TurnEndResult(status="matched")
+    )
+
+    chunks = []
+    async for chunk in d.send_and_stream("hello", timeout=10000):
+        chunks.append(chunk)
+
+    # SSE cannot retract an emitted draft, so no unsafe replacement is sent
+    # as a delta. Non-stream collectors receive the verified full snapshot on
+    # the terminal chunk instead.
+    streamed = "".join(chunk.delta for chunk in chunks)
+    assert streamed == "Draft answer."
+    assert chunks[-1].finish_reason == "stop"
+    assert chunks[-1].final_text == "Final answer with corrected wording."
+
+
 # ── 2. end_turn=True wins even when is_thinking=True ───────────────────
 
 

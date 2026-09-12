@@ -39,6 +39,7 @@ class StreamChunk:
 
     delta: str
     finish_reason: str | None = None
+    final_text: str | None = None
 
 
 # Conservative fallback wait (seconds) when ChatGPT's pop-up gives no exact
@@ -1787,6 +1788,7 @@ class CDPDriver:
            terminal path — success, timeout, exception, cancellation).
         """
         self._last_response_assets = []
+        authoritative_final_text: str | None = None
         from .identity_listener import hash_sent_text
         from .turn_anchor import TurnReconciliationError
 
@@ -2001,6 +2003,7 @@ class CDPDriver:
                     last_status = result.status
                     last_diagnostic = result.diagnostic or {}
                     if result.status == "matched" and result.text:
+                        authoritative_final_text = result.text
                         delta = append_only_delta(last_dom_text, result.text)
                         if delta:
                             yield StreamChunk(delta=delta)
@@ -2081,11 +2084,15 @@ class CDPDriver:
                     except Exception as asset_err:
                         logger.warning("Response asset extraction failed: %s", asset_err)
                     merged_assets = []
-                    seen_assets = set()
+                    seen_asset_identities = set()
+                    from .multimodal import _asset_identity_keys
+
                     for asset in [*backend_assets, *dom_non_text_assets]:
-                        identity = str(asset.get("file_id") or asset.get("source_url") or "")
-                        if identity and identity not in seen_assets:
-                            seen_assets.add(identity)
+                        identities = _asset_identity_keys(asset)
+                        if identities and identities.isdisjoint(
+                            seen_asset_identities
+                        ):
+                            seen_asset_identities.update(identities)
                             merged_assets.append(asset)
                     self._last_response_assets = merged_assets
                 if (
@@ -2103,7 +2110,11 @@ class CDPDriver:
             if capture_scope is not None:
                 capture_scope.close()
 
-        yield StreamChunk(delta="", finish_reason="stop")
+        yield StreamChunk(
+            delta="",
+            finish_reason="stop",
+            final_text=authoritative_final_text,
+        )
 
     async def _fetch_text_for_turn(self, conversation_id: str, anchor):
         """A2 anchored final-text fetch. Delegated to BackendClient.

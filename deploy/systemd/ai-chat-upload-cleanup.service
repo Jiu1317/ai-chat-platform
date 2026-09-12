@@ -1,0 +1,13 @@
+[Unit]
+Description=Clean abandoned AI Chat upload staging files
+ConditionPathIsDirectory=/srv/ai-chat/workspaces
+
+[Service]
+Type=oneshot
+User=ai-chat
+Group=ai-chat
+ExecStart=/usr/bin/python3 /srv/ai-chat/current/scripts/cleanup-stale-uploads.py /srv/ai-chat/workspaces --max-age-seconds 86400
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=true
+PrivateTmp=true

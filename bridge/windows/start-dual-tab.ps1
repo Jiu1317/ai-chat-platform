@@ -43,7 +43,9 @@ function Get-GatewayHealth {
     $handler = [Net.Http.HttpClientHandler]::new()
     $handler.UseProxy = $false
     $client = [Net.Http.HttpClient]::new($handler)
-    $client.Timeout = [TimeSpan]::FromSeconds(5)
+    # The gateway can spend up to five seconds probing each worker. Give the
+    # outer request enough headroom to receive that degraded/busy response.
+    $client.Timeout = [TimeSpan]::FromSeconds(8)
     try {
         $response = $client.GetAsync('http://127.0.0.1:9181/health').GetAwaiter().GetResult()
         $body = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
@@ -82,21 +84,58 @@ if (-not $hasStartMutex) {
     return
 }
 
-# A second start while the complete stack is healthy must not interrupt an
-# in-flight request. Use stop-dual-tab.ps1 first for an intentional restart.
+# A second start while the existing stack is healthy or busy must not interrupt
+# an in-flight text, image, or file-backed request. Use stop-dual-tab.ps1 first
+# for an intentional restart.
 $runtimePorts = @(9181, 9182, 9183, 9325)
-if (($runtimePorts | Where-Object { -not (Test-LocalPort -Port $_) }).Count -eq 0) {
+$allRuntimePortsOpen = (
+    ($runtimePorts | Where-Object { -not (Test-LocalPort -Port $_) }).Count -eq 0
+)
+$knownUnhealthy = $false
+if (Test-LocalPort -Port 9181) {
     try {
         $existingHealth = Get-GatewayHealth
-        if ($existingHealth.mode -eq 'dual-tab' -and
-            [int]$existingHealth.ready_backends -eq 2) {
-            Write-Output 'ChatGPT Web2API is already running with two ready workers.'
+        $busy = (
+            $existingHealth.mode -eq 'dual-tab' -and (
+                $existingHealth.busy -eq $true -or
+                [int]$existingHealth.available_workers -lt [int]$existingHealth.capacity -or
+                [int]$existingHealth.queued_requests -gt 0 -or
+                [int]$existingHealth.active_asset_transfers -gt 0
+            )
+        )
+        $stableBackends = @(
+            @($existingHealth.backends) | Where-Object {
+                $_.reachable -eq $true -and
+                $_.chrome_running -eq $true -and
+                $_.cdp_connected -eq $true
+            }
+        )
+        $stable = (
+            $existingHealth.mode -eq 'dual-tab' -and
+            $allRuntimePortsOpen -and
+            $stableBackends.Count -eq 2
+        )
+        if ($busy -or $stable) {
+            Write-Output (
+                'ChatGPT Web2API is already running ' +
+                "(ready workers: $($existingHealth.ready_backends)/2)."
+            )
+            if ($busy) {
+                Write-Warning 'A worker is handling or waiting on a request; all processes were left running.'
+            }
             return
         }
+        if ($existingHealth.mode -eq 'dual-tab') {
+            $knownUnhealthy = $true
+        }
     } catch {
-        # Continue into exact module-process cleanup when this is not a
-        # readable gateway health response.
+        if ($allRuntimePortsOpen) {
+            throw 'The existing runtime is listening but health is inconclusive. Run stop-dual-tab.ps1 before an intentional restart.'
+        }
     }
+}
+if ($allRuntimePortsOpen -and -not $knownUnhealthy) {
+    throw 'The expected ports are already occupied. Run stop-dual-tab.ps1 before an intentional restart.'
 }
 
 $existing = Get-CimInstance Win32_Process | Where-Object {
@@ -109,6 +148,11 @@ foreach ($process in $existing) {
     Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
 }
 Start-Sleep -Seconds 2
+foreach ($port in @(9181, 9182, 9183)) {
+    if (Test-LocalPort -Port $port) {
+        throw "Local API port $port is still in use after owned-process cleanup."
+    }
+}
 
 $worker1 = Start-Process -FilePath $PythonExe -ArgumentList @(
     '-m', 'chatgpt_web2api', '--config', $ConfigArgument,

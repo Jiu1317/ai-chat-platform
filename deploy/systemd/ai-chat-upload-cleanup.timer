@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodically clean abandoned AI Chat upload staging files
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=10min
+Persistent=true
+Unit=ai-chat-upload-cleanup.service
+
+[Install]
+WantedBy=timers.target

@@ -12,6 +12,7 @@ const MAX_UPLOAD_BYTES = 30 * MEBIBYTE;
 const UPLOAD_CHUNK_BYTES = 3 * MEBIBYTE;
 const MAX_TURN_FILES = 5;
 const INLINE_TEXT_BYTES = 60_000;
+const HISTORY_CONTENT_CHARS = 60_000;
 const TURN_RESUME_MAX_ATTEMPTS = 8;
 const TURN_RESUME_BASE_DELAY_MS = 750;
 const TURN_RESUME_MAX_DELAY_MS = 15_000;
@@ -168,6 +169,7 @@ let renderedConversationId = null;
 let renderedMessageIds = new Set();
 let pendingStreamingMessage = null;
 let streamingRenderScheduled = false;
+const streamingBodyStates = new WeakMap();
 let sidebarCloseTimer = null;
 let quotaLastFetched = 0;
 let latencyLastFetched = 0;
@@ -218,6 +220,11 @@ function utf8ByteLength(value) {
 
 function sumFileSizes(files) {
   return files.reduce((total, file) => total + Math.max(0, Number(file?.size) || 0), 0);
+}
+
+function downloadFileUrl(fileUrl, fileName, variant = "") {
+  const variantQuery = variant ? `variant=${encodeURIComponent(variant)}&` : "";
+  return `${fileUrl}?${variantQuery}download_name=${encodeURIComponent(String(fileName || "file"))}`;
 }
 
 function longTextFileName() {
@@ -408,6 +415,97 @@ function acceptTurnEvent(event, streamState) {
   return true;
 }
 
+function pendingTurnStorageKeyFor(clientTurnId) {
+  const normalized = String(clientTurnId || "");
+  return /^[a-f0-9]{32}$/.test(normalized) ? `${pendingTurnStorageKey}:${normalized}` : "";
+}
+
+function compactPendingRequestPayload(payload) {
+  if (!payload || typeof payload !== "object") return null;
+  const clientTurnId = String(payload.client_turn_id || "");
+  if (!/^[a-f0-9]{32}$/.test(clientTurnId)) return null;
+  const compact = {
+    client_turn_id: clientTurnId,
+    message: String(payload.message || ""),
+    attachments: (Array.isArray(payload.attachments) ? payload.attachments : [])
+      .filter((attachment) => attachment && attachment.id && attachment.name)
+      .slice(0, MAX_TURN_FILES)
+      .map((attachment) => ({
+        id: String(attachment.id),
+        name: String(attachment.name),
+        size: Math.max(0, Number(attachment.size) || 0),
+        type: attachment.type === "image" ? "image" : "document",
+        source: attachment.source === "composer_text" ? "composer_text" : "file",
+      })),
+  };
+  if (/^[a-f0-9]{32}$/.test(String(payload.session_id || ""))) {
+    compact.session_id = String(payload.session_id);
+  }
+  if (/^[a-f0-9]{32}$/.test(String(payload.client_conversation_id || ""))) {
+    compact.client_conversation_id = String(payload.client_conversation_id);
+  }
+  return compact;
+}
+
+function normalizePendingTurnSnapshot(candidate) {
+  const valid = candidate
+    && [1, 2, 3, 4].includes(candidate.version)
+    && /^[a-f0-9]{32}$/.test(String(candidate.clientTurnId || ""))
+    && /^[a-f0-9]{32}$/.test(String(candidate.conversationId || ""))
+    && /^[a-f0-9]{32}$/.test(String(candidate.assistantMessageId || ""));
+  if (!valid) return null;
+  const pending = { ...candidate };
+  const responseState = Number(pending.version) >= 3
+    ? String(pending.initialPostResponseState || "unknown")
+    : "unknown";
+  pending.initialPostResponseState = ["awaiting", "no_http_response", "received", "unknown"].includes(responseState)
+    ? responseState
+    : "unknown";
+  const attemptedAt = Number(pending.initialPostAttemptedAt);
+  pending.initialPostAttemptedAt = Number(pending.version) >= 3
+    && Number.isFinite(attemptedAt)
+    && attemptedAt > 0
+    ? attemptedAt
+    : 0;
+  pending.initialPostReplayAttempted = Number(pending.version) >= 3
+    ? Boolean(pending.initialPostReplayAttempted)
+    : false;
+  const requestKind = String(pending.requestKind || "");
+  pending.requestKind = ["external", "direct_image", "codex"].includes(requestKind)
+    ? requestKind
+    : (String(pending.backendKey || "").startsWith("external:") ? "external" : "codex");
+  if (
+    !pending.requestPayload
+    || typeof pending.requestPayload !== "object"
+    || String(pending.requestPayload.client_turn_id || "") !== String(pending.clientTurnId || "")
+  ) {
+    pending.requestPayload = null;
+    pending.requestPayloadStored = false;
+  } else {
+    pending.requestPayloadStored = Boolean(pending.requestPayloadStored);
+  }
+  pending.userMessageId = /^[a-f0-9]{32}$/.test(String(pending.userMessageId || ""))
+    ? String(pending.userMessageId)
+    : "";
+  const userMessageCreatedAt = Number(pending.userMessageCreatedAt);
+  pending.userMessageCreatedAt = Number.isFinite(userMessageCreatedAt) && userMessageCreatedAt > 0
+    ? userMessageCreatedAt
+    : 0;
+  return pending;
+}
+
+function pendingTurnStorageKeys() {
+  const prefix = `${pendingTurnStorageKey}:`;
+  const keys = [];
+  try {
+    for (let index = 0; index < localStorage.length; index += 1) {
+      const key = localStorage.key(index);
+      if (typeof key === "string" && key.startsWith(prefix)) keys.push(key);
+    }
+  } catch {}
+  return keys.sort();
+}
+
 function buildPendingTurnSnapshot(conversation, assistantMessage, streamState = {}) {
   const previous = latestPendingTurnSnapshot?.clientTurnId === assistantMessage?.clientTurnId
     ? latestPendingTurnSnapshot
@@ -418,6 +516,25 @@ function buildPendingTurnSnapshot(conversation, assistantMessage, streamState = 
     : (previous
       ? previous.requestPayload
       : null);
+  const hasRequestPayloadStored = Object.prototype.hasOwnProperty.call(streamState, "requestPayloadStored");
+  const requestPayloadStored = hasRequestPayloadStored
+    ? Boolean(streamState.requestPayloadStored)
+    : (hasRequestPayload ? Boolean(requestPayload) : Boolean(previous?.requestPayloadStored));
+  const assistantIndex = Array.isArray(conversation?.messages)
+    ? conversation.messages.findIndex((message) => message?.id === assistantMessage?.id)
+    : -1;
+  const adjacentUserMessage = assistantIndex > 0 && conversation.messages[assistantIndex - 1]?.role === "user"
+    ? conversation.messages[assistantIndex - 1]
+    : null;
+  const userMessageIdCandidate = String(
+    streamState.userMessageId || previous?.userMessageId || adjacentUserMessage?.id || "",
+  );
+  const userMessageCreatedAt = Number(
+    streamState.userMessageCreatedAt
+    || previous?.userMessageCreatedAt
+    || adjacentUserMessage?.createdAt
+    || 0,
+  );
   const initialPostResponseState = ["awaiting", "no_http_response", "received", "unknown"].includes(
     String(streamState.initialPostResponseState || ""),
   )
@@ -432,7 +549,7 @@ function buildPendingTurnSnapshot(conversation, assistantMessage, streamState = 
     ? requestKindCandidate
     : (String(conversation?.backendKey || "").startsWith("external:") ? "external" : "codex");
   return {
-    version: 3,
+    version: 4,
     clientTurnId: String(assistantMessage?.clientTurnId || ""),
     conversationId: String(conversation?.id || ""),
     assistantMessageId: String(assistantMessage?.id || ""),
@@ -440,6 +557,7 @@ function buildPendingTurnSnapshot(conversation, assistantMessage, streamState = 
     requestKind,
     content: String(assistantMessage?.content || ""),
     files: Array.isArray(assistantMessage?.files) ? assistantMessage.files : [],
+    contentDropped: false,
     mode: String(assistantMessage?.mode || ""),
     cursor: Math.max(0, Number(streamState.cursor) || 0),
     hasCursor: Boolean(streamState.hasCursor),
@@ -451,7 +569,11 @@ function buildPendingTurnSnapshot(conversation, assistantMessage, streamState = 
       : 0,
     initialPostReplayAttempted,
     requestPayload: requestPayload && typeof requestPayload === "object" ? requestPayload : null,
-    requestPayloadStored: Boolean(requestPayload && typeof requestPayload === "object"),
+    requestPayloadStored: Boolean(requestPayload && typeof requestPayload === "object" && requestPayloadStored),
+    userMessageId: /^[a-f0-9]{32}$/.test(userMessageIdCandidate) ? userMessageIdCandidate : "",
+    userMessageCreatedAt: Number.isFinite(userMessageCreatedAt) && userMessageCreatedAt > 0
+      ? userMessageCreatedAt
+      : 0,
     threadId: String(activeTurn?.threadId || ""),
     turnId: String(activeTurn?.turnId || ""),
     createdAt: Number(assistantMessage?.createdAt) || Date.now(),
@@ -463,31 +585,45 @@ function flushPendingTurnSnapshot() {
   clearTimeout(pendingTurnSaveTimer);
   pendingTurnSaveTimer = null;
   if (!latestPendingTurnSnapshot) return;
+  const targetKey = pendingTurnStorageKeyFor(latestPendingTurnSnapshot.clientTurnId);
+  if (!targetKey) return;
   try {
-    localStorage.setItem(pendingTurnStorageKey, JSON.stringify(latestPendingTurnSnapshot));
+    localStorage.setItem(targetKey, JSON.stringify(latestPendingTurnSnapshot));
   } catch {
     const compact = {
       ...latestPendingTurnSnapshot,
       content: "",
       files: [],
+      cursor: 0,
+      hasCursor: false,
       eventIds: [],
+      contentDropped: true,
     };
     try {
-      localStorage.setItem(pendingTurnStorageKey, JSON.stringify(compact));
+      localStorage.setItem(targetKey, JSON.stringify(compact));
       latestPendingTurnSnapshot = compact;
     } catch {
       const resumeOnly = {
         ...compact,
-        requestPayload: null,
+        requestPayload: compactPendingRequestPayload(compact.requestPayload),
         requestPayloadStored: false,
         storageDegraded: true,
       };
       try {
-        localStorage.setItem(pendingTurnStorageKey, JSON.stringify(resumeOnly));
+        localStorage.setItem(targetKey, JSON.stringify(resumeOnly));
         latestPendingTurnSnapshot = resumeOnly;
       } catch {}
     }
   }
+}
+
+function historyContentForTransfer(value) {
+  const text = String(value || "");
+  if (text.length <= HISTORY_CONTENT_CHARS) return text;
+  const marker = "\n\n…中间内容已为传输压缩…\n\n";
+  const available = Math.max(0, HISTORY_CONTENT_CHARS - marker.length);
+  const headLength = Math.ceil(available * 0.6);
+  return text.slice(0, headLength) + marker + text.slice(-(available - headLength));
 }
 
 function persistPendingTurn(conversation, assistantMessage, streamState = {}, { immediate = false } = {}) {
@@ -499,65 +635,90 @@ function persistPendingTurn(conversation, assistantMessage, streamState = {}, { 
   if (!pendingTurnSaveTimer) pendingTurnSaveTimer = setTimeout(flushPendingTurnSnapshot, 120);
 }
 
-function loadPendingTurn() {
-  let pending = null;
-  try {
-    pending = JSON.parse(localStorage.getItem(pendingTurnStorageKey) || "null");
-  } catch {}
-  const valid = pending
-    && [1, 2, 3].includes(pending.version)
-    && /^[a-f0-9]{32}$/.test(String(pending.clientTurnId || ""))
-    && /^[a-f0-9]{32}$/.test(String(pending.conversationId || ""))
-    && /^[a-f0-9]{32}$/.test(String(pending.assistantMessageId || ""));
-  if (valid) {
-    const responseState = Number(pending.version) >= 3
-      ? String(pending.initialPostResponseState || "unknown")
-      : "unknown";
-    pending.initialPostResponseState = ["awaiting", "no_http_response", "received", "unknown"].includes(responseState)
-      ? responseState
-      : "unknown";
-    const attemptedAt = Number(pending.initialPostAttemptedAt);
-    pending.initialPostAttemptedAt = Number(pending.version) >= 3
-      && Number.isFinite(attemptedAt)
-      && attemptedAt > 0
-      ? attemptedAt
-      : 0;
-    pending.initialPostReplayAttempted = Number(pending.version) >= 3
-      ? Boolean(pending.initialPostReplayAttempted)
-      : false;
-    const requestKind = String(pending.requestKind || "");
-    pending.requestKind = ["external", "direct_image", "codex"].includes(requestKind)
-      ? requestKind
-      : (String(pending.backendKey || "").startsWith("external:") ? "external" : "codex");
-    if (
-      !pending.requestPayload
-      || typeof pending.requestPayload !== "object"
-      || String(pending.requestPayload.client_turn_id || "") !== String(pending.clientTurnId || "")
-    ) {
-      pending.requestPayload = null;
-      pending.requestPayloadStored = false;
+function loadPendingTurn(clientTurnId = "") {
+  const requestedValue = String(clientTurnId || "");
+  const requestedId = /^[a-f0-9]{32}$/.test(requestedValue) ? requestedValue : "";
+  if (requestedValue && !requestedId) return null;
+  const pendingById = new Map();
+  const addCandidate = (pending) => {
+    if (!pending || (requestedId && pending.clientTurnId !== requestedId)) return;
+    const existing = pendingById.get(pending.clientTurnId);
+    if (!existing || (Number(pending.updatedAt) || 0) >= (Number(existing.updatedAt) || 0)) {
+      pendingById.set(pending.clientTurnId, pending);
+    }
+  };
+  const readStored = (key, expectedId = "") => {
+    let pending = null;
+    try {
+      pending = normalizePendingTurnSnapshot(JSON.parse(localStorage.getItem(key) || "null"));
+    } catch {}
+    if (!pending || (expectedId && pending.clientTurnId !== expectedId)) {
+      try { localStorage.removeItem(key); } catch {}
+      return null;
     }
     return pending;
-  }
-  try { localStorage.removeItem(pendingTurnStorageKey); } catch {}
-  return null;
-}
+  };
 
-function clearPendingTurn(clientTurnId = "") {
-  clearTimeout(pendingTurnSaveTimer);
-  pendingTurnSaveTimer = null;
-  if (clientTurnId && latestPendingTurnSnapshot?.clientTurnId && latestPendingTurnSnapshot.clientTurnId !== clientTurnId) return;
-  latestPendingTurnSnapshot = null;
+  const prefix = `${pendingTurnStorageKey}:`;
+  const keys = requestedId ? [pendingTurnStorageKeyFor(requestedId)] : pendingTurnStorageKeys();
+  for (const key of keys) {
+    const expectedId = key.slice(prefix.length);
+    addCandidate(readStored(key, expectedId));
+  }
+
+  let legacy = null;
   try {
-    if (!clientTurnId) {
-      localStorage.removeItem(pendingTurnStorageKey);
-      return;
+    const rawLegacy = localStorage.getItem(pendingTurnStorageKey);
+    if (rawLegacy !== null) {
+      legacy = normalizePendingTurnSnapshot(JSON.parse(rawLegacy));
+      if (!legacy) localStorage.removeItem(pendingTurnStorageKey);
     }
-    const saved = JSON.parse(localStorage.getItem(pendingTurnStorageKey) || "null");
-    if (!saved || saved.clientTurnId === clientTurnId) localStorage.removeItem(pendingTurnStorageKey);
   } catch {
     try { localStorage.removeItem(pendingTurnStorageKey); } catch {}
   }
+  if (legacy) {
+    const migratedKey = pendingTurnStorageKeyFor(legacy.clientTurnId);
+    const existing = pendingById.get(legacy.clientTurnId)
+      || readStored(migratedKey, legacy.clientTurnId);
+    const migrated = existing && (Number(existing.updatedAt) || 0) >= (Number(legacy.updatedAt) || 0)
+      ? existing
+      : legacy;
+    try {
+      localStorage.setItem(migratedKey, JSON.stringify(migrated));
+      localStorage.removeItem(pendingTurnStorageKey);
+    } catch {}
+    addCandidate(migrated);
+  }
+
+  if (requestedId) return pendingById.get(requestedId) || null;
+  return [...pendingById.values()].sort((left, right) => {
+    const leftCreated = Number(left.createdAt) || Number(left.updatedAt) || 0;
+    const rightCreated = Number(right.createdAt) || Number(right.updatedAt) || 0;
+    if (leftCreated !== rightCreated) return leftCreated - rightCreated;
+    const updatedDifference = (Number(left.updatedAt) || 0) - (Number(right.updatedAt) || 0);
+    if (updatedDifference) return updatedDifference;
+    return left.clientTurnId < right.clientTurnId ? -1 : left.clientTurnId > right.clientTurnId ? 1 : 0;
+  })[0] || null;
+}
+
+function clearPendingTurn(clientTurnId = "") {
+  const normalized = String(clientTurnId || "");
+  const targetKey = pendingTurnStorageKeyFor(normalized);
+  if (!targetKey) return;
+  if (latestPendingTurnSnapshot?.clientTurnId === normalized) {
+    clearTimeout(pendingTurnSaveTimer);
+    pendingTurnSaveTimer = null;
+    latestPendingTurnSnapshot = null;
+  }
+  try {
+    localStorage.removeItem(targetKey);
+  } catch {}
+  try {
+    const legacy = normalizePendingTurnSnapshot(
+      JSON.parse(localStorage.getItem(pendingTurnStorageKey) || "null"),
+    );
+    if (legacy?.clientTurnId === normalized) localStorage.removeItem(pendingTurnStorageKey);
+  } catch {}
 }
 
 function normalizeConversation(item, fallbackWorkspaceId) {
@@ -596,15 +757,30 @@ function normalizeConversation(item, fallbackWorkspaceId) {
   };
 }
 
+function normalizeProjectRemovedFileIds(value, files = []) {
+  const presentIds = new Set(
+    (Array.isArray(files) ? files : []).map((file) => String(file?.id || "")).filter(Boolean),
+  );
+  return [...new Set(
+    (Array.isArray(value) ? value : [])
+      .map((fileId) => String(fileId || ""))
+      .filter((fileId) => fileId && fileId.length <= 180 && !/[\\/]/.test(fileId)),
+  )].filter((fileId) => !presentIds.has(fileId)).slice(-200);
+}
+
 function normalizeProject(item) {
   const updatedAt = Number(item?.updatedAt) || Date.now();
+  const files = Array.isArray(item?.files)
+    ? item.files.filter((file) => file && file.id && file.name).slice(0, 20)
+    : [];
   return {
     id: /^[a-f0-9]{32}$/.test(String(item?.id || "")) ? item.id : randomId(),
     workspaceId: /^[a-f0-9]{32}$/.test(String(item?.workspaceId || "")) ? item.workspaceId : randomId(),
     name: String(item?.name || "新项目").trim().replace(/\s+/g, " ").slice(0, 60) || "新项目",
     instructions: String(item?.instructions || "").trim().slice(0, 12000),
     useContext: Boolean(item?.useContext),
-    files: Array.isArray(item?.files) ? item.files.filter((file) => file && file.id && file.name).slice(0, 20) : [],
+    files,
+    removedFileIds: normalizeProjectRemovedFileIds(item?.removedFileIds, files),
     createdAt: Number(item?.createdAt) || updatedAt,
     updatedAt,
   };
@@ -707,6 +883,33 @@ function cloudConversationSnapshot(conversation) {
   };
 }
 
+function mergeConcurrentCloudConversation(local, remote) {
+  const messages = new Map();
+  for (const snapshot of [local, remote]) {
+    for (const message of Array.isArray(snapshot?.messages) ? snapshot.messages : []) {
+      const messageId = String(message?.id || "");
+      if (messageId) messages.set(messageId, message);
+    }
+  }
+  const orderedMessages = [...messages.values()].sort((left, right) => {
+    const createdDifference = (Number(left?.createdAt) || 0) - (Number(right?.createdAt) || 0);
+    if (createdDifference) return createdDifference;
+    const leftId = String(left?.id || "");
+    const rightId = String(right?.id || "");
+    return leftId < rightId ? -1 : leftId > rightId ? 1 : 0;
+  });
+  const codexThreadIds = [...new Set([
+    ...(Array.isArray(local?.codexThreadIds) ? local.codexThreadIds : []),
+    ...(Array.isArray(remote?.codexThreadIds) ? remote.codexThreadIds : []),
+  ])].sort();
+  return {
+    ...remote,
+    messages: orderedMessages,
+    codexThreadIds,
+    updatedAt: Math.max(Number(local?.updatedAt) || 0, Number(remote?.updatedAt) || 0),
+  };
+}
+
 function cloudProjectSnapshot(project) {
   return {
     id: project.id,
@@ -715,6 +918,7 @@ function cloudProjectSnapshot(project) {
     instructions: project.instructions || "",
     useContext: Boolean(project.useContext),
     files: (project.files || []).slice(0, 20).map(({ id, name, size, type }) => ({ id, name, size, type })),
+    removedFileIds: normalizeProjectRemovedFileIds(project.removedFileIds, project.files),
     createdAt: Number(project.createdAt) || Number(project.updatedAt) || Date.now(),
     updatedAt: Number(project.updatedAt) || Date.now(),
   };
@@ -787,6 +991,15 @@ async function syncCloudConversations({ force = false, initial = false } = {}) {
       if (!local || remote.updatedAt > (Number(local.updatedAt) || 0)) {
         merged.set(remote.id, remote);
         changed = true;
+      } else if (remote.updatedAt === (Number(local.updatedAt) || 0)) {
+        const reconciled = mergeConcurrentCloudConversation(local, remote);
+        if (
+          JSON.stringify(cloudConversationSnapshot(reconciled))
+          !== JSON.stringify(cloudConversationSnapshot(local))
+        ) {
+          merged.set(remote.id, reconciled);
+          changed = true;
+        }
       }
     }
     state.conversations = [...merged.values()];
@@ -800,6 +1013,12 @@ async function syncCloudConversations({ force = false, initial = false } = {}) {
       const remote = normalizeProject(raw);
       const local = projectMerged.get(remote.id);
       if (!local || remote.updatedAt > (Number(local.updatedAt) || 0)) {
+        projectMerged.set(remote.id, remote);
+        changed = true;
+      } else if (
+        remote.updatedAt === (Number(local.updatedAt) || 0)
+        && JSON.stringify(cloudProjectSnapshot(remote)) !== JSON.stringify(cloudProjectSnapshot(local))
+      ) {
         projectMerged.set(remote.id, remote);
         changed = true;
       }
@@ -859,6 +1078,7 @@ function sortedConversations(projectId = state.activeProjectId) {
 
 function selectProject(projectId) {
   if (blockPendingRecoveryAction("切换项目")) return;
+  if (blockActiveProjectUpload("切换项目")) return;
   if (isSending || attachments.some((item) => item.loading)) return;
   state.activeProjectId = projectId || null;
   const conversations = sortedConversations();
@@ -874,6 +1094,7 @@ function selectProject(projectId) {
 
 function createProject() {
   if (blockPendingRecoveryAction("新建项目")) return null;
+  if (blockActiveProjectUpload("新建项目")) return null;
   if (state.projects.length >= 50) {
     showComposerError("项目数量已达到 50 个，请先整理现有项目。");
     return null;
@@ -886,6 +1107,7 @@ function createProject() {
     instructions: "",
     useContext: false,
     files: [],
+    removedFileIds: [],
     createdAt: now,
     updatedAt: now,
   });
@@ -1373,8 +1595,10 @@ function buildMessage(message, workspaceId) {
   for (const file of message.files || []) {
     const encodedPath = file.path.split("/").map(encodeURIComponent).join("/");
     const fileUrl = `/api/files/${workspaceId}/${encodedPath}`;
-    const isImageFile = String(file.mediaType || "").startsWith("image/")
-      || /\.(?:avif|gif|jpe?g|png|webp)$/i.test(String(file.name || file.path || ""));
+    const explicitMediaType = String(file.mediaType || "");
+    const isImageFile = explicitMediaType
+      ? explicitMediaType.startsWith("image/")
+      : /\.(?:avif|gif|jpe?g|png|webp)$/i.test(String(file.name || file.path || ""));
     const isImage = isImageFile;
     if (isImage) {
       const figure = document.createElement("figure");
@@ -1406,14 +1630,14 @@ function buildMessage(message, workspaceId) {
       const caption = document.createElement("figcaption");
       const compressedDownload = document.createElement("a");
       compressedDownload.className = "generated-image-download is-primary";
-      compressedDownload.href = `${fileUrl}?variant=compressed`;
+      compressedDownload.href = downloadFileUrl(fileUrl, file.name, "compressed");
       compressedDownload.download = `${file.name.replace(/\.[^.]+$/, "")}-高清.webp`;
       compressedDownload.textContent = file.compressedSize
         ? `下载高清版 · ${formatBytes(file.compressedSize)}`
         : "下载高清版";
       const originalDownload = document.createElement("a");
       originalDownload.className = "generated-image-download";
-      originalDownload.href = `${fileUrl}?variant=original`;
+      originalDownload.href = downloadFileUrl(fileUrl, file.name, "original");
       originalDownload.download = file.name;
       originalDownload.textContent = `下载原图 · ${formatBytes(file.size)}`;
       caption.append(compressedDownload, originalDownload);
@@ -1422,7 +1646,8 @@ function buildMessage(message, workspaceId) {
       continue;
     }
     const link = document.createElement("a");
-    link.href = fileUrl;
+    link.href = downloadFileUrl(fileUrl, file.name);
+    link.download = file.name;
     link.textContent = `下载 ${file.name} · ${formatBytes(file.size)}`;
     files.append(link);
   }
@@ -1439,7 +1664,44 @@ function buildMessage(message, workspaceId) {
   return node;
 }
 
+function renderStreamingMessageBody(body, message) {
+  const content = stripInternalAnnotations(String(message?.content || ""), { removeIncomplete: true });
+  const recoveryStatus = String(message?.recoveryStatus || "").trim();
+  if (!content.trim()) {
+    renderAssistantMessageBody(body, message);
+    return;
+  }
+
+  let stream = streamingBodyStates.get(body);
+  if (!stream || stream.messageId !== message.id || !content.startsWith(stream.content)) {
+    const contentNode = document.createElement("span");
+    contentNode.className = "streaming-content";
+    contentNode.textContent = content;
+    body.replaceChildren(contentNode);
+    stream = { messageId: message.id, content, contentNode, statusNode: null };
+    streamingBodyStates.set(body, stream);
+  } else if (content.length > stream.content.length) {
+    stream.contentNode.append(document.createTextNode(content.slice(stream.content.length)));
+    stream.content = content;
+  }
+
+  if (recoveryStatus) {
+    if (!stream.statusNode) {
+      stream.statusNode = document.createElement("span");
+      stream.statusNode.className = "thinking-indicator";
+      stream.statusNode.setAttribute("role", "status");
+      stream.statusNode.setAttribute("aria-live", "polite");
+      body.append(stream.statusNode);
+    }
+    stream.statusNode.textContent = recoveryStatus;
+  } else if (stream.statusNode) {
+    stream.statusNode.remove();
+    stream.statusNode = null;
+  }
+}
+
 function renderAssistantMessageBody(body, message) {
+  streamingBodyStates.delete(body);
   const content = String(message?.content || "");
   const recoveryStatus = String(message?.recoveryStatus || "").trim();
   if (message?.streaming && !content.trim()) {
@@ -2326,6 +2588,10 @@ function renderProjectFiles(project = activeProject()) {
       const current = activeProject();
       if (!current) return;
       current.files = current.files.filter((item) => item.id !== file.id);
+      current.removedFileIds = normalizeProjectRemovedFileIds(
+        [...(current.removedFileIds || []), file.id],
+        current.files,
+      );
       current.updatedAt = Date.now();
       saveState();
       renderProjectFiles(current);
@@ -2357,7 +2623,16 @@ function openProjectPanel(project = activeProject()) {
   setTimeout(() => elements.projectName.focus(), 0);
 }
 
+function blockActiveProjectUpload(action) {
+  if (!activeProjectUploadController) return false;
+  const message = `正在上传共享文件，请先取消或等待完成后再${action}。`;
+  if (elements.projectPanel.classList.contains("is-open")) setProjectStatus(message, "error");
+  else showComposerError(message);
+  return true;
+}
+
 function closeProjectPanel() {
+  if (blockActiveProjectUpload("关闭项目设置")) return;
   const wasOpen = elements.projectPanel.classList.contains("is-open");
   elements.projectPanel.classList.remove("is-open");
   elements.projectScrim.classList.remove("is-visible");
@@ -2417,6 +2692,7 @@ function waitForUploadRetry(delay, signal) {
 }
 
 function canRetryUpload(error) {
+  if (error?.retryableUpload === false) return false;
   const status = Number(error?.status) || 0;
   return status === 0 || status === 408 || status === 425 || status === 429 || status >= 500;
 }
@@ -2438,69 +2714,110 @@ async function uploadStep(action, signal) {
   throw lastError || new Error("上传失败");
 }
 
+async function cleanupChunkUpload(uploadId, sessionId) {
+  if (!uploadId || !sessionId) return;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 2000);
+  try {
+    await api(
+      `/api/uploads/${encodeURIComponent(uploadId)}?session_id=${encodeURIComponent(sessionId)}`,
+      { method: "DELETE", signal: controller.signal },
+    );
+  } catch {
+    // Cleanup is best effort and must never replace the upload failure shown to the user.
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function uploadFileInChunks(file, sessionId, onProgress = () => {}, source = "file", signal) {
   if (!file || file.size > MAX_UPLOAD_BYTES) throw new Error("单个文件不能超过 30 MB");
   if (signal?.aborted) throw abortError();
-  const initResponse = await uploadStep(() => api("/api/uploads/init", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ session_id: sessionId, name: file.name, size: file.size, source }),
-    signal,
-  }), signal);
-  const initialized = await initResponse.json();
-  const uploadId = String(initialized.uploadId || "");
-  const chunkSize = Number(initialized.chunkSize);
-  let offset = Number(initialized.nextOffset);
-  if (!uploadId || uploadId.length > 200) throw new Error("服务器没有返回有效的上传编号");
-  if (!Number.isInteger(chunkSize) || chunkSize <= 0 || chunkSize > UPLOAD_CHUNK_BYTES) {
-    throw new Error("服务器返回了无效的分片大小");
-  }
-  if (!Number.isInteger(offset) || offset < 0 || offset > file.size) {
-    throw new Error("服务器返回了无效的上传进度");
-  }
-  onProgress(file.size ? offset / file.size : 1);
-  while (offset < file.size) {
-    const expectedOffset = offset;
-    const nextExpectedOffset = Math.min(file.size, expectedOffset + chunkSize);
-    const chunk = file.slice(expectedOffset, nextExpectedOffset);
-    const chunkResult = await uploadStep(async () => {
-      const form = new FormData();
-      form.append("session_id", sessionId);
-      form.append("offset", String(expectedOffset));
-      form.append("chunk", chunk, file.name);
-      const response = await api(`/api/uploads/${encodeURIComponent(uploadId)}/chunk`, {
+  let uploadId = "";
+  try {
+    const initialized = await uploadStep(async () => {
+      const response = await api("/api/uploads/init", {
         method: "POST",
-        body: form,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId, name: file.name, size: file.size, source }),
+        signal,
+      });
+      try {
+        return await response.json();
+      } catch (cause) {
+        // init currently allocates a new random upload id on every request. If
+        // its successful response is truncated, replaying the POST would leak
+        // another staging upload without giving us the first id to clean up.
+        const error = new Error("上传初始化响应不完整；为避免重复上传，请重新选择文件重试");
+        error.cause = cause;
+        error.uploadPhase = "init";
+        error.retryStrategy = "restart";
+        error.recoverableUploadError = true;
+        error.retryableUpload = false;
+        throw error;
+      }
+    }, signal);
+    const initializedUploadId = String(initialized.uploadId || "");
+    const chunkSize = Number(initialized.chunkSize);
+    let offset = Number(initialized.nextOffset);
+    if (!initializedUploadId || initializedUploadId.length > 200) throw new Error("服务器没有返回有效的上传编号");
+    uploadId = initializedUploadId;
+    if (!Number.isInteger(chunkSize) || chunkSize <= 0 || chunkSize > UPLOAD_CHUNK_BYTES) {
+      throw new Error("服务器返回了无效的分片大小");
+    }
+    if (!Number.isInteger(offset) || offset < 0 || offset > file.size) {
+      throw new Error("服务器返回了无效的上传进度");
+    }
+    onProgress(file.size ? offset / file.size : 1);
+    while (offset < file.size) {
+      const expectedOffset = offset;
+      const nextExpectedOffset = Math.min(file.size, expectedOffset + chunkSize);
+      const chunk = file.slice(expectedOffset, nextExpectedOffset);
+      const chunkResult = await uploadStep(async () => {
+        const form = new FormData();
+        form.append("session_id", sessionId);
+        form.append("offset", String(expectedOffset));
+        form.append("chunk", chunk, file.name);
+        const response = await api(`/api/uploads/${encodeURIComponent(uploadId)}/chunk`, {
+          method: "POST",
+          body: form,
+          signal,
+        });
+        return response.json();
+      }, signal);
+      const nextOffset = Number(chunkResult.nextOffset);
+      if (String(chunkResult.uploadId || uploadId) !== uploadId || nextOffset !== nextExpectedOffset) {
+        throw new Error("服务器返回的分片进度不一致，请重新上传");
+      }
+      offset = nextOffset;
+      onProgress(file.size ? offset / file.size : 1);
+    }
+    const completed = await uploadStep(async () => {
+      const response = await api(`/api/uploads/${encodeURIComponent(uploadId)}/complete`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId }),
         signal,
       });
       return response.json();
     }, signal);
-    const nextOffset = Number(chunkResult.nextOffset);
-    if (String(chunkResult.uploadId || uploadId) !== uploadId || nextOffset !== nextExpectedOffset) {
-      throw new Error("服务器返回的分片进度不一致，请重新上传");
+    if (signal?.aborted) throw abortError();
+    if (!Array.isArray(completed.files) || !completed.files.length) {
+      throw new Error("上传完成，但服务器没有返回文件信息");
     }
-    offset = nextOffset;
-    onProgress(file.size ? offset / file.size : 1);
+    const expectedSource = source === "composer_text" ? "composer_text" : "file";
+    return completed.files.map((uploaded) => {
+      const serverSource = uploaded.source === "composer_text" ? "composer_text" : "file";
+      if (serverSource !== expectedSource) throw new Error("服务器返回的文件类型不一致，请重新上传");
+      if (serverSource === "composer_text" && typeof uploaded.preview !== "string") {
+        throw new Error("服务器没有返回长文字预览，请重新上传");
+      }
+      return { ...uploaded, source: serverSource };
+    });
+  } catch (error) {
+    if (uploadId) await cleanupChunkUpload(uploadId, sessionId);
+    throw error;
   }
-  const completeResponse = await uploadStep(() => api(`/api/uploads/${encodeURIComponent(uploadId)}/complete`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ session_id: sessionId }),
-    signal,
-  }), signal);
-  const completed = await completeResponse.json();
-  if (!Array.isArray(completed.files) || !completed.files.length) {
-    throw new Error("上传完成，但服务器没有返回文件信息");
-  }
-  const expectedSource = source === "composer_text" ? "composer_text" : "file";
-  return completed.files.map((uploaded) => {
-    const serverSource = uploaded.source === "composer_text" ? "composer_text" : "file";
-    if (serverSource !== expectedSource) throw new Error("服务器返回的文件类型不一致，请重新上传");
-    if (serverSource === "composer_text" && typeof uploaded.preview !== "string") {
-      throw new Error("服务器没有返回长文字预览，请重新上传");
-    }
-    return { ...uploaded, source: serverSource };
-  });
 }
 
 async function uploadProjectFiles(fileList) {
@@ -2545,6 +2862,7 @@ async function uploadProjectFiles(fileList) {
       project.files.push(...resultFiles);
       uploadedCount += resultFiles.length;
       project.files = project.files.slice(0, 20);
+      project.removedFileIds = normalizeProjectRemovedFileIds(project.removedFileIds, project.files);
       project.updatedAt = Date.now();
       saveState();
       renderProjectFiles(project);
@@ -3210,7 +3528,11 @@ async function sendMessage() {
   const history = conversation.messages
     .filter((message) => !message.error && !message.streaming && ["user", "assistant"].includes(message.role) && message.content)
     .slice(-60)
-    .map((message) => ({ id: message.id, role: message.role, content: message.content }));
+    .map((message) => ({
+      id: message.id,
+      role: message.role,
+      content: historyContentForTransfer(message.content),
+    }));
   const selectedModel = models.find((model) => model.id === state.model);
   const backendKey = selectedModel?.source === "external" ? `external:${selectedModel.providerId}` : "codex";
   const previousBackend = conversation.backendKey || (conversation.threadId ? "codex" : null);
@@ -3267,6 +3589,8 @@ async function sendMessage() {
   elements.sendButton.hidden = true;
 
   const turnRequest = new AbortController();
+  turnRequest.conversation = conversation;
+  turnRequest.assistantMessage = assistantMessage;
   activeTurnRequest = turnRequest;
   const turnPayload = {
     client_turn_id: clientTurnId,
@@ -3279,7 +3603,9 @@ async function sendMessage() {
     history,
     model: state.model,
     effort: state.effort,
-    attachments: userMessage.attachments.map(({ id, name, source }) => ({ id, name, source })),
+    attachments: userMessage.attachments.map(
+      ({ id, name, size, type, source }) => ({ id, name, size, type, source }),
+    ),
     project_attachments: project?.useContext
       ? project.files.map(({ id, name }) => ({ id, name }))
       : [],
@@ -3292,6 +3618,7 @@ async function sendMessage() {
       : "codex");
   if (requestKind === "external") activeTurn = { threadId: "external", turnId: clientTurnId };
   if (requestKind === "direct_image") activeTurn = { threadId: "image", turnId: clientTurnId };
+  if (requestKind === "codex") activeTurn = { threadId: "codex", turnId: clientTurnId };
   const streamState = {
     cursor: 0,
     hasCursor: false,
@@ -3303,6 +3630,9 @@ async function sendMessage() {
     initialPostReplayAttempted: false,
     requestKind,
     requestPayload: turnPayload,
+    requestPayloadStored: true,
+    userMessageId: userMessage.id,
+    userMessageCreatedAt: userMessage.createdAt,
   };
   persistPendingTurn(conversation, assistantMessage, streamState, { immediate: true });
   let keepPendingRecovery = false;
@@ -3313,14 +3643,16 @@ async function sendMessage() {
       response = await postTurnRequest(turnPayload, turnRequest.signal);
       streamState.initialPostUncertain = false;
       streamState.initialPostResponseState = "received";
-      streamState.requestPayload = null;
+      streamState.requestPayload = compactPendingRequestPayload(streamState.requestPayload);
+      streamState.requestPayloadStored = false;
       persistPendingTurn(conversation, assistantMessage, streamState, { immediate: true });
     } catch (error) {
       const receivedHttpResponse = Number(error?.status) > 0;
       streamState.initialPostResponseState = receivedHttpResponse ? "received" : "no_http_response";
       if (receivedHttpResponse) {
         streamState.initialPostUncertain = false;
-        streamState.requestPayload = null;
+        streamState.requestPayload = compactPendingRequestPayload(streamState.requestPayload);
+        streamState.requestPayloadStored = false;
       }
       persistPendingTurn(conversation, assistantMessage, streamState, { immediate: true });
       if (!isTurnConnectionError(error)) throw error;
@@ -3331,8 +3663,8 @@ async function sendMessage() {
       signal: turnRequest.signal,
       initialError: initialStreamError,
       streamState,
-      resumeEnabled: ["external", "direct_image"].includes(requestKind),
-      requestInitial: ["external", "direct_image"].includes(requestKind)
+      resumeEnabled: ["external", "direct_image", "codex"].includes(requestKind),
+      requestInitial: ["external", "direct_image", "codex"].includes(requestKind)
         ? (requestPayload, signal) => postTurnRequest(requestPayload, signal)
         : null,
       onProgress: (progress, persistOptions = {}) => persistPendingTurn(
@@ -3344,9 +3676,7 @@ async function sendMessage() {
     });
   } catch (error) {
     if (error?.name === "AbortError") {
-      assistantMessage.content = stripInternalAnnotations(assistantMessage.content, { removeIncomplete: true }).trimEnd()
-        || "已停止生成。";
-      assistantMessage.error = false;
+      normalizeStoppedAssistantMessage(assistantMessage);
     } else if (error.status === 429) {
       conversation.messages = conversation.messages.filter(
         (message) => ![userMessage.id, assistantMessage.id].includes(message.id),
@@ -3393,16 +3723,118 @@ async function sendMessage() {
 
 function resumePendingTurnOnce() {
   if (pendingRecoveryPromise) return pendingRecoveryPromise;
-  pendingRecoveryPromise = Promise.resolve(resumePendingTurn())
+  const pending = loadPendingTurn();
+  const clientTurnId = String(pending?.clientTurnId || "");
+  pendingRecoveryPromise = Promise.resolve(resumePendingTurn(pending))
     .finally(() => {
       pendingRecoveryPromise = null;
+      const nextPending = loadPendingTurn();
+      if (
+        clientTurnId
+        && nextPending
+        && nextPending.clientTurnId !== clientTurnId
+        && !isSending
+      ) {
+        pendingRecoveryWaiting = true;
+        updateComposer();
+        setTimeout(() => {
+          if (!isSending && pendingRecoveryWaiting && !pendingRecoveryPromise) {
+            void resumePendingTurnOnce();
+          }
+        }, 0);
+      }
     });
   return pendingRecoveryPromise;
 }
 
-async function resumePendingTurn() {
+function prepareAssistantForResume(assistantMessage, pending) {
+  const replayFromStart = Boolean(pending?.contentDropped)
+    && Math.max(0, Number(pending?.cursor) || 0) === 0
+    && !pending?.hasCursor;
+  assistantMessage.content = replayFromStart
+    ? ""
+    : String(assistantMessage.content || pending?.content || "");
+  assistantMessage.files = replayFromStart
+    ? []
+    : (
+      Array.isArray(assistantMessage.files) && assistantMessage.files.length
+        ? assistantMessage.files
+        : (Array.isArray(pending?.files) ? pending.files : [])
+    );
+  return assistantMessage;
+}
+
+function restorePendingUserMessage(conversation, pending) {
+  const payload = pending?.requestPayload;
+  if (!payload || typeof payload !== "object") return null;
+  const content = String(payload.message || "");
+  const attachments = (Array.isArray(payload.attachments) ? payload.attachments : [])
+    .filter((attachment) => attachment && attachment.id && attachment.name)
+    .slice(0, MAX_TURN_FILES)
+    .map((attachment) => ({
+      id: String(attachment.id),
+      name: String(attachment.name),
+      size: Math.max(0, Number(attachment.size) || 0),
+      type: attachment.type === "image"
+        || /\.(?:avif|gif|jpe?g|png|webp)$/i.test(String(attachment.name))
+        ? "image"
+        : "document",
+      source: attachment.source === "composer_text" ? "composer_text" : "file",
+    }));
+  if (!content && !attachments.length) return null;
+  if (!Array.isArray(conversation.messages)) conversation.messages = [];
+  const explicitUserMessageId = /^[a-f0-9]{32}$/.test(String(pending.userMessageId || ""))
+    ? String(pending.userMessageId)
+    : "";
+  let userMessage = explicitUserMessageId
+    ? conversation.messages.find(
+      (message) => message?.id === explicitUserMessageId && message?.role === "user",
+    )
+    : null;
+  if (!userMessage) {
+    const assistantIndex = conversation.messages.findIndex(
+      (message) => message?.id === pending.assistantMessageId && message?.role === "assistant",
+    );
+    if (!explicitUserMessageId && assistantIndex > 0 && conversation.messages[assistantIndex - 1]?.role === "user") {
+      userMessage = conversation.messages[assistantIndex - 1];
+    }
+  }
+  if (userMessage) {
+    userMessage.content = content || "请分析我上传的附件。";
+    userMessage.attachments = attachments;
+    if (!Number(userMessage.createdAt) && Number(pending.userMessageCreatedAt) > 0) {
+      userMessage.createdAt = Number(pending.userMessageCreatedAt);
+    }
+    return userMessage;
+  }
+
+  const userMessageId = explicitUserMessageId
+    || (/^[a-f0-9]{32}$/.test(String(pending.clientTurnId || ""))
+      ? String(pending.clientTurnId)
+      : randomId());
+  const assistantCreatedAt = Number(pending.createdAt);
+  const createdAt = Number(pending.userMessageCreatedAt)
+    || (Number.isFinite(assistantCreatedAt) && assistantCreatedAt > 1
+      ? assistantCreatedAt - 1
+      : Date.now());
+  userMessage = {
+    id: userMessageId,
+    role: "user",
+    content: content || "请分析我上传的附件。",
+    attachments,
+    createdAt,
+  };
+  const assistantIndex = conversation.messages.findIndex(
+    (message) => message?.id === pending.assistantMessageId && message?.role === "assistant",
+  );
+  if (assistantIndex >= 0) conversation.messages.splice(assistantIndex, 0, userMessage);
+  else conversation.messages.push(userMessage);
+  return userMessage;
+}
+
+async function resumePendingTurn(selectedPending = undefined) {
   if (isSending) return;
-  const pending = loadPendingTurn();
+  const pending = selectedPending === undefined ? loadPendingTurn() : selectedPending;
   if (!pending) {
     pendingRecoveryWaiting = false;
     updateComposer();
@@ -3410,9 +3842,10 @@ async function resumePendingTurn() {
   }
   let conversation = state.conversations.find((item) => item.id === pending.conversationId);
   if (!conversation) {
+    const payloadWorkspaceId = String(pending.requestPayload?.session_id || "");
     conversation = {
       id: pending.conversationId,
-      workspaceId: state.sessionId,
+      workspaceId: /^[a-f0-9]{32}$/.test(payloadWorkspaceId) ? payloadWorkspaceId : state.sessionId,
       projectId: null,
       threadId: null,
       externalConversationId: null,
@@ -3428,12 +3861,18 @@ async function resumePendingTurn() {
     state.conversations.unshift(conversation);
   }
 
+  const restoredUserMessage = restorePendingUserMessage(conversation, pending);
   let assistantMessage = conversation.messages.find(
     (message) => message.id === pending.assistantMessageId && message.role === "assistant",
   );
   if (assistantMessage && !assistantMessage.streaming && !assistantMessage.recoveryStatus) {
     clearPendingTurn(pending.clientTurnId);
     pendingRecoveryWaiting = false;
+    if (restoredUserMessage) {
+      conversation.updatedAt = Date.now();
+      saveState();
+      renderAll();
+    }
     updateComposer();
     return;
   }
@@ -3450,10 +3889,7 @@ async function resumePendingTurn() {
     };
     conversation.messages.push(assistantMessage);
   } else {
-    assistantMessage.content = String(assistantMessage.content || pending.content || "");
-    assistantMessage.files = Array.isArray(assistantMessage.files) && assistantMessage.files.length
-      ? assistantMessage.files
-      : (Array.isArray(pending.files) ? pending.files : []);
+    prepareAssistantForResume(assistantMessage, pending);
     assistantMessage.mode = assistantMessage.mode || String(pending.mode || "");
     assistantMessage.clientTurnId = pending.clientTurnId;
     assistantMessage.streaming = true;
@@ -3471,7 +3907,7 @@ async function resumePendingTurn() {
       ? { threadId: "external", turnId: pending.clientTurnId }
       : (pending.requestKind === "direct_image"
         ? { threadId: "image", turnId: pending.clientTurnId }
-        : null));
+        : { threadId: "codex", turnId: pending.clientTurnId }));
   assistantMessage.recoveryStatus = "正在恢复未完成的回答……";
   conversation.updatedAt = Date.now();
   saveState();
@@ -3481,6 +3917,8 @@ async function resumePendingTurn() {
   updateComposer();
 
   const turnRequest = new AbortController();
+  turnRequest.conversation = conversation;
+  turnRequest.assistantMessage = assistantMessage;
   activeTurnRequest = turnRequest;
   const streamState = {
     cursor: Math.max(0, Number(pending.cursor) || 0),
@@ -3492,9 +3930,10 @@ async function resumePendingTurn() {
     initialPostAttemptedAt: Number(pending.initialPostAttemptedAt) || 0,
     initialPostReplayAttempted: Boolean(pending.initialPostReplayAttempted),
     requestKind: String(pending.requestKind || "codex"),
-    requestPayload: pending.requestPayloadStored && pending.requestPayload
-      ? pending.requestPayload
-      : null,
+    requestPayload: pending.requestPayload || null,
+    requestPayloadStored: Boolean(pending.requestPayloadStored),
+    userMessageId: restoredUserMessage?.id || String(pending.userMessageId || ""),
+    userMessageCreatedAt: Number(restoredUserMessage?.createdAt || pending.userMessageCreatedAt) || 0,
   };
   const disconnected = new Error("回答连接意外中断，请重试");
   disconnected.recoverableStreamError = true;
@@ -3505,8 +3944,8 @@ async function resumePendingTurn() {
       signal: turnRequest.signal,
       initialError: disconnected,
       streamState,
-      resumeEnabled: ["external", "direct_image"].includes(pending.requestKind),
-      requestInitial: ["external", "direct_image"].includes(pending.requestKind)
+      resumeEnabled: ["external", "direct_image", "codex"].includes(pending.requestKind),
+      requestInitial: ["external", "direct_image", "codex"].includes(pending.requestKind)
         ? (requestPayload, signal) => postTurnRequest(requestPayload, signal)
         : null,
       onProgress: (progress, persistOptions = {}) => persistPendingTurn(
@@ -3518,9 +3957,7 @@ async function resumePendingTurn() {
     });
   } catch (error) {
     if (error?.name === "AbortError") {
-      assistantMessage.content = stripInternalAnnotations(assistantMessage.content, { removeIncomplete: true }).trimEnd()
-        || "已停止生成。";
-      assistantMessage.error = false;
+      normalizeStoppedAssistantMessage(assistantMessage);
     } else if (error?.recoveryFailed) {
       keepPendingRecovery = true;
       pendingRecoveryWaiting = true;
@@ -3572,6 +4009,9 @@ async function consumeStream(response, conversation, assistantMessage, options =
     eventIds: new Set(),
     finished: false,
   };
+  if (!Object.prototype.hasOwnProperty.call(streamState, "requestPayloadStored")) {
+    streamState.requestPayloadStored = Boolean(streamState.requestPayload);
+  }
   let currentResponse = response;
   let failure = options.initialError || null;
   let attempts = 0;
@@ -3619,7 +4059,7 @@ async function consumeStream(response, conversation, assistantMessage, options =
       if (Number(error?.status) === 404) {
         const replayBlockReason = initialPostReplayBlockReason(streamState);
         if (streamState.initialPostUncertain && !replayBlockReason) {
-          if (!requestInitial || !streamState.requestPayload) {
+          if (!requestInitial || !streamState.requestPayload || !streamState.requestPayloadStored) {
             throw missingTurnRecoveryError("服务器没有可恢复记录，且本机未能保留完整请求。为避免重复发送，请先核对官网或会话记录，再手动重试");
           }
           assistantMessage.recoveryStatus = "服务器未收到消息，正在安全补发……";
@@ -3630,7 +4070,8 @@ async function consumeStream(response, conversation, assistantMessage, options =
             currentResponse = await requestInitial(streamState.requestPayload, signal);
             streamState.initialPostUncertain = false;
             streamState.initialPostResponseState = "received";
-            streamState.requestPayload = null;
+            streamState.requestPayload = compactPendingRequestPayload(streamState.requestPayload);
+            streamState.requestPayloadStored = false;
             onProgress(streamState, { immediate: true });
             failure = null;
           } catch (initialError) {
@@ -3638,7 +4079,8 @@ async function consumeStream(response, conversation, assistantMessage, options =
             streamState.initialPostResponseState = receivedHttpResponse ? "received" : "no_http_response";
             if (receivedHttpResponse) {
               streamState.initialPostUncertain = false;
-              streamState.requestPayload = null;
+              streamState.requestPayload = compactPendingRequestPayload(streamState.requestPayload);
+              streamState.requestPayloadStored = false;
             }
             onProgress(streamState, { immediate: true });
             if (initialError?.name === "AbortError") throw initialError;
@@ -3680,7 +4122,7 @@ async function consumeStreamResponse(response, conversation, assistantMessage, s
     if (value) buffer += decoder.decode(value, { stream: !done });
     if (done) buffer += decoder.decode();
     const lines = buffer.split("\n");
-    buffer = done ? "" : lines.pop();
+    buffer = lines.pop() ?? "";
     for (const line of lines) {
       if (!line.trim()) continue;
       let event;
@@ -3693,6 +4135,26 @@ async function consumeStreamResponse(response, conversation, assistantMessage, s
       applyTurnEvent(event, conversation, assistantMessage, streamState);
       onProgress(streamState);
       if (streamState.finished) return;
+    }
+    if (done && buffer.trim()) {
+      let event;
+      try {
+        event = JSON.parse(buffer);
+      } catch (cause) {
+        // A final NDJSON record without its newline may have been cut anywhere
+        // in transit. Treat that ambiguous tail as a recoverable disconnect;
+        // newline-terminated malformed records above remain protocol errors.
+        const error = new Error("回答连接意外中断，请重试");
+        error.recoverableStreamError = true;
+        error.cause = cause;
+        throw error;
+      }
+      buffer = "";
+      if (acceptTurnEvent(event, streamState)) {
+        applyTurnEvent(event, conversation, assistantMessage, streamState);
+        onProgress(streamState);
+        if (streamState.finished) return;
+      }
     }
     if (done) {
       const error = new Error("回答连接意外中断，请重试");
@@ -3755,18 +4217,36 @@ function updateStreamingMessage(message) {
     streamingRenderScheduled = false;
     const latest = pendingStreamingMessage;
     pendingStreamingMessage = null;
-    if (!latest) return;
+    if (!latest?.streaming) return;
     const article = elements.messageList.querySelector(
       `.message[data-message-id="${latest.id}"]`,
     );
     if (!article) return;
     const isThinking = Boolean(latest.streaming) && !String(latest.content || "").trim();
     article.classList.toggle("is-thinking", isThinking);
-    renderAssistantMessageBody(article.querySelector(".message-body"), latest);
+    renderStreamingMessageBody(article.querySelector(".message-body"), latest);
     if (autoScrollEnabled) {
       window.scrollTo({ top: document.documentElement.scrollHeight, behavior: "auto" });
     }
   });
+}
+
+function normalizeStoppedAssistantMessage(message) {
+  if (!message) return false;
+  let content = stripInternalAnnotations(
+    message.content,
+    { removeIncomplete: true },
+  ).trimEnd();
+  if (message.error) {
+    const interruptionMarker = "\n\n> 回答传输中断：";
+    const markerIndex = content.lastIndexOf(interruptionMarker);
+    content = markerIndex >= 0 ? content.slice(0, markerIndex).trimEnd() : "";
+  }
+  message.content = content || "已停止生成。";
+  message.streaming = false;
+  message.recoveryStatus = "";
+  message.error = false;
+  return true;
 }
 
 async function stopCurrentTurn() {
@@ -3777,6 +4257,9 @@ async function stopCurrentTurn() {
     showComposerError("回答任务仍在建立连接，暂时无法确认停止；请稍后再试");
     return;
   }
+  const stoppingRequest = activeTurnRequest;
+  const stoppingConversation = stoppingRequest?.conversation || null;
+  const stoppingAssistantMessage = stoppingRequest?.assistantMessage || null;
   elements.stopButton.disabled = true;
   try {
     await api(`/api/turn/${encodeURIComponent(turn.threadId)}/${encodeURIComponent(turn.turnId)}/interrupt`, { method: "POST" });
@@ -3786,18 +4269,19 @@ async function stopCurrentTurn() {
     return;
   }
 
-  activeTurnRequest?.abort();
+  stoppingRequest?.abort();
   try {
+    if (!wasWaitingForRecovery && normalizeStoppedAssistantMessage(stoppingAssistantMessage)) {
+      if (stoppingConversation) stoppingConversation.updatedAt = Date.now();
+      saveState();
+      renderAll();
+    }
     if (wasWaitingForRecovery) {
       const pending = latestPendingTurnSnapshot || loadPendingTurn();
       const conversation = state.conversations.find((item) => item.id === pending?.conversationId);
       const assistantMessage = conversation?.messages.find((message) => message.id === pending?.assistantMessageId);
       if (assistantMessage) {
-        assistantMessage.content = stripInternalAnnotations(assistantMessage.content, { removeIncomplete: true }).trimEnd()
-          || "已停止生成。";
-        assistantMessage.streaming = false;
-        assistantMessage.recoveryStatus = "";
-        assistantMessage.error = false;
+        normalizeStoppedAssistantMessage(assistantMessage);
         conversation.updatedAt = Date.now();
       }
       clearPendingTurn(pending?.clientTurnId || "");
@@ -3976,6 +4460,7 @@ document.querySelectorAll("[data-prompt]").forEach((button) => {
   });
 });
 window.addEventListener("paste", (event) => {
+  if (event.target !== elements.input || document.activeElement !== elements.input) return;
   const images = [...(event.clipboardData?.files || [])].filter((file) => file.type.startsWith("image/"));
   if (images.length) uploadSelectedFiles(images);
 });
@@ -4048,8 +4533,12 @@ document.addEventListener("visibilitychange", () => {
   }
 });
 window.addEventListener("pagehide", flushPendingTurnSnapshot);
+function shouldWarnBeforeUnload() {
+  return providerFormDirty || uploadControllers.size > 0 || Boolean(activeProjectUploadController);
+}
+
 window.addEventListener("beforeunload", (event) => {
-  if (!providerFormDirty) return;
+  if (!shouldWarnBeforeUnload()) return;
   event.preventDefault();
   event.returnValue = "";
 });

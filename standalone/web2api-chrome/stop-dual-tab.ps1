@@ -23,7 +23,7 @@ foreach ($process in $targets) {
 $browserTargets = Get-CimInstance Win32_Process | Where-Object {
     $_.Name -match 'chrome|msedge' -and
     $_.CommandLine -and
-    $_.CommandLine -match '--remote-debugging-port=9325(?:\s|$)'
+    $_.CommandLine -match '--remote-debugging-port(?:=|\s+)9325(?:\s|$)'
 }
 foreach ($process in $browserTargets) {
     Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue

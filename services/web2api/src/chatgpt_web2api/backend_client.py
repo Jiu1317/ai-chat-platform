@@ -38,10 +38,11 @@ import asyncio
 import base64
 import json
 import logging
+import mimetypes
 import time
 
 from .breakers import BreakerKind
-from .multimodal import _download_remote_image
+from .multimodal import _download_remote_file, _download_remote_image
 
 logger = logging.getLogger(__name__)
 
@@ -473,8 +474,18 @@ class BackendClient:
             return await self._download_response_asset_via_browser(asset)
         try:
             resolved = await self._resolve_response_asset_url(asset)
+            declared_type = str(asset.get("mime_type") or "").lower()
+            guessed_type = mimetypes.guess_type(
+                str(asset.get("name") or resolved.get("filename") or "")
+            )[0] or ""
+            is_image = (
+                str(asset.get("type") or "").lower() == "image"
+                or declared_type.startswith("image/")
+                or guessed_type.startswith("image/")
+            )
+            downloader = _download_remote_image if is_image else _download_remote_file
             data, content_type, _ = await asyncio.wait_for(
-                _download_remote_image(
+                downloader(
                     resolved["url"], retry_connection_timeouts=False
                 ),
                 timeout=DIRECT_ASSET_DOWNLOAD_TIMEOUT_SECONDS,
@@ -549,12 +560,40 @@ class BackendClient:
             "   filename=meta.file_name||'';r=await fetch(meta.download_url);"
             "   if(!r.ok)return JSON.stringify({status:r.status,error:'signed download failed'});"
             " }"
-            " var b=await r.arrayBuffer();"
-            f" if(b.byteLength>{MAX_BROWSER_ASSET_BYTES})"
-            "return JSON.stringify({status:413,error:'asset too large'});"
-            " var u=new Uint8Array(b),chunks=[];"
-            " for(var i=0;i<u.length;i+=32768)"
-            "   chunks.push(String.fromCharCode.apply(null,u.subarray(i,i+32768)));"
+            " var lengthHeader=r.headers.get('content-length');"
+            " var declaredLength=Number(lengthHeader);"
+            " if(lengthHeader!==null && /^[0-9]+$/.test(lengthHeader.trim()) &&"
+            "   Number.isSafeInteger(declaredLength) && declaredLength>__D.max_bytes){"
+            "   if(r.body){try{await r.body.cancel('asset too large');}catch(_e){}}"
+            "   return JSON.stringify({status:413,error:'asset too large',"
+            "     cancelled:true,bytes_read:0});"
+            " }"
+            " if(!r.body || typeof r.body.getReader!=='function')"
+            "   return JSON.stringify({status:502,error:'response body is not streamable'});"
+            " var reader=r.body.getReader(),byteChunks=[],total=0;"
+            " try{"
+            "   while(true){"
+            "     var part=await reader.read();"
+            "     if(part.done)break;"
+            "     var chunk=part.value instanceof Uint8Array"
+            "       ? part.value : new Uint8Array(part.value);"
+            "     total+=chunk.byteLength;"
+            "     if(total>__D.max_bytes){"
+            "       try{await reader.cancel('asset too large');}catch(_e){}"
+            "       return JSON.stringify({status:413,error:'asset too large',"
+            "         cancelled:true,bytes_read:total});"
+            "     }"
+            "     byteChunks.push(chunk);"
+            "   }"
+            " }catch(e){"
+            "   try{await reader.cancel();}catch(_e){}"
+            "   return JSON.stringify({status:502,error:'stream read failed'});"
+            " }finally{try{reader.releaseLock();}catch(_e){}}"
+            " var chunks=[];"
+            " for(var c=0;c<byteChunks.length;c++){var u=byteChunks[c];"
+            "   for(var i=0;i<u.length;i+=32768)"
+            "     chunks.push(String.fromCharCode.apply(null,u.subarray(i,i+32768)));"
+            " }"
             " return JSON.stringify({status:200,content_type:r.headers.get('content-type')||"
             "   __D.mime_type||'application/octet-stream',disposition:"
             "   r.headers.get('content-disposition')||'',filename:filename,data:btoa(chunks.join(''))});"
@@ -564,11 +603,14 @@ class BackendClient:
                 "file_id": file_id,
                 "source_url": source_url,
                 "mime_type": asset.get("mime_type") or "",
+                "max_bytes": MAX_BROWSER_ASSET_BYTES,
             },
             timeout=90,
         )
         self._check_auth_in_raw(raw)
         payload = json.loads(raw)
+        if payload.get("status") == 413:
+            raise RuntimeError("ChatGPT asset exceeds the 30 MiB limit")
         if payload.get("status") != 200 or not payload.get("data"):
             raise RuntimeError(
                 f"ChatGPT asset download failed (HTTP {payload.get('status', 'unknown')})"
@@ -951,6 +993,8 @@ class BackendClient:
         async for chunk in d.send_and_stream(memory_prompt, timeout=60):
             if chunk.delta:
                 full_response += chunk.delta
+            if chunk.final_text is not None:
+                full_response = chunk.final_text
 
         conv_id = d._current_conv_id or ""
 

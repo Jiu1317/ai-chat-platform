@@ -794,6 +794,8 @@ async def do_chat_completion(
         if chunk.finish_reason:
             conv_id = driver._current_conv_id or ""
             await _notify(on_progress, "Finalizing…")
+        if chunk.final_text is not None:
+            full_response = chunk.final_text
 
     return {
         "content": full_response,
@@ -1030,6 +1032,8 @@ async def do_chat_with_gpt(
         if chunk.finish_reason:
             conv_id = driver._current_conv_id or ""
             await _notify(on_progress, "Finalizing…")
+        if chunk.final_text is not None:
+            full_response = chunk.final_text
     return {
         "content": full_response,
         "model": "gpt",

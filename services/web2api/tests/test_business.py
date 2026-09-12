@@ -9,6 +9,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from chatgpt_web2api.cdp_driver import StreamChunk
+
 # ── Fixtures ──────────────────────────────────────────────────
 
 @pytest.fixture
@@ -423,6 +425,31 @@ async def test_chat_completion_basic(mock_driver, mock_config):
 
 
 @pytest.mark.asyncio
+async def test_chat_completion_prefers_authoritative_terminal_text(
+    mock_driver, mock_config
+):
+    from chatgpt_web2api.mcp_server import do_chat_completion
+
+    async def rewritten_stream(_text, timeout=120, *, budgets=None, model=None):
+        yield StreamChunk(delta="Draft answer.")
+        yield StreamChunk(
+            delta="",
+            finish_reason="stop",
+            final_text="Final answer with corrected wording.",
+        )
+
+    mock_driver.send_and_stream = rewritten_stream
+
+    result = await do_chat_completion(
+        mock_driver,
+        {"message": "Hello"},
+        mock_config,
+    )
+
+    assert result["content"] == "Final answer with corrected wording."
+
+
+@pytest.mark.asyncio
 async def test_chat_completion_with_system_prompt(mock_driver, mock_config):
     from chatgpt_web2api.mcp_server import do_chat_completion
     result = await do_chat_completion(mock_driver, {
@@ -477,6 +504,28 @@ async def test_chat_with_gpt(mock_driver):
     assert result["content"] == "Hello!"
     assert result["gpt_id"] == "gpt-1"
     mock_driver.navigate_gpt.assert_called_once_with(gizmo_id="gpt-1")
+
+
+@pytest.mark.asyncio
+async def test_chat_with_gpt_prefers_authoritative_terminal_text(mock_driver):
+    from chatgpt_web2api.mcp_server import do_chat_with_gpt
+
+    async def rewritten_stream(_text, timeout=120):
+        yield StreamChunk(delta="Draft.")
+        yield StreamChunk(
+            delta="",
+            finish_reason="stop",
+            final_text="Final.",
+        )
+
+    mock_driver.send_and_stream = rewritten_stream
+
+    result = await do_chat_with_gpt(
+        mock_driver,
+        {"gpt_id": "gpt-1", "message": "Write code"},
+    )
+
+    assert result["content"] == "Final."
 
 
 # ── API Server: message history ──────────────────────────────

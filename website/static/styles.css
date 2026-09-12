@@ -612,6 +612,14 @@ body.has-project .empty-state { top: 104px; }
   letter-spacing: 0.01em;
   animation: thinking-text-breathe 1.45s ease-in-out infinite;
 }
+.streaming-content {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.streaming-content + .thinking-indicator {
+  display: flex;
+  margin-top: 8px;
+}
 .message.is-error .message-body { color: var(--danger); }
 .message-files { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 10px; }
 .message-files:empty { display: none; }
@@ -911,7 +919,17 @@ select:disabled { color: var(--faint); cursor: wait; }
 .attachment-chip { max-width: 220px; flex: none; background: var(--surface); }
 .attachment-list:not([hidden]) .attachment-chip { animation: attachment-arrive 180ms var(--ease-out) both; }
 .attachment-chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.attachment-chip button { border: 0; background: transparent; color: var(--faint); cursor: pointer; font-size: 10px; }
+.attachment-chip button {
+  min-width: 28px;
+  min-height: 28px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--faint);
+  cursor: pointer;
+  font-size: 10px;
+}
 .attachment-chip.is-loading { opacity: 0.62; }
 .attachment-chip.is-error {
   max-width: min(360px, calc(100vw - 32px));
@@ -1367,6 +1385,8 @@ body.picker-open { overflow: hidden; }
   .project-panel .icon-button, .project-panel .secondary-button,
   .settings-panel .provider-row-actions button { min-height: 44px; }
   .message-action { width: 44px; height: 44px; }
+  .attachment-list .attachment-chip { min-height: 44px; padding-inline-end: 2px; }
+  .attachment-list .attachment-chip button { min-width: 44px; min-height: 44px; padding: 0 10px; }
 }
 
 @keyframes blink { 50% { opacity: 0; } }

@@ -71,6 +71,21 @@ def test_public_context_limits_allow_thirty_history_turns_plus_current():
     assert MAX_SYSTEM_CONTEXT_CHARS == 24_000
 
 
+def test_developer_message_is_preserved_as_high_priority_instruction():
+    text, _images, latest, has_instructions, _has_history = _build_chat_context(
+        [
+            {"role": "developer", "content": "Always answer in JSON."},
+            {"role": "user", "content": "Give me one item."},
+        ]
+    )
+
+    assert text.startswith(
+        "[System Instructions]\nAlways answer in JSON.\n\n[User]\n"
+    )
+    assert latest == "Give me one item."
+    assert has_instructions is True
+
+
 def test_bootstrap_keeps_current_plus_configured_recent_turns():
     messages = [{"role": "system", "content": "answer clearly"}]
     total_prior = MAX_HISTORY_TURNS + 4
@@ -330,6 +345,169 @@ async def test_handler_rejects_nine_images_before_starting_stream():
     )
 
     assert response.status == 400
+    server._driver.navigate_new_chat.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_streaming_reference_image_validation_is_deferred_to_stream(
+    monkeypatch,
+):
+    import chatgpt_web2api.api_server as srv
+
+    server = _server()
+    server._stream_response = AsyncMock(return_value=MagicMock(status=200))
+    prepare = AsyncMock(
+        side_effect=srv.ImageInputError("Image exceeds the 30 MiB limit")
+    )
+    monkeypatch.setattr(srv, "prepare_image_files", prepare)
+    monkeypatch.setattr(srv, "MutationLock", _NullLock)
+
+    response = await server._handle_chat(
+        _request(
+            {
+                "model": "auto",
+                "stream": True,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "describe"},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": "https://example.com/oversized.png"
+                                },
+                            },
+                        ],
+                    }
+                ],
+            }
+        )
+    )
+
+    assert response.status == 200
+    prepare.assert_not_awaited()
+    server._stream_response.assert_awaited_once()
+    stream_kwargs = server._stream_response.await_args.kwargs
+    assert stream_kwargs["image_paths"] == []
+    assert len(stream_kwargs["image_references"]) == 1
+    assert stream_kwargs["image_directory"]
+    server._driver.navigate_new_chat.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_nonstreaming_reference_image_keeps_http_400_prevalidation(
+    monkeypatch,
+):
+    import chatgpt_web2api.api_server as srv
+
+    server = _server()
+    server._full_response = AsyncMock()
+    prepare = AsyncMock(
+        side_effect=srv.ImageInputError("Image exceeds the 30 MiB limit")
+    )
+    monkeypatch.setattr(srv, "prepare_image_files", prepare)
+
+    response = await server._handle_chat(
+        _request(
+            {
+                "model": "auto",
+                "stream": False,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "describe"},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": "https://example.com/oversized.png"
+                                },
+                            },
+                        ],
+                    }
+                ],
+            }
+        )
+    )
+
+    assert response.status == 400
+    assert b"Image exceeds the 30 MiB limit" in response.body
+    prepare.assert_awaited_once()
+    server._full_response.assert_not_awaited()
+    server._driver.navigate_new_chat.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload", "param"),
+    [
+        (
+            {
+                "model": "auto",
+                "messages": [
+                    {"role": "user", "content": "run it"},
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call_1",
+                        "content": "result",
+                    },
+                    {"role": "user", "content": "continue"},
+                ],
+            },
+            "messages[1].role",
+        ),
+        (
+            {
+                "model": "auto",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "summarize this"},
+                            {
+                                "type": "input_file",
+                                "file_url": "https://example.com/report.pdf",
+                            },
+                        ],
+                    }
+                ],
+            },
+            "messages[0].content[1]",
+        ),
+        (
+            {
+                "model": "auto",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "file",
+                                "file": {
+                                    "file_data": "data:application/pdf;base64,AAAA"
+                                },
+                            }
+                        ],
+                    }
+                ],
+            },
+            "messages[0].content[0]",
+        ),
+    ],
+)
+async def test_handler_explicitly_rejects_unsupported_tool_and_file_inputs(
+    payload, param
+):
+    server = _server()
+
+    response = await server._handle_chat(_request(payload))
+
+    assert response.status == 400
+    assert b'"code": "unsupported_feature"' in response.body
+    assert param.encode() in response.body
+    server._driver.select_model.assert_not_awaited()
+    server._driver.navigate_conversation.assert_not_awaited()
     server._driver.navigate_new_chat.assert_not_awaited()
 
 

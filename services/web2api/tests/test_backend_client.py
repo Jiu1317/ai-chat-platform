@@ -131,6 +131,43 @@ async def test_response_asset_prefers_direct_binary_download():
 
 
 @pytest.mark.asyncio
+async def test_response_file_uses_generic_download_without_image_sniffing():
+    client, driver = _make_client()
+    with (
+        patch(
+            "chatgpt_web2api.backend_client._download_remote_file",
+            new=AsyncMock(
+                return_value=(
+                    b"%PDF-1.7\nreport",
+                    "application/pdf",
+                    "https://cdn.example/report.pdf",
+                )
+            ),
+        ) as file_download,
+        patch(
+            "chatgpt_web2api.backend_client._download_remote_image",
+            new=AsyncMock(),
+        ) as image_download,
+    ):
+        result = await client.download_response_asset(
+            {
+                "type": "file",
+                "mime_type": "application/pdf",
+                "source_url": "https://cdn.example/report.pdf",
+                "name": "report.pdf",
+            }
+        )
+
+    assert result["data"].startswith(b"%PDF")
+    assert result["content_type"] == "application/pdf"
+    file_download.assert_awaited_once_with(
+        "https://cdn.example/report.pdf", retry_connection_timeouts=False
+    )
+    image_download.assert_not_awaited()
+    driver.ensure_token.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_file_id_only_response_asset_uses_browser_without_direct_wait():
     client, _ = _make_client()
     client._resolve_response_asset_url = AsyncMock()
@@ -201,9 +238,54 @@ async def test_browser_asset_download_uses_thirty_mib_guard():
     })
 
     script = driver._js_with_data_strict.await_args.args[0]
-    assert f"b.byteLength>{MAX_BROWSER_ASSET_BYTES}" in script
+    payload = driver._js_with_data_strict.await_args.args[1]
+    assert "r.headers.get('content-length')" in script
+    assert "r.body.getReader()" in script
+    assert "arrayBuffer" not in script
+    assert "total>__D.max_bytes" in script
+    assert payload["max_bytes"] == MAX_BROWSER_ASSET_BYTES
     assert result["data"] == b"file-bytes"
     assert result["filename"] == "report.pdf"
+
+
+@pytest.mark.asyncio
+async def test_browser_asset_download_cancels_unknown_length_oversized_stream():
+    client, driver = _make_client()
+
+    async def simulate_unknown_length_oversized_stream(script, payload, **_kwargs):
+        # Model a response with no Content-Length whose next chunk crosses the
+        # cap. The browser program must cancel before retaining that chunk or
+        # entering its base64 assembly path.
+        assert payload["max_bytes"] == MAX_BROWSER_ASSET_BYTES
+        assert "r.body.getReader()" in script
+        assert "total>__D.max_bytes" in script
+        cancel_at = script.index("await reader.cancel('asset too large')")
+        retain_at = script.index("byteChunks.push(chunk)")
+        encode_at = script.index("btoa(chunks.join(''))")
+        assert cancel_at < retain_at < encode_at
+        return json.dumps(
+            {
+                "status": 413,
+                "error": "asset too large",
+                "cancelled": True,
+                "bytes_read": MAX_BROWSER_ASSET_BYTES + 1,
+            }
+        )
+
+    driver._js_with_data_strict = AsyncMock(
+        side_effect=simulate_unknown_length_oversized_stream
+    )
+
+    with pytest.raises(RuntimeError, match="exceeds the 30 MiB limit"):
+        await client._download_response_asset_via_browser(
+            {
+                "file_id": "file_result",
+                "mime_type": "application/pdf",
+                "name": "oversized.pdf",
+            }
+        )
+
+    driver._js_with_data_strict.assert_awaited_once()
 
 
 @pytest.mark.asyncio

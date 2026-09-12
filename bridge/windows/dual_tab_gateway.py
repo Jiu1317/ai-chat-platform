@@ -11,6 +11,7 @@ import math
 import os
 import time
 from collections.abc import Iterable
+from contextlib import asynccontextmanager
 
 from aiohttp import ClientSession, ClientTimeout, web
 
@@ -19,6 +20,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_QUEUE_TIMEOUT_SECONDS = 60.0
 DEFAULT_MAX_QUEUED_REQUESTS = 32
 DEFAULT_HEALTH_TIMEOUT_SECONDS = 5.0
+DEFAULT_MAX_CONCURRENT_ASSETS = 4
 
 _DOWNSTREAM_DISCONNECT_ERRNOS = {
     errno.ECONNABORTED,
@@ -97,6 +99,7 @@ class DualTabGateway:
         queue_timeout_seconds: float = DEFAULT_QUEUE_TIMEOUT_SECONDS,
         max_queued_requests: int = DEFAULT_MAX_QUEUED_REQUESTS,
         health_timeout_seconds: float = DEFAULT_HEALTH_TIMEOUT_SECONDS,
+        max_concurrent_assets: int = DEFAULT_MAX_CONCURRENT_ASSETS,
     ) -> None:
         if len(backends) != 2:
             raise ValueError("exactly two backends are required")
@@ -106,10 +109,14 @@ class DualTabGateway:
             raise ValueError("max_queued_requests must not be negative")
         if health_timeout_seconds <= 0:
             raise ValueError("health_timeout_seconds must be positive")
+        if max_concurrent_assets <= 0:
+            raise ValueError("max_concurrent_assets must be positive")
         self.backends = [url.rstrip("/") for url in backends]
         self.queue_timeout_seconds = queue_timeout_seconds
         self.max_queued_requests = max_queued_requests
         self.health_timeout_seconds = health_timeout_seconds
+        self.asset_slots = asyncio.Semaphore(max_concurrent_assets)
+        self._active_asset_transfers = 0
         self.available: asyncio.Queue[int] = asyncio.Queue(maxsize=2)
         self.available.put_nowait(0)
         self.available.put_nowait(1)
@@ -120,6 +127,19 @@ class DualTabGateway:
     @property
     def queued_requests(self) -> int:
         return self._queued_requests
+
+    @property
+    def active_asset_transfers(self) -> int:
+        return self._active_asset_transfers
+
+    @asynccontextmanager
+    async def reserve_asset_slot(self):
+        async with self.asset_slots:
+            self._active_asset_transfers += 1
+            try:
+                yield
+            finally:
+                self._active_asset_transfers -= 1
 
     async def start(self, app: web.Application) -> None:
         self.session = ClientSession(
@@ -229,6 +249,11 @@ class DualTabGateway:
         reachable_count = sum(
             result.get("reachable") is True for result in results
         )
+        busy = (
+            self.available.qsize() < 2
+            or self._queued_requests > 0
+            or self._active_asset_transfers > 0
+        )
         return web.json_response(
             {
                 "status": "healthy" if ready_count == 2 else "degraded",
@@ -236,6 +261,8 @@ class DualTabGateway:
                 "capacity": 2,
                 "available_workers": self.available.qsize(),
                 "queued_requests": self._queued_requests,
+                "active_asset_transfers": self._active_asset_transfers,
+                "busy": busy,
                 "max_queued_requests": self.max_queued_requests,
                 "ready_backends": ready_count,
                 "reachable_backends": reachable_count,
@@ -248,32 +275,50 @@ class DualTabGateway:
     async def proxy_asset(self, request: web.Request) -> web.StreamResponse:
         """Try both workers because generated asset tokens are worker-local."""
         assert self.session is not None
-        body = await request.read()
-        last_error: Exception | None = None
-        for index, backend in enumerate(self.backends):
-            try:
-                async with self.session.request(
-                    request.method, f"{backend}{request.rel_url}",
-                    headers=self.upstream_headers(request), data=body, allow_redirects=False,
-                ) as response:
-                    response_body = await response.read()
-                    if response.status != 404:
-                        return web.Response(
-                            status=response.status, body=response_body,
+        async with self.reserve_asset_slot():
+            body = await request.read()
+            last_error: Exception | None = None
+            for index, backend in enumerate(self.backends):
+                downstream: web.StreamResponse | None = None
+                try:
+                    async with self.session.request(
+                        request.method, f"{backend}{request.rel_url}",
+                        headers=self.upstream_headers(request), data=body,
+                        allow_redirects=False,
+                    ) as response:
+                        if response.status == 404:
+                            continue
+                        downstream = web.StreamResponse(
+                            status=response.status,
+                            reason=response.reason,
                             headers=filtered_headers(response.headers.items()),
                         )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001 - try the other worker
-                last_error = exc
-                logger.warning("asset backend %s unavailable: %s", index + 1, exc)
-                continue
-        if last_error is not None:
-            return web.json_response(
-                {"error": {"message": "asset backend unavailable",
-                           "type": "upstream_error"}}, status=502,
-            )
-        raise web.HTTPNotFound()
+                        if not await await_downstream_io(downstream.prepare(request)):
+                            return downstream
+                        async for chunk in response.content.iter_chunked(64 * 1024):
+                            if not await await_downstream_io(downstream.write(chunk)):
+                                return downstream
+                        if not await await_downstream_io(downstream.write_eof()):
+                            return downstream
+                        return downstream
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - try the other worker
+                    if downstream is not None and downstream.prepared:
+                        logger.warning(
+                            "asset backend %s stream interrupted: %s", index + 1, exc
+                        )
+                        downstream.force_close()
+                        return downstream
+                    last_error = exc
+                    logger.warning("asset backend %s unavailable: %s", index + 1, exc)
+                    continue
+            if last_error is not None:
+                return web.json_response(
+                    {"error": {"message": "asset backend unavailable",
+                               "type": "upstream_error"}}, status=502,
+                )
+            raise web.HTTPNotFound()
 
     async def proxy(self, request: web.Request) -> web.StreamResponse:
         if request.path in ("/", "/health"):
@@ -478,18 +523,36 @@ def main() -> None:
         ),
         help="maximum seconds for each worker health probe (default: 5)",
     )
+    parser.add_argument(
+        "--max-concurrent-assets",
+        type=int,
+        default=int(
+            os.environ.get(
+                "W2A_GATEWAY_MAX_CONCURRENT_ASSETS",
+                str(DEFAULT_MAX_CONCURRENT_ASSETS),
+            )
+        ),
+        help="maximum concurrent generated-asset transfers (default: 4)",
+    )
     args = parser.parse_args()
     gateway = DualTabGateway(
         args.backends,
         queue_timeout_seconds=args.queue_timeout,
         max_queued_requests=args.max_queued,
         health_timeout_seconds=args.health_timeout,
+        max_concurrent_assets=args.max_concurrent_assets,
     )
     app = web.Application(client_max_size=70 * 1024 * 1024)
     app.on_startup.append(gateway.start)
     app.on_cleanup.append(gateway.stop)
     app.router.add_route("*", "/{tail:.*}", gateway.proxy)
-    web.run_app(app, host=args.host, port=args.port, access_log=None)
+    web.run_app(
+        app,
+        host=args.host,
+        port=args.port,
+        access_log=None,
+        handler_cancellation=True,
+    )
 
 
 if __name__ == "__main__":

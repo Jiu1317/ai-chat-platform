@@ -10,7 +10,10 @@ import logging
 import mimetypes
 import re
 import socket
+from contextvars import ContextVar
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import parse_qs, unquote_to_bytes, urljoin, urlparse
 
@@ -35,6 +38,8 @@ MAX_REDIRECTS = 3
 IMAGE_DOWNLOAD_ATTEMPTS = 3
 IMAGE_DOWNLOAD_RETRY_DELAYS = (0.5, 1.5)
 IMAGE_DOWNLOAD_CONCURRENCY = 2
+IMAGE_RETRY_AFTER_MAX_SECONDS = 30.0
+IMAGE_PREPARE_TIMEOUT_SECONDS = 5 * 60
 ALLOWED_IMAGE_TYPES = {
     "image/png": ".png",
     "image/jpeg": ".jpg",
@@ -466,6 +471,39 @@ def _safe_filename(index: int, mime_type: str, source_url: str = "") -> str:
     return f"{index:02d}_image{ALLOWED_IMAGE_TYPES[mime_type]}"
 
 
+def _write_bytes_atomic(path: Path, data: bytes) -> None:
+    """Write one prepared image without exposing a partial destination file."""
+    temporary = path.with_name(f".{path.name}.part")
+    try:
+        temporary.write_bytes(data)
+        temporary.replace(path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+async def _write_bytes_cancellation_safe(path: Path, data: bytes) -> None:
+    """Do not report cancellation until the underlying worker thread has stopped."""
+    write_task = asyncio.create_task(asyncio.to_thread(_write_bytes_atomic, path, data))
+    try:
+        await asyncio.shield(write_task)
+    except asyncio.CancelledError:
+        # asyncio.to_thread cannot stop a running thread. Keep the wrapper task
+        # alive until the real write/replace has completed so callers may safely
+        # clean up their TemporaryDirectory after our cancellation propagates.
+        while not write_task.done():
+            try:
+                await asyncio.shield(write_task)
+            except asyncio.CancelledError:
+                continue
+        error = write_task.exception()
+        if error is not None:
+            logger.warning("Image write failed while cancellation was pending: %s", error)
+        raise
+
+
 def _decode_data_url(url: str) -> tuple[bytes, str]:
     try:
         header, payload = url.split(",", 1)
@@ -530,56 +568,177 @@ async def _validate_public_url(url: str) -> None:
 
 
 class _RetryableImageDownload(Exception):
-    pass
+    """Transient remote-download failure with an optional server delay."""
+
+    def __init__(self, message: str, *, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+class _ImageByteBudget:
+    """Concurrency-safe request budget charged while response chunks arrive."""
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.total = 0
+        self._lock = asyncio.Lock()
+        self._by_task: dict[asyncio.Task, int] = {}
+
+    async def reserve(self, size: int) -> None:
+        if size <= 0:
+            return
+        task = asyncio.current_task()
+        if task is None:  # pragma: no cover - all callers run in asyncio tasks
+            raise RuntimeError("Image byte budget requires an asyncio task")
+        async with self._lock:
+            if self.total + size > self.limit:
+                raise ImageInputError("Combined images exceed the 30 MiB limit")
+            self.total += size
+            self._by_task[task] = self._by_task.get(task, 0) + size
+
+    async def release(self, size: int) -> None:
+        if size <= 0:
+            return
+        task = asyncio.current_task()
+        if task is None:  # pragma: no cover - all callers run in asyncio tasks
+            return
+        async with self._lock:
+            reserved = self._by_task.get(task, 0)
+            released = min(size, reserved)
+            self.total -= released
+            remaining = reserved - released
+            if remaining:
+                self._by_task[task] = remaining
+            else:
+                self._by_task.pop(task, None)
+
+    async def reserved_by_current_task(self) -> int:
+        task = asyncio.current_task()
+        if task is None:  # pragma: no cover - all callers run in asyncio tasks
+            return 0
+        async with self._lock:
+            return self._by_task.get(task, 0)
+
+
+_ACTIVE_IMAGE_BYTE_BUDGET: ContextVar[_ImageByteBudget | None] = ContextVar(
+    "web2api_image_byte_budget", default=None
+)
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    """Parse an HTTP Retry-After value and cap any wait at 30 seconds."""
+    if not value:
+        return None
+    raw = value.strip()
+    try:
+        seconds = float(raw)
+    except ValueError:
+        try:
+            when = parsedate_to_datetime(raw)
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=UTC)
+            seconds = (when - datetime.now(UTC)).total_seconds()
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return min(max(0.0, seconds), IMAGE_RETRY_AFTER_MAX_SECONDS)
+
+
+async def _download_remote_asset_once(
+    url: str, *, require_image: bool
+) -> tuple[bytes, str, str]:
+    timeout = aiohttp.ClientTimeout(total=180, connect=20, sock_read=60)
+    current = url
+    budget = _ACTIVE_IMAGE_BYTE_BUDGET.get()
+    reserved = 0
+    completed = False
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for redirect_count in range(MAX_REDIRECTS + 1):
+                await _validate_public_url(current)
+                async with session.get(
+                    current,
+                    allow_redirects=False,
+                    headers={"User-Agent": "ChatGPT-Web2API/0.2 asset-fetch"},
+                ) as response:
+                    if response.status in {301, 302, 303, 307, 308}:
+                        if redirect_count >= MAX_REDIRECTS:
+                            raise ImageInputError("Too many image URL redirects")
+                        location = response.headers.get("Location")
+                        if not location:
+                            raise ImageInputError("Image redirect has no destination")
+                        current = urljoin(current, location)
+                        continue
+                    if response.status in {
+                        408, 425, 429, 500, 502, 503, 504, 520, 522, 524
+                    }:
+                        retry_after = (
+                            _parse_retry_after(response.headers.get("Retry-After"))
+                            if response.status == 429
+                            else None
+                        )
+                        raise _RetryableImageDownload(
+                            f"HTTP {response.status}", retry_after=retry_after
+                        )
+                    if response.status != 200:
+                        raise ImageInputError(
+                            f"Image URL returned HTTP {response.status}"
+                        )
+                    if response.content_length and response.content_length > MAX_IMAGE_BYTES:
+                        raise ImageInputError("Image exceeds the 30 MiB limit")
+                    chunks: list[bytes] = []
+                    size = 0
+                    async for chunk in response.content.iter_chunked(64 * 1024):
+                        chunk_size = len(chunk)
+                        size += chunk_size
+                        if size > MAX_IMAGE_BYTES:
+                            raise ImageInputError("Image exceeds the 30 MiB limit")
+                        if budget is not None:
+                            await budget.reserve(chunk_size)
+                            reserved += chunk_size
+                        chunks.append(chunk)
+                    data = b"".join(chunks)
+                    if require_image:
+                        content_type = _sniff_image_type(data)
+                        if content_type is None:
+                            raise ImageInputError(
+                                "Image URL did not return PNG, JPEG, WebP, or GIF"
+                            )
+                    else:
+                        content_type = (
+                            str(response.headers.get("Content-Type") or "")
+                            .split(";", 1)[0]
+                            .strip()
+                            or "application/octet-stream"
+                        )
+                    completed = True
+                    return data, content_type, current
+        raise ImageInputError("Image download failed")
+    finally:
+        if budget is not None and reserved and not completed:
+            await budget.release(reserved)
 
 
 async def _download_remote_image_once(url: str) -> tuple[bytes, str, str]:
-    timeout = aiohttp.ClientTimeout(total=180, connect=20, sock_read=60)
-    current = url
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        for redirect_count in range(MAX_REDIRECTS + 1):
-            await _validate_public_url(current)
-            async with session.get(
-                current,
-                allow_redirects=False,
-                headers={"User-Agent": "ChatGPT-Web2API/0.2 image-fetch"},
-            ) as response:
-                if response.status in {301, 302, 303, 307, 308}:
-                    if redirect_count >= MAX_REDIRECTS:
-                        raise ImageInputError("Too many image URL redirects")
-                    location = response.headers.get("Location")
-                    if not location:
-                        raise ImageInputError("Image redirect has no destination")
-                    current = urljoin(current, location)
-                    continue
-                if response.status in {408, 425, 429, 500, 502, 503, 504, 520, 522, 524}:
-                    raise _RetryableImageDownload(f"HTTP {response.status}")
-                if response.status != 200:
-                    raise ImageInputError(f"Image URL returned HTTP {response.status}")
-                if response.content_length and response.content_length > MAX_IMAGE_BYTES:
-                    raise ImageInputError("Image exceeds the 30 MiB limit")
-                chunks: list[bytes] = []
-                size = 0
-                async for chunk in response.content.iter_chunked(64 * 1024):
-                    size += len(chunk)
-                    if size > MAX_IMAGE_BYTES:
-                        raise ImageInputError("Image exceeds the 30 MiB limit")
-                    chunks.append(chunk)
-                data = b"".join(chunks)
-                actual_type = _sniff_image_type(data)
-                if actual_type is None:
-                    raise ImageInputError("Image URL did not return PNG, JPEG, WebP, or GIF")
-                return data, actual_type, current
-    raise ImageInputError("Image download failed")
+    return await _download_remote_asset_once(url, require_image=True)
 
 
-async def _download_remote_image(
-    url: str, *, retry_connection_timeouts: bool = True
+async def _download_remote_file_once(url: str) -> tuple[bytes, str, str]:
+    return await _download_remote_asset_once(url, require_image=False)
+
+
+async def _download_remote_with_retries(
+    url: str,
+    download_once,
+    *,
+    retry_connection_timeouts: bool,
 ) -> tuple[bytes, str, str]:
+    """Retry a bounded remote asset download, honoring capped Retry-After."""
     last_error: Exception | None = None
+    retry_after: float | None = None
     for attempt in range(IMAGE_DOWNLOAD_ATTEMPTS):
+        retry_after = None
         try:
-            return await _download_remote_image_once(url)
+            return await download_once(url)
         except ImageInputError:
             raise
         except _CONNECTION_TIMEOUT_ERRORS as exc:
@@ -589,60 +748,128 @@ async def _download_remote_image(
             if not retry_connection_timeouts:
                 raise ImageInputError("Image download connection timed out") from exc
             last_error = exc
-        except (TimeoutError, _RetryableImageDownload, aiohttp.ClientError) as exc:
+        except _RetryableImageDownload as exc:
+            last_error = exc
+            retry_after = exc.retry_after
+        except (TimeoutError, aiohttp.ClientError) as exc:
             last_error = exc
         if attempt + 1 >= IMAGE_DOWNLOAD_ATTEMPTS:
             break
+        delay = (
+            retry_after
+            if retry_after is not None
+            else IMAGE_DOWNLOAD_RETRY_DELAYS[attempt]
+        )
         logger.warning(
-            "Reference image download attempt %d/%d failed (%s): %s",
+            "Reference image download attempt %d/%d failed (%s): %s; retrying in %.1fs",
             attempt + 1,
             IMAGE_DOWNLOAD_ATTEMPTS,
             type(last_error).__name__,
             last_error,
+            delay,
         )
-        await asyncio.sleep(IMAGE_DOWNLOAD_RETRY_DELAYS[attempt])
+        await asyncio.sleep(delay)
     raise ImageInputError(
         f"Image download failed after {IMAGE_DOWNLOAD_ATTEMPTS} attempts"
     ) from last_error
 
 
+async def _download_remote_image(
+    url: str, *, retry_connection_timeouts: bool = True
+) -> tuple[bytes, str, str]:
+    return await _download_remote_with_retries(
+        url,
+        _download_remote_image_once,
+        retry_connection_timeouts=retry_connection_timeouts,
+    )
+
+
+async def _download_remote_file(
+    url: str, *, retry_connection_timeouts: bool = True
+) -> tuple[bytes, str, str]:
+    """Download a generic response file without applying image signatures."""
+    return await _download_remote_with_retries(
+        url,
+        _download_remote_file_once,
+        retry_connection_timeouts=retry_connection_timeouts,
+    )
+
+
 async def prepare_image_files(
     references: list[ImageReference], directory: str | Path
 ) -> list[str]:
-    """Download reference images concurrently and materialize local upload files."""
+    """Download reference images under one byte budget and hard deadline."""
     if len(references) > MAX_IMAGE_COUNT:
         raise ImageInputError(f"At most {MAX_IMAGE_COUNT} images are allowed per request")
     target = Path(directory)
     target.mkdir(parents=True, exist_ok=True)
     semaphore = asyncio.Semaphore(IMAGE_DOWNLOAD_CONCURRENCY)
+    byte_budget = _ImageByteBudget(MAX_TOTAL_IMAGE_BYTES)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + IMAGE_PREPARE_TIMEOUT_SECONDS
 
     async def load(reference: ImageReference) -> tuple[bytes, str, str]:
         async with semaphore:
             if reference.url.lower().startswith("data:"):
                 data, mime_type = _decode_data_url(reference.url)
+                await byte_budget.reserve(len(data))
                 return data, mime_type, ""
-            return await _download_remote_image(reference.url)
-
-    loaded = await asyncio.gather(*(load(reference) for reference in references))
-    if sum(len(data) for data, _mime_type, _url in loaded) > MAX_TOTAL_IMAGE_BYTES:
-        raise ImageInputError("Combined images exceed the 30 MiB limit")
+            token = _ACTIVE_IMAGE_BYTE_BUDGET.set(byte_budget)
+            try:
+                item = await _download_remote_image(reference.url)
+            finally:
+                _ACTIVE_IMAGE_BYTE_BUDGET.reset(token)
+            # Test doubles and alternate transports may return complete bytes
+            # without using the chunk-aware downloader. Charge them here while
+            # avoiding a double charge for the normal streaming path.
+            if not await byte_budget.reserved_by_current_task():
+                await byte_budget.reserve(len(item[0]))
+            return item
 
     async def save(index: int, item: tuple[bytes, str, str]) -> str:
         data, mime_type, final_url = item
         path = target / _safe_filename(index, mime_type, final_url)
-        await asyncio.to_thread(path.write_bytes, data)
+        await _write_bytes_cancellation_safe(path, data)
         return str(path.resolve())
 
-    return list(await asyncio.gather(*(
-        save(index, item) for index, item in enumerate(loaded, start=1)
-    )))
+    async def run_tasks(coroutines) -> list:
+        tasks = [asyncio.create_task(coroutine) for coroutine in coroutines]
+        if not tasks:
+            return []
+        try:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise TimeoutError
+            return list(
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks),
+                    timeout=remaining,
+                )
+            )
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    try:
+        loaded = await run_tasks(load(reference) for reference in references)
+        return await run_tasks(
+            save(index, item) for index, item in enumerate(loaded, start=1)
+        )
+    except TimeoutError as exc:
+        raise ImageInputError(
+            "Timed out preparing reference images after 5 minutes"
+        ) from exc
 
 
 def _asset_from_dict(value: dict) -> dict | None:
     pointer = value.get("asset_pointer") or value.get("file_id")
     content_type = str(value.get("content_type") or value.get("type") or "")
     mime_type = str(value.get("mime_type") or "")
-    direct_url = value.get("download_url") or value.get("image_url")
+    content_type_lower = content_type.lower()
+    raw_download_url = value.get("download_url")
+    direct_url = raw_download_url or value.get("image_url")
     if isinstance(direct_url, dict):
         direct_url = direct_url.get("url")
 
@@ -651,16 +878,55 @@ def _asset_from_dict(value: dict) -> dict | None:
         match = _FILE_ID_RE.search(pointer)
         if match:
             file_id = match.group(1).replace("file-", "file_")
+    # An arbitrary citation/website record may contain image_url for a
+    # favicon or preview. It is not a generated attachment. A bare image URL
+    # is accepted only when its enclosing object explicitly declares an asset
+    # content type; download_url remains an explicit attachment signal.
+    explicit_asset_types = {
+        "image_asset_pointer",
+        "file_asset_pointer",
+        "file",
+        "image",
+    }
+    effective_mime_type = (
+        mime_type
+        or (content_type if "/" in content_type else "")
+    )
+    citation_or_favicon = (
+        content_type_lower in {
+            "citation",
+            "webpage",
+            "website",
+            "web_result",
+            "link",
+        }
+        or any(
+            key in value
+            for key in ("citation", "citations", "citation_id", "favicon")
+        )
+    )
+    explicit_download = (
+        raw_download_url is not None and isinstance(direct_url, str)
+    )
+    explicit_image_mime = (
+        isinstance(direct_url, str)
+        and effective_mime_type.lower().startswith("image/")
+        and not citation_or_favicon
+    )
     is_asset = bool(
         file_id
-        or isinstance(direct_url, str)
-        or content_type in {"image_asset_pointer", "file", "image"}
+        or explicit_download
+        or explicit_image_mime
+        or content_type_lower in explicit_asset_types
     )
     if not is_asset:
         return None
-    kind = "image" if (
-        content_type in {"image_asset_pointer", "image"} or mime_type.startswith("image/")
-    ) else "file"
+    kind = (
+        "image"
+        if content_type_lower in {"image_asset_pointer", "image"}
+        or effective_mime_type.lower().startswith("image/")
+        else "file"
+    )
     name = (
         value.get("name")
         or value.get("filename")
@@ -671,7 +937,7 @@ def _asset_from_dict(value: dict) -> dict | None:
     result = {
         "type": kind,
         "name": str(name),
-        "mime_type": mime_type or mimetypes.guess_type(str(name))[0]
+        "mime_type": effective_mime_type or mimetypes.guess_type(str(name))[0]
         or ("image/png" if kind == "image" else "application/octet-stream"),
     }
     if file_id:
@@ -700,10 +966,11 @@ def _asset_identity_keys(asset: dict) -> set[str]:
         if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{7,255}", candidate):
             keys.add(f"id:{candidate}")
 
-    file_id = str(asset.get("file_id") or "").strip()
-    if file_id:
-        keys.add(f"raw:{file_id}")
-        remember_id(file_id)
+    for field in ("file_id", "asset_pointer", "identity"):
+        value = str(asset.get(field) or "").strip()
+        if value:
+            keys.add(f"raw:{value}")
+            remember_id(value)
 
     source_url = str(asset.get("source_url") or "").strip()
     if source_url:
@@ -779,19 +1046,19 @@ def extract_response_assets(conversation: dict, anchor) -> list[dict]:
 
     descendants = [mapping[node_id] for node_id in descendant_ids if node_id in mapping]
     assets: list[dict] = []
-    seen: set[str] = set()
+    seen_asset_identities: set[str] = set()
 
     def walk(value) -> None:
         if isinstance(value, dict):
             asset = _asset_from_dict(value)
             if asset:
                 identities = _asset_identity_keys(asset)
-                identity = str(asset.get("file_id") or asset.get("source_url"))
                 if (
-                    identity not in seen
+                    identities
+                    and identities.isdisjoint(seen_asset_identities)
                     and identities.isdisjoint(input_asset_identities)
                 ):
-                    seen.add(identity)
+                    seen_asset_identities.update(identities)
                     assets.append(asset)
             for child in value.values():
                 walk(child)

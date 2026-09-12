@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import tempfile
+import threading
 import time
 from unittest.mock import AsyncMock, MagicMock
 
@@ -355,6 +356,110 @@ async def test_remote_reference_image_still_retries_connection_timeout(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_remote_reference_image_honors_bounded_retry_after(monkeypatch):
+    attempts = 0
+
+    async def rate_limited_then_ready(_url):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise multimodal._RetryableImageDownload(
+                "HTTP 429", retry_after=multimodal._parse_retry_after("120")
+            )
+        return PNG_1X1, "image/png", "https://example.com/image.png"
+
+    sleep = AsyncMock()
+    monkeypatch.setattr(
+        multimodal, "_download_remote_image_once", rate_limited_then_ready
+    )
+    monkeypatch.setattr(multimodal.asyncio, "sleep", sleep)
+
+    await multimodal._download_remote_image("https://example.com/image.png")
+
+    assert multimodal._parse_retry_after("120") == 30
+    sleep.assert_awaited_once_with(30)
+
+
+@pytest.mark.asyncio
+async def test_prepare_images_deadline_cancels_unfinished_downloads(
+    tmp_path, monkeypatch
+):
+    started = 0
+    cancelled = 0
+
+    async def blocked_download(_url):
+        nonlocal started, cancelled
+        started += 1
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled += 1
+            raise
+
+    monkeypatch.setattr(multimodal, "_download_remote_image", blocked_download)
+    monkeypatch.setattr(multimodal, "IMAGE_PREPARE_TIMEOUT_SECONDS", 0.01)
+
+    with pytest.raises(ImageInputError, match="Timed out preparing reference images"):
+        await prepare_image_files(
+            [
+                ImageReference("https://example.com/one.png"),
+                ImageReference("https://example.com/two.png"),
+                ImageReference("https://example.com/three.png"),
+            ],
+            tmp_path,
+        )
+
+    assert started == multimodal.IMAGE_DOWNLOAD_CONCURRENCY
+    assert cancelled == started
+
+
+@pytest.mark.asyncio
+async def test_prepare_images_cancellation_waits_for_blocking_atomic_write(
+    tmp_path,
+    monkeypatch,
+):
+    write_started = threading.Event()
+    release_write = threading.Event()
+    write_finished = threading.Event()
+    original_write = multimodal._write_bytes_atomic
+
+    def blocking_write(path, data):
+        write_started.set()
+        if not release_write.wait(timeout=5):
+            raise TimeoutError("test did not release image write")
+        try:
+            original_write(path, data)
+        finally:
+            write_finished.set()
+
+    monkeypatch.setattr(multimodal, "_write_bytes_atomic", blocking_write)
+    encoded = base64.b64encode(PNG_1X1).decode()
+    task = asyncio.create_task(
+        prepare_image_files(
+            [ImageReference(f"data:image/png;base64,{encoded}")],
+            tmp_path,
+        )
+    )
+    for _ in range(100):
+        if write_started.is_set():
+            break
+        await asyncio.sleep(0.001)
+    assert write_started.is_set()
+
+    task.cancel()
+    await asyncio.sleep(0.01)
+
+    assert task.done() is False
+    assert write_finished.is_set() is False
+    release_write.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert write_finished.is_set()
+    assert list(tmp_path.glob("*.part")) == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "url",
     [
@@ -416,6 +521,56 @@ def test_extract_generated_image_for_exact_turn():
         "mime_type": "image/png",
         "file_id": "file_abc123",
     }]
+
+
+def test_asset_from_dict_accepts_object_download_url_for_generated_file():
+    asset = multimodal._asset_from_dict(
+        {
+            "download_url": {"url": "https://cdn.example/report.pdf"},
+            "filename": "report.pdf",
+            "mime_type": "application/pdf",
+        }
+    )
+
+    assert asset == {
+        "type": "file",
+        "name": "report.pdf",
+        "mime_type": "application/pdf",
+        "source_url": "https://cdn.example/report.pdf",
+    }
+
+
+def test_asset_from_dict_accepts_explicit_image_mime_with_image_url():
+    asset = multimodal._asset_from_dict(
+        {
+            "image_url": "https://cdn.example/generated.png",
+            "filename": "generated.png",
+            "mime_type": "image/png",
+        }
+    )
+
+    assert asset == {
+        "type": "image",
+        "name": "generated.png",
+        "mime_type": "image/png",
+        "source_url": "https://cdn.example/generated.png",
+    }
+
+
+def test_asset_from_dict_rejects_explicit_mime_on_citation_favicon():
+    assert (
+        multimodal._asset_from_dict(
+            {
+                "type": "citation",
+                "url": "https://example.com/article",
+                "image_url": "https://example.com/favicon.png",
+                "favicon": "https://example.com/favicon.ico",
+                "mime_type": "image/png",
+                "filename": "preview.png",
+            }
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
@@ -497,6 +652,110 @@ async def test_full_response_passes_images_and_publishes_assets():
 
 
 @pytest.mark.asyncio
+async def test_full_response_prefers_authoritative_terminal_text():
+    driver = MagicMock()
+    driver._current_conv_id = "conv-rewritten"
+    driver._last_response_assets = []
+
+    async def stream(_text, timeout=120, *, budgets=None, model=None):
+        yield StreamChunk(delta="Draft answer.")
+        yield StreamChunk(
+            delta="",
+            finish_reason="stop",
+            final_text="Final answer with corrected wording.",
+        )
+
+    driver.send_and_stream = stream
+    server = APIServer(Config.load(None), driver)
+    request = MagicMock()
+    request.headers = {}
+    request.scheme = "http"
+    request.host = "127.0.0.1:9181"
+
+    response = await server._full_response(
+        request,
+        "gpt-5-5",
+        "question",
+        30,
+    )
+    body = json.loads(response.body)
+
+    assert (
+        body["choices"][0]["message"]["content"]
+        == "Final answer with corrected wording."
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "final_text",
+    ["Final answer with corrected wording.", ""],
+)
+async def test_stream_response_exposes_authoritative_terminal_text(
+    monkeypatch,
+    final_text,
+):
+    class CapturingStreamResponse:
+        def __init__(self):
+            self.content_type = None
+            self.headers = {}
+            self.writes = []
+            self.prepared_with = None
+            self.eof_written = False
+
+        async def prepare(self, request):
+            self.prepared_with = request
+            return self
+
+        async def write(self, data):
+            self.writes.append(data)
+
+        async def write_eof(self):
+            self.eof_written = True
+
+    monkeypatch.setattr(api_server.web, "StreamResponse", CapturingStreamResponse)
+    driver = MagicMock()
+    driver._js_strict = AsyncMock(return_value='{"text": ""}')
+    driver._current_conv_id = "conv-rewritten"
+    driver._last_response_assets = []
+
+    async def stream(_text, timeout=120, *, budgets=None, model=None):
+        yield StreamChunk(delta="Draft answer.")
+        yield StreamChunk(
+            delta="",
+            finish_reason="stop",
+            final_text=final_text,
+        )
+
+    driver.send_and_stream = stream
+    server = APIServer(Config.load(None), driver)
+    request = MagicMock()
+
+    response = await server._stream_response(
+        request,
+        "gpt-5-5",
+        "question",
+        30,
+    )
+    events = [
+        json.loads(raw.decode().removeprefix("data: ").strip())
+        for raw in response.writes
+        if raw.startswith(b"data: {")
+    ]
+    terminal = next(
+        event
+        for event in events
+        if event["choices"][0]["finish_reason"] == "stop"
+    )
+
+    assert terminal["final_text"] == final_text
+    assert terminal["conversation_id"] == "conv-rewritten"
+    assert all("final_text" not in event for event in events[:-1])
+    assert response.writes[-1] == b"data: [DONE]\n\n"
+    assert response.eof_written is True
+
+
+@pytest.mark.asyncio
 async def test_image_response_uses_full_fifteen_minute_timeout():
     config = Config.load(None)
     driver = MagicMock()
@@ -568,6 +827,36 @@ async def test_asset_capability_url_serves_bytes():
 
 
 @pytest.mark.asyncio
+async def test_generated_asset_memory_hit_skips_disk_and_browser():
+    driver = MagicMock()
+    driver.download_response_asset = AsyncMock(
+        side_effect=AssertionError("memory hit must not call the browser")
+    )
+    server = APIServer(Config.load(None), driver)
+    server._asset_cache["memory-only-token"] = (
+        time.time() + 600,
+        {
+            "data": PNG_1X1,
+            "content_type": "image/png",
+            "filename": "memory.png",
+        },
+    )
+    server._load_asset_disk = AsyncMock(
+        side_effect=AssertionError("memory hit must not read disk")
+    )
+    request = MagicMock()
+    request.match_info = {"token": "memory-only-token"}
+
+    response = await server._handle_asset(request)
+
+    assert response.status == 200
+    assert response.body == PNG_1X1
+    assert response.content_type == "image/png"
+    server._load_asset_disk.assert_not_awaited()
+    driver.download_response_asset.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_generated_asset_survives_worker_restart_via_shared_disk_cache():
     first_driver = MagicMock()
     first = APIServer(Config.load(None), first_driver)
@@ -596,6 +885,42 @@ async def test_generated_asset_survives_worker_restart_via_shared_disk_cache():
     assert response.body == PNG_1X1
     assert response.content_type == "image/png"
     second_driver.download_response_asset.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_three_five_asset_rounds_keep_first_round_available_cross_worker():
+    driver = MagicMock()
+    driver.download_response_asset = AsyncMock(
+        side_effect=AssertionError("shared-cache hit must not revisit the browser")
+    )
+    worker_a = APIServer(Config.load(None), driver)
+    worker_b = APIServer(Config.load(None), driver)
+    expires_at = time.time() + 600
+
+    async def cache_round(worker, prefix):
+        for index in range(5):
+            await worker._cache_asset(
+                f"{prefix}-{index}",
+                expires_at,
+                {
+                    "data": PNG_1X1,
+                    "content_type": "image/png",
+                    "filename": f"{prefix}-{index}.png",
+                },
+            )
+
+    await cache_round(worker_a, "round-a")
+    await cache_round(worker_b, "round-b")
+    await cache_round(worker_a, "round-c")
+
+    assert api_server.MAX_SHARED_ASSET_CACHE_ITEMS >= 15
+    for index in range(2, 5):
+        request = MagicMock()
+        request.match_info = {"token": f"round-a-{index}"}
+        response = await worker_a._handle_asset(request)
+        assert response.status == 200
+        assert response.body == PNG_1X1
+    driver.download_response_asset.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -674,6 +999,7 @@ async def test_generated_image_prefetch_is_cancelled_when_heartbeat_write_fails(
 
 @pytest.mark.asyncio
 async def test_generated_image_prefetch_is_bounded_to_cache_capacity():
+    assert api_server.MAX_ASSET_CACHE_ITEMS == 5
     driver = MagicMock()
     driver.download_response_asset = AsyncMock(return_value={
         "data": PNG_1X1,
@@ -698,6 +1024,47 @@ async def test_generated_image_prefetch_is_bounded_to_cache_capacity():
 
     assert driver.download_response_asset.await_count == api_server.MAX_ASSET_CACHE_ITEMS
     assert len(server._asset_cache) == api_server.MAX_ASSET_CACHE_ITEMS
+
+
+@pytest.mark.asyncio
+async def test_generated_asset_prefetch_includes_images_and_files():
+    driver = MagicMock()
+
+    async def download(asset):
+        if asset["type"] == "image":
+            return {"data": PNG_1X1, "content_type": "application/octet-stream"}
+        return {"data": b"%PDF-1.7\nreport", "content_type": "application/pdf"}
+
+    driver.download_response_asset = AsyncMock(side_effect=download)
+    server = APIServer(Config.load(None), driver)
+    request = MagicMock()
+    request.headers = {}
+    request.scheme = "http"
+    request.host = "127.0.0.1:9181"
+    assets = server._publish_assets(
+        request,
+        [
+            {
+                "type": "image",
+                "name": "result.png",
+                "mime_type": "image/png",
+                "file_id": "file_image_result",
+            },
+            {
+                "type": "file",
+                "name": "report.pdf",
+                "mime_type": "application/pdf",
+                "file_id": "file_pdf_result",
+            },
+        ],
+    )
+
+    await server._prefetch_published_assets(assets)
+
+    assert driver.download_response_asset.await_count == 2
+    assert len(server._asset_cache) == 2
+    cached_types = {record[1]["content_type"] for record in server._asset_cache.values()}
+    assert cached_types == {"image/png", "application/pdf"}
 
 
 def test_generated_asset_cache_enforces_size_and_cleans_expired_items(monkeypatch):
@@ -956,3 +1323,100 @@ def test_extract_response_assets_preserves_descendant_breadth_first_order():
     assert [
         asset["file_id"] for asset in extract_response_assets(conversation, anchor)
     ] == ["file_generated_first", "file_generated_second"]
+
+
+def test_extract_response_assets_ignores_citation_and_favicon_image_urls():
+    conversation = {
+        "mapping": {
+            "u": {
+                "children": ["a"],
+                "message": {
+                    "id": "user-citation",
+                    "author": {"role": "user"},
+                    "content": {"content_type": "text", "parts": ["research this"]},
+                },
+            },
+            "a": {
+                "parent": "u",
+                "children": [],
+                "message": {
+                    "author": {"role": "assistant"},
+                    "end_turn": True,
+                    "content": {"content_type": "text", "parts": ["answer"]},
+                    "metadata": {
+                        "citations": [
+                            {
+                                "type": "citation",
+                                "url": "https://example.com/article",
+                                "image_url": "https://example.com/preview.png",
+                            },
+                            {
+                                "title": "Example",
+                                "favicon": "https://example.com/favicon.ico",
+                                "image_url": "https://example.com/favicon.png",
+                            },
+                        ]
+                    },
+                },
+            },
+        }
+    }
+    anchor = TurnAnchor(
+        sent_text="research this",
+        mode="captured_id",
+        captured_user_message_id="user-citation",
+    )
+
+    assert extract_response_assets(conversation, anchor) == []
+
+
+def test_extract_response_assets_deduplicates_pointer_and_source_url_shapes():
+    conversation = {
+        "mapping": {
+            "u": {
+                "children": ["tool"],
+                "message": {
+                    "id": "user-dedupe",
+                    "author": {"role": "user"},
+                    "content": {"content_type": "text", "parts": ["make a file"]},
+                },
+            },
+            "tool": {
+                "parent": "u",
+                "children": ["a"],
+                "message": {
+                    "author": {"role": "tool"},
+                    "content": {
+                        "content_type": "image_asset_pointer",
+                        "asset_pointer": "sediment://file_same_result",
+                        "name": "result.png",
+                    },
+                },
+            },
+            "a": {
+                "parent": "tool",
+                "children": [],
+                "message": {
+                    "author": {"role": "assistant"},
+                    "end_turn": True,
+                    "content": {
+                        "content_type": "image",
+                        "image_url": (
+                            "https://chatgpt.com/backend-api/estuary/content"
+                            "?id=file_same_result"
+                        ),
+                    },
+                },
+            },
+        }
+    }
+    anchor = TurnAnchor(
+        sent_text="make a file",
+        mode="captured_id",
+        captured_user_message_id="user-dedupe",
+    )
+
+    assets = extract_response_assets(conversation, anchor)
+
+    assert len(assets) == 1
+    assert assets[0]["file_id"] == "file_same_result"

@@ -4,6 +4,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from contextlib import closing
@@ -86,6 +87,33 @@ class ImageRequestDetectionTests(unittest.TestCase):
             complete = app._prepare_image_variants(source, output_root)
             self.assertTrue(complete["compressedPath"].is_file())
             self.assertGreater(int(complete["compressedSize"]), 0)
+
+    def test_generated_file_download_uses_requested_display_name(self) -> None:
+        user_id = "1" * 32
+        session_id = "2" * 32
+        workspace = app._session_path(user_id, session_id)
+        stored_name = "external-" + "e" * 64 + ".png"
+        app.Image.new("RGB", (8, 8), "white").save(
+            workspace / "outputs" / stored_name
+        )
+
+        async def scenario():
+            with patch.object(app, "_require_auth", return_value={"id": user_id}):
+                return await app.download_file(
+                    object(),
+                    session_id,
+                    stored_name,
+                    download_name="meeting-poster.png",
+                )
+
+        response = asyncio.run(scenario())
+        disposition = response.headers.get("content-disposition", "")
+        self.assertIn("meeting-poster.png", disposition)
+        self.assertNotIn("external-", disposition)
+        self.assertEqual(
+            response.headers.get("cache-control"),
+            "private, max-age=0, must-revalidate",
+        )
 
     def test_generated_image_is_streamed_to_disk(self) -> None:
         image_buffer = io.BytesIO()
@@ -373,6 +401,7 @@ class RuntimeCleanupTests(unittest.TestCase):
             with (
                 patch.object(app, "_prepare_directories"),
                 patch.object(app, "_cleanup_loop", new=fake_cleanup_loop),
+                patch.object(app, "SHUTDOWN_DRAIN_TIMEOUT_SECONDS", 0.01),
                 patch.object(app.codex, "stop", new=AsyncMock()) as stop,
             ):
                 async with app.lifespan(app.app):
@@ -481,6 +510,12 @@ class RuntimeCleanupTests(unittest.TestCase):
         )
 
         async def scenario(payload: app.TurnRequest) -> str | None:
+            record = app.ResumableExternalTurn(
+                user_id="user-a",
+                client_turn_id=str(payload.client_turn_id),
+                fingerprint="a" * 64,
+                kind="codex",
+            )
             with (
                 patch.object(app, "_require_auth", return_value={"id": "user-a"}),
                 patch.object(app, "_session_path", return_value=Path(".")),
@@ -498,16 +533,20 @@ class RuntimeCleanupTests(unittest.TestCase):
                     "_start_or_reuse_resumable_image_turn",
                     new=AsyncMock(),
                 ) as direct_start,
+                patch.object(
+                    app,
+                    "_start_or_reuse_resumable_codex_turn",
+                    new=AsyncMock(return_value=record),
+                ) as codex_start,
                 patch.object(app, "_reserve_message_slot") as reserve,
             ):
                 response = await app.turn(object(), payload)
             direct_start.assert_not_awaited()
-            attachment_inputs.assert_awaited_once_with(
-                payload,
-                Path("."),
-                max_text_chars=app.MAX_CONTEXT_TEXT_CHARS,
-            )
-            reserve.assert_called_once_with("user-a")
+            codex_start.assert_awaited_once_with(payload, Path("."), "user-a")
+            # Attachment extraction and quota reservation run inside the durable
+            # turn task, after the resumable response has been established.
+            attachment_inputs.assert_not_awaited()
+            reserve.assert_not_called()
             return response.headers.get("x-client-turn-id")
 
         for index, update in enumerate(cases):
@@ -521,10 +560,135 @@ class RuntimeCleanupTests(unittest.TestCase):
                     effort="default",
                     **update,
                 )
-                self.assertIsNone(asyncio.run(scenario(payload)))
+                self.assertEqual(
+                    asyncio.run(scenario(payload)), payload.client_turn_id
+                )
 
 
 class ExternalImageTransferTests(unittest.TestCase):
+    def test_transfer_cache_cleanup_removes_old_and_keeps_recent_files(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            upload_root = Path(directory)
+            cache_root = upload_root / app.TRANSFER_CACHE_DIR
+            cache_root.mkdir()
+            old = cache_root / "old.webp"
+            recent = cache_root / "recent.webp"
+            old.write_bytes(b"old")
+            recent.write_bytes(b"recent")
+            now = time.time()
+            os.utime(old, (now - app.TRANSFER_CACHE_RETENTION_SECONDS - 10,) * 2)
+
+            removed = app._cleanup_transfer_cache(upload_root, now=now)
+
+            self.assertEqual(removed, 1)
+            self.assertFalse(old.exists())
+            self.assertTrue(recent.exists())
+
+    def test_signing_reused_transfer_cache_refreshes_its_lease(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            upload_root = Path(directory)
+            cache_root = upload_root / app.TRANSFER_CACHE_DIR
+            cache_root.mkdir()
+            target = cache_root / "reused.webp"
+            target.write_bytes(b"cached")
+            old_time = time.time() - app.TRANSFER_CACHE_RETENTION_SECONDS - 10
+            os.utime(target, (old_time, old_time))
+            with (
+                patch.object(app, "TRANSFER_SECRET", "t" * 32),
+                patch.object(app, "TRANSFER_PUBLIC_BASE_URL", "https://chat.example"),
+            ):
+                url = app._transfer_image_url(
+                    "a" * 32, "b" * 32, target, upload_root
+                )
+
+            self.assertTrue(url.startswith("https://chat.example/api/transfer-image/"))
+            self.assertGreater(target.stat().st_mtime, old_time)
+            self.assertEqual(app._cleanup_transfer_cache(upload_root), 0)
+
+    def test_transfer_cache_cleanup_does_not_break_open_response_file(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            upload_root = Path(directory)
+            cache_root = upload_root / app.TRANSFER_CACHE_DIR
+            cache_root.mkdir()
+            target = cache_root / "streaming.webp"
+            payload = b"active-response-bytes"
+            target.write_bytes(payload)
+            now = time.time()
+            old_time = now - app.TRANSFER_CACHE_RETENTION_SECONDS - 10
+            os.utime(target, (old_time, old_time))
+
+            with target.open("rb") as response_file:
+                app._cleanup_transfer_cache(upload_root, now=now)
+                self.assertEqual(response_file.read(), payload)
+
+            app._cleanup_transfer_cache(upload_root, now=now)
+            self.assertFalse(target.exists())
+
+    def test_cancelled_bounded_thread_keeps_capacity_until_worker_finishes(self) -> None:
+        release_workers = threading.Event()
+        first_two_started = threading.Event()
+        started: list[str] = []
+        started_lock = threading.Lock()
+
+        def blocking_work(label: str) -> str:
+            with started_lock:
+                started.append(label)
+                if len(started) == 2:
+                    first_two_started.set()
+            if not release_workers.wait(timeout=2):
+                raise TimeoutError("test worker was not released")
+            return label
+
+        async def scenario() -> None:
+            semaphore = asyncio.Semaphore(2)
+            first = [
+                asyncio.create_task(
+                    app._run_bounded_thread(semaphore, blocking_work, label)
+                )
+                for label in ("first", "second")
+            ]
+            for _ in range(100):
+                if first_two_started.is_set():
+                    break
+                await asyncio.sleep(0.005)
+            self.assertTrue(first_two_started.is_set())
+            for task in first:
+                task.cancel()
+            await asyncio.gather(*first, return_exceptions=True)
+
+            third = asyncio.create_task(
+                app._run_bounded_thread(semaphore, blocking_work, "third")
+            )
+            await asyncio.sleep(0.03)
+            self.assertEqual(started, ["first", "second"])
+            self.assertFalse(third.done())
+
+            release_workers.set()
+            self.assertEqual(await asyncio.wait_for(third, timeout=1), "third")
+            await asyncio.sleep(0)
+
+        asyncio.run(scenario())
+        self.assertFalse(app.bounded_thread_tasks)
+
+    def test_reference_transfer_token_covers_queue_budget_then_expires(self) -> None:
+        issued_at = 1_800_000_000
+        with patch.object(app, "TRANSFER_SECRET", "t" * 32):
+            token = app._create_transfer_token(
+                "a" * 32, "b" * 32, "reference.webp", now=issued_at
+            )
+            claims = app._decode_transfer_token(
+                token, now=issued_at + 20 * 60
+            )
+            self.assertEqual(
+                claims["expires_at"], issued_at + app.TRANSFER_URL_TTL_SECONDS
+            )
+            with self.assertRaises(app.HTTPException) as raised:
+                app._decode_transfer_token(
+                    token, now=issued_at + app.TRANSFER_URL_TTL_SECONDS + 1
+                )
+        self.assertEqual(app.TRANSFER_URL_TTL_SECONDS, 30 * 60)
+        self.assertEqual(raised.exception.status_code, 404)
+
     def test_invalid_reference_image_is_rejected_before_transfer(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             upload_root = Path(directory)
@@ -554,18 +718,21 @@ class ExternalImageTransferTests(unittest.TestCase):
         active = 0
         maximum_active = 0
         paths = [Path(f"reference-{index}.png") for index in range(6)]
+        counter_lock = threading.Lock()
 
-        async def fake_to_thread(_function, source, _upload_root):
+        def fake_prepare(source, _upload_root):
             nonlocal active, maximum_active
-            active += 1
-            maximum_active = max(maximum_active, active)
+            with counter_lock:
+                active += 1
+                maximum_active = max(maximum_active, active)
             try:
-                await asyncio.sleep(0.01)
+                time.sleep(0.01)
                 return source
             finally:
-                active -= 1
+                with counter_lock:
+                    active -= 1
 
-        with patch.object(app.asyncio, "to_thread", new=fake_to_thread):
+        with patch.object(app, "_prepare_transfer_image", new=fake_prepare):
             prepared = asyncio.run(app._prepare_transfer_images(paths, Path(".")))
 
         self.assertEqual(prepared, paths)
@@ -708,6 +875,127 @@ class ExternalImageTransferTests(unittest.TestCase):
 
         self.assertEqual(candidates, [])
         self.assertEqual(app._openai_message_text(data), markdown)
+
+    def test_external_generated_file_candidate_is_preserved_and_deduplicated(self) -> None:
+        url = "https://provider.example/v1/assets/abcdefghijklmnopqrstuvwx"
+        data = {
+            "choices": [{
+                "message": {
+                    "content": f"[报告]({url})",
+                    "attachments": [{
+                        "type": "file",
+                        "name": "报告.txt",
+                        "mime_type": "text/plain",
+                        "url": url,
+                    }],
+                }
+            }]
+        }
+
+        candidates = app._openai_image_candidates(
+            data, "https://provider.example/v1"
+        )
+
+        self.assertEqual(candidates, [{
+            "url": url,
+            "name": "报告.txt",
+            "type": "file",
+            "mime_type": "text/plain",
+        }])
+
+    def test_external_generated_file_is_streamed_to_workspace(self) -> None:
+        file_bytes = "生成文件内容".encode()
+        url = "https://provider.example/v1/assets/abcdefghijklmnopqrstuvwx"
+
+        class FakeResponse:
+            status_code = 200
+            headers = {
+                "content-type": "text/plain; charset=utf-8",
+                "content-length": str(len(file_bytes)),
+            }
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def aiter_bytes(self, _chunk_size):
+                yield file_bytes[:4]
+                yield file_bytes[4:]
+
+        class FakeClient:
+            def stream(self, *_args, **_kwargs):
+                return FakeResponse()
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            workspace = Path(directory)
+            with patch.object(
+                app,
+                "_validated_external_asset_url",
+                new=AsyncMock(return_value=url),
+            ):
+                result = asyncio.run(app._persist_external_image(
+                    FakeClient(),
+                    {"url": url, "name": "报告.txt", "type": "file"},
+                    "https://provider.example/v1",
+                    workspace,
+                ))
+
+            saved = workspace / "outputs" / result["path"]
+            digest = app.hashlib.sha256(file_bytes).hexdigest()
+            self.assertEqual(saved.read_bytes(), file_bytes)
+            self.assertEqual(result["path"], f"external-{digest}.txt")
+            self.assertEqual(result["name"], "报告.txt")
+            self.assertEqual(result["mediaType"], "text/plain")
+            self.assertFalse(result["inline"])
+
+    def test_compressed_external_file_uses_decoded_size_for_storage(self) -> None:
+        file_bytes = ("压缩后的生成文件内容\n" * 50).encode()
+        url = "https://provider.example/v1/assets/abcdefghijklmnopqrstuvwx"
+
+        class FakeResponse:
+            status_code = 200
+            headers = {
+                "content-type": "text/plain; charset=utf-8",
+                "content-encoding": "gzip",
+                # HTTPX exposes decoded bytes from aiter_bytes(), while this
+                # header describes the smaller encoded transfer body.
+                "content-length": "37",
+            }
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def aiter_bytes(self, _chunk_size):
+                yield file_bytes
+
+        class FakeClient:
+            def stream(self, *_args, **_kwargs):
+                return FakeResponse()
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            workspace = Path(directory)
+            with patch.object(
+                app,
+                "_validated_external_asset_url",
+                new=AsyncMock(return_value=url),
+            ):
+                result = asyncio.run(app._persist_external_image(
+                    FakeClient(),
+                    {"url": url, "name": "压缩报告.txt", "type": "file"},
+                    "https://provider.example/v1",
+                    workspace,
+                ))
+
+            self.assertEqual(
+                (workspace / "outputs" / result["path"]).read_bytes(),
+                file_bytes,
+            )
+            self.assertEqual(result["size"], len(file_bytes))
 
 
     def test_external_image_is_streamed_to_workspace(self) -> None:
@@ -916,6 +1204,26 @@ class ExternalImageTransferTests(unittest.TestCase):
             + retry_delays
         )
         self.assertLess(worst_case, app.EXTERNAL_ASSET_DOWNLOAD_TIMEOUT_SECONDS)
+        self.assertGreaterEqual(
+            app.EXTERNAL_ASSET_ATTEMPT_TIMEOUT_SECONDS,
+            45 + 90,
+            "website must wait through Web2API direct plus browser fallback",
+        )
+        self.assertGreaterEqual(app.EXTERNAL_ASSET_DOWNLOAD_TIMEOUT_SECONDS, 8 * 60)
+        self.assertLess(
+            app.EXTERNAL_ASSET_DOWNLOAD_TIMEOUT_SECONDS,
+            app.EXTERNAL_RESPONSE_TIMEOUT_SECONDS,
+        )
+        self.assertGreater(
+            app.SHUTDOWN_DRAIN_TIMEOUT_SECONDS,
+            app.EXTERNAL_RESPONSE_TIMEOUT_SECONDS,
+        )
+        staged_worst_case = (5 + 15 + 9 + 8) * 60
+        self.assertGreaterEqual(
+            app.EXTERNAL_RESPONSE_TIMEOUT_SECONDS,
+            staged_worst_case + 3 * 60,
+            "outer deadline must cover prepare, generation, prefetch, persistence, and margin",
+        )
 
 
     def test_external_image_batch_has_one_total_deadline(self) -> None:
@@ -1087,7 +1395,8 @@ class ExternalImageTransferTests(unittest.TestCase):
                         }],
                     },
                     "finish_reason": "stop",
-                }]
+                }],
+                "final_text": f"图片已生成。![生成图片]({url})",
             },
             ensure_ascii=False,
         )
@@ -1150,6 +1459,107 @@ class ExternalImageTransferTests(unittest.TestCase):
         self.assertEqual(events[0]["text"], "图片已生成。")
         self.assertEqual(events[1]["mode"], "image")
         self.assertEqual(events[1]["files"], [image_file])
+        self.assertNotIn("/v1/assets/", app.json.dumps(events, ensure_ascii=False))
+
+    def test_external_generated_document_stream_returns_local_download(self) -> None:
+        url = "https://provider.example/v1/assets/abcdefghijklmnopqrstuvwx"
+        payload = app.TurnRequest(
+            session_id="4" * 32,
+            message="生成一份报告",
+            model="external",
+            effort="medium",
+        )
+        provider = {
+            "baseUrl": "https://provider.example/v1",
+            "protocol": "openai",
+            "apiKey": "test-key",
+            "preset": "custom",
+        }
+        generated_file = {
+            "name": "报告.txt",
+            "size": 24,
+            "path": "external-document.txt",
+            "mediaType": "text/plain",
+            "inline": False,
+        }
+        line = app.json.dumps(
+            {
+                "choices": [{
+                    "delta": {
+                        "content": f"[报告.txt]({url})",
+                        "attachments": [{
+                            "type": "file",
+                            "name": "报告.txt",
+                            "mime_type": "text/plain",
+                            "url": url,
+                        }],
+                    },
+                    "finish_reason": "stop",
+                }],
+                "final_text": f"报告已生成。[报告.txt]({url})",
+            },
+            ensure_ascii=False,
+        )
+
+        class FakeResponse:
+            status_code = 200
+            headers = {"content-type": "text/event-stream"}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def aiter_lines(self):
+                yield f"data: {line}"
+                yield "data: [DONE]"
+
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            def stream(self, *_args, **_kwargs):
+                return FakeResponse()
+
+        async def scenario() -> list[dict]:
+            with (
+                tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory,
+                patch.object(
+                    app,
+                    "_validate_remote_base",
+                    new=AsyncMock(return_value=provider["baseUrl"]),
+                ),
+                patch.object(
+                    app,
+                    "_external_current_content",
+                    new=AsyncMock(return_value="生成一份报告"),
+                ),
+                patch.object(app.httpx, "AsyncClient", return_value=FakeClient()),
+                patch.object(
+                    app,
+                    "_persist_external_images",
+                    new=AsyncMock(return_value=([generated_file], 0)),
+                ) as persist_assets,
+            ):
+                events = [
+                    app.json.loads(event.decode())
+                    async for event in app._external_response_stream(
+                        payload, Path(directory), provider, "test-model", "user-1"
+                    )
+                ]
+                candidates = persist_assets.await_args.args[0]
+            self.assertEqual(candidates[0]["type"], "file")
+            return events
+
+        events = asyncio.run(scenario())
+        self.assertEqual([event["type"] for event in events], ["replace", "done"])
+        self.assertEqual(events[0]["text"], "报告已生成。")
+        self.assertEqual(events[1]["files"], [generated_file])
+        self.assertNotIn("mode", events[1])
         self.assertNotIn("/v1/assets/", app.json.dumps(events, ensure_ascii=False))
 
     def test_openai_done_marker_completes_stream_without_finish_reason(self) -> None:
@@ -1472,6 +1882,81 @@ class UploadCapacityTests(unittest.TestCase):
         self.assertEqual(uploaded["preview"], "abcde")
         self.assertFalse((upload_root / app.UPLOAD_STAGING_DIR / f"{upload_id}.part").exists())
 
+    def test_chunk_upload_accepts_long_ascii_and_cjk_filenames(self) -> None:
+        user_id = "7" * 32
+        session_id = "8" * 32
+        request = object()
+
+        async def scenario(name: str) -> dict:
+            with patch.object(app, "_require_auth", return_value={"id": user_id}):
+                initialized = await app.init_chunk_upload(
+                    request,
+                    app.ChunkUploadInitRequest(
+                        session_id=session_id,
+                        name=name,
+                        size=0,
+                    ),
+                )
+                return await app.complete_chunk_upload(
+                    request,
+                    initialized["uploadId"],
+                    app.ChunkUploadCompleteRequest(session_id=session_id),
+                )
+
+        for name in ("a" * 116 + ".txt", "猫" * 100 + ".txt"):
+            with self.subTest(name=name):
+                completed = asyncio.run(scenario(name))
+                uploaded = completed["files"][0]
+                self.assertLessEqual(len(uploaded["id"].encode("utf-8")), 120)
+                self.assertTrue(uploaded["id"].endswith(".txt"))
+                self.assertTrue(uploaded["name"].endswith(".txt"))
+                upload_root = app._session_path(user_id, session_id) / "uploads"
+                self.assertTrue((upload_root / uploaded["id"]).is_file())
+
+    def test_cancel_chunk_upload_removes_partial_data_and_is_idempotent(self) -> None:
+        user_id = "2" * 32
+        session_id = "5" * 32
+        request = object()
+
+        async def scenario() -> tuple[Path, Path, str]:
+            with (
+                patch.object(app, "_require_auth", return_value={"id": user_id}),
+                patch.object(app, "UPLOAD_CHUNK_BYTES", 3),
+            ):
+                initialized = await app.init_chunk_upload(
+                    request,
+                    app.ChunkUploadInitRequest(
+                        session_id=session_id,
+                        name="cancel.txt",
+                        size=6,
+                    ),
+                )
+                upload_id = initialized["uploadId"]
+                await app.upload_chunk(
+                    request,
+                    upload_id,
+                    session_id=session_id,
+                    offset=0,
+                    chunk=app.UploadFile(filename="chunk.bin", file=io.BytesIO(b"abc")),
+                )
+                upload_root = app._session_path(user_id, session_id) / "uploads"
+                part_path, metadata_path = app._chunk_upload_paths(upload_root, upload_id)
+                first = await app.cancel_chunk_upload(
+                    request, upload_id, session_id=session_id
+                )
+                second = await app.cancel_chunk_upload(
+                    request, upload_id, session_id=session_id
+                )
+                self.assertEqual(first, {"ok": True})
+                self.assertEqual(second, {"ok": True})
+                return part_path, metadata_path, upload_id
+
+        part_path, metadata_path, upload_id = asyncio.run(scenario())
+        self.assertFalse(part_path.exists())
+        self.assertFalse(metadata_path.exists())
+        self.assertNotIn(upload_id, app.chunk_upload_locks)
+        self.assertNotIn(upload_id, app.chunk_upload_lock_times)
+
     def test_invalid_upload_ids_do_not_consume_chunk_locks(self) -> None:
         request = object()
         session_id = "7" * 32
@@ -1710,6 +2195,34 @@ class UploadCapacityTests(unittest.TestCase):
                     workspace,
                 )
         self.assertEqual(caught.exception.status_code, 400)
+
+    def test_actual_30_mib_attachment_boundary_is_accepted_and_next_byte_rejected(self) -> None:
+        user_id = "7" * 32
+        session_id = "9" * 32
+        workspace = app._session_path(user_id, session_id)
+        attachment = workspace / "uploads" / "boundary.txt"
+        with attachment.open("wb") as handle:
+            handle.seek(app.MAX_FILE_BYTES - 1)
+            handle.write(b"x")
+        payload = app.TurnRequest(
+            session_id=session_id,
+            message="",
+            model="external",
+            effort="default",
+            attachments=[
+                app.AttachmentRef(id=attachment.name, name=attachment.name)
+            ],
+        )
+
+        self.assertEqual(
+            app._validate_user_content_size(payload, workspace),
+            30 * 1024 * 1024,
+        )
+        with attachment.open("ab") as handle:
+            handle.write(b"y")
+        with self.assertRaises(app.HTTPException) as caught:
+            app._validate_user_content_size(payload, workspace)
+        self.assertEqual(caught.exception.status_code, 413)
 
     def test_composer_preview_reads_stable_unicode_head_and_tail(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
@@ -1973,6 +2486,138 @@ class ExternalContextTests(unittest.TestCase):
         })
         self.assertEqual(normalized["externalConversationId"], "upstream_context_2")
         self.assertEqual(normalized["externalContextKey"], "b" * 64)
+
+    def test_cloud_history_long_answer_preserves_head_and_tail(self) -> None:
+        app._prepare_directories()
+        with closing(sqlite3.connect(app.CONVERSATIONS_PATH)) as database:
+            owner_id = str(database.execute(
+                "SELECT id FROM users WHERE username = 'owner'"
+            ).fetchone()[0])
+        conversation_id = "9" * 32
+        long_answer = "开头事实" + "甲" * 55_000 + "乙" * 20_000 + "最终结论"
+        app._sync_cloud_conversations(owner_id, [{
+            "id": conversation_id,
+            "workspaceId": "8" * 32,
+            "title": "长回答",
+            "messages": [{
+                "id": "7" * 32,
+                "role": "assistant",
+                "content": long_answer,
+            }],
+            "updatedAt": int(time.time() * 1000),
+        }], [])
+
+        history = app._cloud_context_history(owner_id, conversation_id)
+
+        self.assertEqual(len(history), 1)
+        self.assertLessEqual(len(history[0].content), 60_000)
+        self.assertTrue(history[0].content.startswith("开头事实"))
+        self.assertTrue(history[0].content.endswith("最终结论"))
+        self.assertIn("中间省略", history[0].content)
+
+    def test_cloud_sync_merges_concurrent_tab_messages_in_either_arrival_order(self) -> None:
+        app._prepare_directories()
+        with closing(sqlite3.connect(app.CONVERSATIONS_PATH)) as database:
+            owner_id = str(database.execute(
+                "SELECT id FROM users WHERE username = 'owner'"
+            ).fetchone()[0])
+        workspace_id = app.uuid.uuid4().hex
+        base_time = int(time.time() * 1000) - 10_000
+        common = {
+            "id": app.uuid.uuid4().hex,
+            "role": "user",
+            "content": "共同问题",
+            "createdAt": base_time,
+        }
+
+        for newer_first in (True, False):
+            conversation_id = app.uuid.uuid4().hex
+            branch_a = {
+                "id": app.uuid.uuid4().hex,
+                "role": "assistant",
+                "content": "标签 A 的回答",
+                "createdAt": base_time + 100,
+            }
+            branch_b = {
+                "id": app.uuid.uuid4().hex,
+                "role": "assistant",
+                "content": "标签 B 的回答",
+                "createdAt": base_time + 200,
+            }
+            snapshot_a = {
+                "id": conversation_id,
+                "workspaceId": workspace_id,
+                "title": "并发标签",
+                "messages": [common, branch_a],
+                "updatedAt": base_time + 300,
+            }
+            snapshot_b = {
+                "id": conversation_id,
+                "workspaceId": workspace_id,
+                "title": "并发标签",
+                "messages": [common, branch_b],
+                "updatedAt": base_time + 250,
+            }
+            sequence = (snapshot_a, snapshot_b) if newer_first else (snapshot_b, snapshot_a)
+            app._sync_cloud_conversations(owner_id, [sequence[0]], [])
+            state = app._sync_cloud_conversations(owner_id, [sequence[1]], [])
+            merged = next(
+                item for item in state["conversations"] if item["id"] == conversation_id
+            )
+            self.assertEqual(
+                [item["id"] for item in merged["messages"]],
+                [common["id"], branch_a["id"], branch_b["id"]],
+            )
+            self.assertEqual(merged["updatedAt"], snapshot_a["updatedAt"])
+
+    def test_cloud_sync_merges_project_additions_and_preserves_file_removals(self) -> None:
+        app._prepare_directories()
+        with closing(sqlite3.connect(app.CONVERSATIONS_PATH)) as database:
+            owner_id = str(database.execute(
+                "SELECT id FROM users WHERE username = 'owner'"
+            ).fetchone()[0])
+        base_time = int(time.time() * 1000) - 10_000
+        common = {"id": "common.txt", "name": "common.txt", "size": 10, "type": "document"}
+        added_a = {"id": "a.txt", "name": "a.txt", "size": 11, "type": "document"}
+        added_b = {"id": "b.txt", "name": "b.txt", "size": 12, "type": "document"}
+
+        for delete_first in (True, False):
+            project_id = app.uuid.uuid4().hex
+            workspace_id = app.uuid.uuid4().hex
+            snapshot_a = {
+                "id": project_id, "workspaceId": workspace_id, "name": "并发项目",
+                "files": [common, added_a], "removedFileIds": [],
+                "createdAt": base_time, "updatedAt": base_time + 100,
+            }
+            snapshot_b = {
+                "id": project_id, "workspaceId": workspace_id, "name": "并发项目",
+                "files": [common, added_b], "removedFileIds": [],
+                "createdAt": base_time, "updatedAt": base_time + 200,
+            }
+            app._sync_cloud_conversations(owner_id, [], [snapshot_a])
+            state = app._sync_cloud_conversations(owner_id, [], [snapshot_b])
+            merged = next(item for item in state["projects"] if item["id"] == project_id)
+            self.assertEqual({item["id"] for item in merged["files"]}, {
+                "common.txt", "a.txt", "b.txt",
+            })
+
+            deletion = {
+                **snapshot_b,
+                "files": [added_a, added_b],
+                "removedFileIds": ["common.txt"],
+                "updatedAt": base_time + 400,
+            }
+            stale_add = {
+                **snapshot_a,
+                "files": [common, added_a],
+                "updatedAt": base_time + 300,
+            }
+            sequence = (deletion, stale_add) if delete_first else (stale_add, deletion)
+            app._sync_cloud_conversations(owner_id, [], [sequence[0]])
+            state = app._sync_cloud_conversations(owner_id, [], [sequence[1]])
+            merged = next(item for item in state["projects"] if item["id"] == project_id)
+            self.assertNotIn("common.txt", {item["id"] for item in merged["files"]})
+            self.assertIn("common.txt", merged["removedFileIds"])
 
     def test_context_key_changes_with_model_provider_and_project_context(self) -> None:
         payload = app.TurnRequest(
@@ -2341,7 +2986,7 @@ class ExternalContextTests(unittest.TestCase):
         self.assertEqual(maximum_active, 1)
         self.assertEqual(calls, ["", "upstream_serial_1"])
 
-    def test_external_stream_enforces_outer_20_minute_deadline_and_cancels_source(self) -> None:
+    def test_external_stream_enforces_outer_40_minute_deadline_and_cancels_source(self) -> None:
         source_cancelled = False
         payload = app.TurnRequest(
             session_id="7" * 32,
@@ -2375,10 +3020,10 @@ class ExternalContextTests(unittest.TestCase):
                     )
                 ]
 
-        self.assertEqual(app.EXTERNAL_RESPONSE_TIMEOUT_SECONDS, 20 * 60)
+        self.assertEqual(app.EXTERNAL_RESPONSE_TIMEOUT_SECONDS, 40 * 60)
         events = asyncio.run(scenario())
         self.assertEqual([event["type"] for event in events], ["started", "error"])
-        self.assertIn("20 分钟", events[-1]["message"])
+        self.assertIn("40 分钟", events[-1]["message"])
         self.assertTrue(source_cancelled)
 
     def test_external_stream_propagates_client_cancellation(self) -> None:
@@ -2486,6 +3131,95 @@ class ExternalContextTests(unittest.TestCase):
         self.assertEqual(events[-1]["externalConversationId"], "upstream_existing_1")
         self.assertEqual(completion["external_conversation_id"], "upstream_existing_1")
         self.assertEqual(completion["external_context_key"], "c" * 64)
+
+    def test_stream_authoritative_final_text_replaces_draft(self) -> None:
+        draft = app.json.dumps({
+            "choices": [{
+                "delta": {"content": "Draft answer."},
+                "finish_reason": None,
+            }]
+        })
+        final = app.json.dumps({
+            "choices": [{
+                "delta": {},
+                "finish_reason": "stop",
+            }],
+            "final_text": "Final answer with corrected wording.",
+        })
+        payload = app.TurnRequest(
+            session_id="4" * 32,
+            message="请回答",
+            model="external",
+            effort="medium",
+        )
+        provider = {
+            "baseUrl": "https://provider.example/v1",
+            "protocol": "openai",
+            "apiKey": "test-key",
+            "preset": "custom",
+        }
+
+        class FakeResponse:
+            status_code = 200
+            headers = {"content-type": "text/event-stream"}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def aiter_lines(self):
+                yield f"data: {draft}"
+                yield f"data: {final}"
+                yield "data: [DONE]"
+
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            def stream(self, *_args, **_kwargs):
+                return FakeResponse()
+
+        async def scenario() -> list[dict]:
+            with (
+                tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory,
+                patch.object(
+                    app,
+                    "_validate_remote_base",
+                    new=AsyncMock(return_value=provider["baseUrl"]),
+                ),
+                patch.object(
+                    app,
+                    "_external_current_content",
+                    new=AsyncMock(return_value="请回答"),
+                ),
+                patch.object(app.httpx, "AsyncClient", return_value=FakeClient()),
+            ):
+                return [
+                    app.json.loads(event.decode())
+                    async for event in app._external_response_stream(
+                        payload,
+                        Path(directory),
+                        provider,
+                        "test-model",
+                        "user-1",
+                    )
+                ]
+
+        events = asyncio.run(scenario())
+        self.assertEqual(
+            [event["type"] for event in events],
+            ["delta", "replace", "done"],
+        )
+        self.assertEqual(events[0]["text"], "Draft answer.")
+        self.assertEqual(
+            events[1]["text"],
+            "Final answer with corrected wording.",
+        )
 
     def test_external_id_is_not_committed_when_a_later_stream_error_occurs(self) -> None:
         final_line = app.json.dumps({
@@ -2652,6 +3386,179 @@ class ExternalContextTests(unittest.TestCase):
             self.assertIn(marker, source)
 
 
+class CodexTransportFailureTests(unittest.TestCase):
+    class _Stdout:
+        def __init__(self, lines: list[bytes] | None = None) -> None:
+            self.lines = list(lines or [])
+
+        async def readline(self) -> bytes:
+            await asyncio.sleep(0)
+            return self.lines.pop(0) if self.lines else b""
+
+    class _Process:
+        def __init__(self, lines: list[bytes] | None = None) -> None:
+            self.stdout = CodexTransportFailureTests._Stdout(lines)
+            self.stdin = None
+            self.stderr = None
+            self.returncode = None
+
+    @staticmethod
+    def _payload() -> app.TurnRequest:
+        return app.TurnRequest(
+            session_id="a" * 32,
+            client_conversation_id="b" * 32,
+            client_turn_id="c" * 32,
+            message="请读取附件",
+            model="gpt-5.6",
+            effort="default",
+        )
+
+    def test_reader_eof_fails_pending_request_and_wakes_active_stream(self) -> None:
+        async def scenario() -> tuple[str, dict, bool]:
+            server = app.CodexAppServer()
+            process = self._Process()
+            server.process = process
+            server._generation = 1
+            server._transport_closed = False
+            future = asyncio.get_running_loop().create_future()
+            server.pending[7] = (future, 1)
+            server._turn_generations["turn-active"] = 1
+            queue = server.register_stream("turn-active")
+
+            await server._reader(process, 1)
+            with self.assertRaises(app.CodexProtocolError) as raised:
+                future.result()
+            event = await asyncio.wait_for(queue.get(), timeout=0.1)
+            return str(raised.exception), event, server._transport_closed
+
+        message, event, closed = asyncio.run(scenario())
+        self.assertIn("连接意外中断", message)
+        self.assertEqual(event["method"], "codex/appServerDisconnected")
+        self.assertEqual(
+            event["params"]["code"], "codex_app_server_disconnected"
+        )
+        self.assertTrue(event["params"]["recoverable"])
+        self.assertTrue(closed)
+
+    def test_reader_eof_after_turn_start_wakes_late_stream_registration(self) -> None:
+        async def scenario() -> tuple[dict, dict]:
+            response = (
+                app.json.dumps(
+                    {"id": 9, "result": {"turn": {"id": "turn-late"}}}
+                ).encode()
+                + b"\n"
+            )
+            server = app.CodexAppServer()
+            process = self._Process([response])
+            server.process = process
+            server._generation = 3
+            server._transport_closed = False
+            future = asyncio.get_running_loop().create_future()
+            server.pending[9] = (future, 3)
+
+            await server._reader(process, 3)
+            result = future.result()
+            queue = server.register_stream("turn-late")
+            event = await asyncio.wait_for(queue.get(), timeout=0.1)
+            return result, event
+
+        result, event = asyncio.run(scenario())
+        self.assertEqual(result["turn"]["id"], "turn-late")
+        self.assertEqual(event["method"], "codex/appServerDisconnected")
+
+    def test_disconnect_event_terminates_stream_and_releases_workspace(self) -> None:
+        async def scenario() -> tuple[list[dict], bool]:
+            payload = self._payload()
+            queue: asyncio.Queue = asyncio.Queue()
+            queue.put_nowait(
+                app.CodexAppServer._disconnect_event("后台连接中断，请重试")
+            )
+            with (
+                tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory,
+                patch.object(
+                    app,
+                    "_attachment_inputs_async",
+                    new=AsyncMock(return_value=[]),
+                ),
+                patch.object(
+                    app,
+                    "_ensure_thread",
+                    new=AsyncMock(return_value="thread-one"),
+                ),
+                patch.object(
+                    app.codex,
+                    "request",
+                    new=AsyncMock(return_value={"turn": {"id": "turn-one"}}),
+                ),
+                patch.object(app.codex, "register_stream", return_value=queue),
+                patch.object(app.codex, "unregister_stream") as unregister,
+            ):
+                workspace = Path(directory)
+                (workspace / "outputs").mkdir()
+                key = ("user-one", str(workspace.resolve()))
+                events = [
+                    app.json.loads(raw.decode())
+                    async for raw in app._codex_response_stream(
+                        payload, workspace, "user-one"
+                    )
+                ]
+                unlocked = not app.codex_workspace_locks[key].locked()
+                unregister.assert_called_once_with("turn-one")
+            app.codex_workspace_locks.clear()
+            return events, unlocked
+
+        events, unlocked = asyncio.run(scenario())
+        self.assertEqual([event["type"] for event in events], ["started", "error"])
+        self.assertEqual(events[-1]["code"], "codex_app_server_disconnected")
+        self.assertTrue(events[-1]["recoverable"])
+        self.assertTrue(unlocked)
+
+    def test_hard_timeout_terminates_stream_and_releases_workspace(self) -> None:
+        async def scenario() -> tuple[list[dict], bool]:
+            payload = self._payload()
+            queue: asyncio.Queue = asyncio.Queue()
+            with (
+                tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory,
+                patch.object(app, "EXTERNAL_RESPONSE_TIMEOUT_SECONDS", 0.02),
+                patch.object(
+                    app,
+                    "_attachment_inputs_async",
+                    new=AsyncMock(return_value=[]),
+                ),
+                patch.object(
+                    app,
+                    "_ensure_thread",
+                    new=AsyncMock(return_value="thread-timeout"),
+                ),
+                patch.object(
+                    app.codex,
+                    "request",
+                    new=AsyncMock(return_value={"turn": {"id": "turn-timeout"}}),
+                ),
+                patch.object(app.codex, "register_stream", return_value=queue),
+                patch.object(app.codex, "unregister_stream") as unregister,
+            ):
+                workspace = Path(directory)
+                (workspace / "outputs").mkdir()
+                key = ("user-timeout", str(workspace.resolve()))
+                events = [
+                    app.json.loads(raw.decode())
+                    async for raw in app._codex_response_stream(
+                        payload, workspace, "user-timeout"
+                    )
+                ]
+                unlocked = not app.codex_workspace_locks[key].locked()
+                unregister.assert_called_once_with("turn-timeout")
+            app.codex_workspace_locks.clear()
+            return events, unlocked
+
+        events, unlocked = asyncio.run(scenario())
+        self.assertEqual([event["type"] for event in events], ["started", "error"])
+        self.assertEqual(events[-1]["code"], "codex_turn_timeout")
+        self.assertTrue(events[-1]["recoverable"])
+        self.assertTrue(unlocked)
+
+
 class ResumableExternalTurnTests(unittest.TestCase):
     @staticmethod
     def _payload(client_turn_id: str = "d" * 32) -> app.TurnRequest:
@@ -2678,6 +3585,148 @@ class ResumableExternalTurnTests(unittest.TestCase):
         app.resumable_external_turns.clear()
         app.resumable_stop_tombstones.clear()
         app.external_turns.clear()
+        with app._database_connection() as database:
+            app._ensure_resumable_tables(database)
+            database.execute("DELETE FROM resumable_turn_events")
+            database.execute("DELETE FROM resumable_turns")
+            database.execute("DELETE FROM resumable_stop_tombstones")
+
+    def test_codex_turns_in_one_workspace_are_serialized(self) -> None:
+        active = 0
+        maximum_active = 0
+
+        async def fake_locked(_payload, _workspace, _user_id):
+            nonlocal active, maximum_active
+            active += 1
+            maximum_active = max(maximum_active, active)
+            try:
+                await asyncio.sleep(0.01)
+                yield app._ndjson({"type": "done", "files": []})
+            finally:
+                active -= 1
+
+        async def scenario() -> None:
+            app.codex_workspace_locks.clear()
+            payload_a = self._payload("1" * 32)
+            payload_b = self._payload("2" * 32)
+            with (
+                tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory,
+                patch.object(
+                    app,
+                    "_codex_response_stream_locked",
+                    new=fake_locked,
+                ),
+            ):
+                workspace = Path(directory)
+
+                async def consume(payload) -> None:
+                    async for _event in app._codex_response_stream(
+                        payload,
+                        workspace,
+                        "user-a",
+                    ):
+                        pass
+
+                await asyncio.gather(consume(payload_a), consume(payload_b))
+            app.codex_workspace_locks.clear()
+
+        asyncio.run(scenario())
+        self.assertEqual(maximum_active, 1)
+
+    def test_shutdown_drains_completed_tasks_and_cancels_only_after_deadline(self) -> None:
+        async def scenario() -> tuple[bool, bool]:
+            completed = False
+            cancelled = False
+
+            async def quick() -> None:
+                nonlocal completed
+                await asyncio.sleep(0)
+                completed = True
+
+            async def blocked() -> None:
+                nonlocal cancelled
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    cancelled = True
+                    raise
+
+            quick_task = asyncio.create_task(quick())
+            with patch.object(app, "SHUTDOWN_DRAIN_TIMEOUT_SECONDS", 0.02):
+                await app._drain_background_tasks({quick_task})
+            blocked_task = asyncio.create_task(blocked())
+            await asyncio.sleep(0)
+            with patch.object(app, "SHUTDOWN_DRAIN_TIMEOUT_SECONDS", 0.02):
+                await app._drain_background_tasks({blocked_task})
+            return completed, cancelled
+
+        completed, cancelled = asyncio.run(scenario())
+        self.assertTrue(completed)
+        self.assertTrue(cancelled)
+
+    def test_completed_turn_replays_after_process_restart(self) -> None:
+        async def scenario() -> list[dict]:
+            await self._reset_records()
+            record = app.ResumableExternalTurn(
+                user_id="user-a",
+                client_turn_id="f" * 32,
+                fingerprint="a" * 64,
+                kind="codex",
+            )
+            await asyncio.to_thread(app._persist_resumable_start_sync, record)
+            await app._append_resumable_external_event(
+                record, app._ndjson({"type": "delta", "text": "已完成"})
+            )
+            await app._append_resumable_external_event(
+                record, app._ndjson({"type": "done", "files": []})
+            )
+            app.resumable_external_turns.clear()
+
+            restored, _tombstones = await asyncio.to_thread(
+                app._restore_resumable_turns_sync
+            )
+            recovered = restored[("user-a", "f" * 32)]
+            events = [app.json.loads(item.decode()) for item in recovered.events]
+            await self._reset_records()
+            return events
+
+        events = asyncio.run(scenario())
+        self.assertEqual([event["type"] for event in events], ["delta", "done"])
+        self.assertEqual([event["cursor"] for event in events], [1, 2])
+
+    def test_incomplete_turn_becomes_replayable_error_after_restart(self) -> None:
+        async def scenario() -> tuple[list[dict], bool]:
+            await self._reset_records()
+            record = app.ResumableExternalTurn(
+                user_id="user-a",
+                client_turn_id="e" * 32,
+                fingerprint="b" * 64,
+                kind="image",
+            )
+            await asyncio.to_thread(app._persist_resumable_start_sync, record)
+            await app._append_resumable_external_event(
+                record,
+                app._ndjson({
+                    "type": "started",
+                    "threadId": "image",
+                    "turnId": "upstream-image",
+                }),
+            )
+            app.resumable_external_turns.clear()
+
+            restored, _tombstones = await asyncio.to_thread(
+                app._restore_resumable_turns_sync
+            )
+            recovered = restored[("user-a", "e" * 32)]
+            events = [app.json.loads(item.decode()) for item in recovered.events]
+            terminal = recovered.terminal
+            await self._reset_records()
+            return events, terminal
+
+        events, terminal = asyncio.run(scenario())
+        self.assertEqual([event["type"] for event in events], ["started", "error"])
+        self.assertIn("服务重启", events[-1]["message"])
+        self.assertTrue(terminal)
 
     def test_disconnected_reader_does_not_cancel_and_resume_uses_cursor(self) -> None:
         release = asyncio.Event()
@@ -2729,6 +3778,92 @@ class ResumableExternalTurnTests(unittest.TestCase):
         self.assertFalse(upstream_cancelled)
         self.assertEqual([event["type"] for event in resumed], ["delta", "done"])
         self.assertEqual([event["cursor"] for event in resumed], [2, 3])
+
+    def test_codex_turn_is_idempotent_and_resumes_after_reader_disconnect(self) -> None:
+        async def scenario() -> tuple[list[dict], bool]:
+            await self._reset_records()
+            payload = self._payload("0" * 32).model_copy(
+                update={"model": "gpt-5.6", "message": "读取附件"}
+            )
+            queue: asyncio.Queue = asyncio.Queue()
+            await queue.put(
+                {
+                    "method": "item/agentMessage/delta",
+                    "params": {"delta": "已读取"},
+                }
+            )
+            await queue.put(
+                {
+                    "method": "turn/completed",
+                    "params": {"turn": {"status": "completed"}},
+                }
+            )
+            with (
+                tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory,
+                patch.object(app, "_reserve_message_slot") as reserve,
+                patch.object(
+                    app,
+                    "_attachment_inputs_async",
+                    new=AsyncMock(return_value=[]),
+                ),
+                patch.object(
+                    app,
+                    "_ensure_thread",
+                    new=AsyncMock(return_value="thread-one"),
+                ),
+                patch.object(
+                    app.codex,
+                    "request",
+                    new=AsyncMock(return_value={"turn": {"id": "turn-one"}}),
+                ),
+                patch.object(app.codex, "register_stream", return_value=queue),
+                patch.object(app.codex, "unregister_stream") as unregister,
+            ):
+                workspace = Path(directory)
+                (workspace / "outputs").mkdir()
+                record = await app._start_or_reuse_resumable_codex_turn(
+                    payload, workspace, "user-a"
+                )
+                first_reader = app._resumable_external_event_stream(record, 0)
+                first = app.json.loads((await anext(first_reader)).decode())
+                await first_reader.aclose()
+                await asyncio.wait_for(record.task, timeout=1)
+                reused = await app._start_or_reuse_resumable_codex_turn(
+                    payload, workspace, "user-a"
+                )
+                resumed = [
+                    app.json.loads(event.decode())
+                    async for event in app._resumable_external_event_stream(record, 1)
+                ]
+                reserve.assert_called_once_with("user-a")
+                unregister.assert_called_once_with("turn-one")
+            await self._reset_records()
+            return [first, *resumed], reused is record
+
+        events, reused = asyncio.run(scenario())
+        self.assertTrue(reused)
+        self.assertEqual(
+            [event["type"] for event in events],
+            ["started", "delta", "done"],
+        )
+        self.assertEqual([event["cursor"] for event in events], [1, 2, 3])
+        self.assertEqual(events[1]["text"], "已读取")
+
+    def test_codex_placeholder_interrupt_tombstones_pending_turn(self) -> None:
+        async def scenario() -> tuple[dict, bool]:
+            await self._reset_records()
+            client_turn_id = "9" * 32
+            with patch.object(app, "_require_auth", return_value={"id": "user-a"}):
+                result = await app.interrupt(
+                    object(), "codex", client_turn_id
+                )
+            tombstoned = ("user-a", client_turn_id) in app.resumable_stop_tombstones
+            await self._reset_records()
+            return result, tombstoned
+
+        result, tombstoned = asyncio.run(scenario())
+        self.assertEqual(result, {"ok": True})
+        self.assertTrue(tombstoned)
 
     def test_duplicate_client_turn_is_idempotent_and_does_not_reserve_twice(self) -> None:
         upstream_calls = 0
@@ -2867,7 +4002,7 @@ class ResumableExternalTurnTests(unittest.TestCase):
 
         events, terminal, task_done = asyncio.run(scenario())
         self.assertEqual([event["type"] for event in events], ["started", "error"])
-        self.assertIn("20 分钟", events[-1]["message"])
+        self.assertIn("40 分钟", events[-1]["message"])
         self.assertTrue(terminal)
         self.assertTrue(task_done)
         self.assertEqual(app.external_turns, {})

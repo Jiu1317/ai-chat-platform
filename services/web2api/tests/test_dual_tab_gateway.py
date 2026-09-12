@@ -6,6 +6,7 @@ import asyncio
 import importlib.util
 import json
 import logging
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -44,6 +45,44 @@ def _load_gateway_module():
 
 
 gateway_module = _load_gateway_module()
+
+
+def test_gateway_defaults_to_four_concurrent_asset_transfers():
+    assert gateway_module.DEFAULT_MAX_CONCURRENT_ASSETS == 4
+
+
+@pytest.mark.asyncio
+async def test_default_gateway_starts_four_asset_transfers_without_queueing(monkeypatch):
+    gateway = gateway_module.DualTabGateway(["http://one", "http://two"])
+    release = asyncio.Event()
+    started = [asyncio.Event() for _ in range(4)]
+    responses = [
+        SimpleNamespace(
+            status=200,
+            reason="OK",
+            headers={"Content-Type": "image/png"},
+            content=_GatedContent(event, release, f"asset-{index}".encode()),
+            read=AsyncMock(side_effect=AssertionError("assets must stream")),
+        )
+        for index, event in enumerate(started)
+    ]
+    gateway.session = _Session([_Context(response=response) for response in responses])
+    monkeypatch.setattr(gateway_module.web, "StreamResponse", _Downstream)
+
+    tasks = [
+        asyncio.create_task(gateway.proxy_asset(_request(f"/v1/assets/{index}")))
+        for index in range(4)
+    ]
+    await asyncio.gather(
+        *(asyncio.wait_for(event.wait(), timeout=1) for event in started)
+    )
+
+    assert gateway.active_asset_transfers == 4
+    assert len(gateway.session.requests) == 4
+    release.set()
+    downstream = await asyncio.gather(*tasks)
+    assert all(response.eof for response in downstream)
+    assert gateway.active_asset_transfers == 0
 
 
 class _Context:
@@ -110,21 +149,26 @@ def _request(path: str):
 
 
 @pytest.mark.asyncio
-async def test_asset_proxy_tries_second_worker_when_first_is_unavailable():
+async def test_asset_proxy_tries_second_worker_when_first_is_unavailable(monkeypatch):
     gateway = gateway_module.DualTabGateway(["http://one", "http://two"])
     response = SimpleNamespace(
         status=200,
+        reason="OK",
         headers={"Content-Type": "image/png"},
-        read=AsyncMock(return_value=b"png-bytes"),
+        content=_Content([b"png-", b"bytes"]),
+        read=AsyncMock(side_effect=AssertionError("successful assets must stream")),
     )
     gateway.session = _Session(
         [_Context(error=OSError("worker one down")), _Context(response=response)]
     )
+    monkeypatch.setattr(gateway_module.web, "StreamResponse", _Downstream)
 
     proxied = await gateway.proxy_asset(_request("/v1/assets/token"))
 
     assert proxied.status == 200
-    assert proxied.body == b"png-bytes"
+    assert proxied.writes == [b"png-", b"bytes"]
+    assert proxied.eof is True
+    response.read.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -185,6 +229,28 @@ class _Content:
             raise StopAsyncIteration from None
 
 
+class _GatedContent:
+    def __init__(self, started: asyncio.Event, release: asyncio.Event, chunk: bytes):
+        self.started = started
+        self.release = release
+        self.chunk = chunk
+        self.sent = False
+
+    def iter_chunked(self, _size):
+        return self
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self.sent:
+            raise StopAsyncIteration
+        self.sent = True
+        self.started.set()
+        await self.release.wait()
+        return self.chunk
+
+
 class _Downstream:
     def __init__(self, *, status, reason, headers):
         self.status = status
@@ -233,6 +299,67 @@ class _DisconnectingDownstream(_Downstream):
         if self.disconnect_stage == "write_eof":
             raise self.disconnect_error
         self.eof = True
+
+
+@pytest.mark.asyncio
+async def test_asset_proxy_bounds_concurrency_and_streams_without_full_read(monkeypatch):
+    gateway = gateway_module.DualTabGateway(
+        ["http://one", "http://two"], max_concurrent_assets=1
+    )
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    first = SimpleNamespace(
+        status=200,
+        reason="OK",
+        headers={"Content-Type": "image/png", "Content-Length": "5"},
+        content=_GatedContent(first_started, release_first, b"first"),
+        read=AsyncMock(side_effect=AssertionError("successful assets must stream")),
+    )
+    second = SimpleNamespace(
+        status=200,
+        reason="OK",
+        headers={"Content-Type": "image/png"},
+        content=_Content([b"second"]),
+        read=AsyncMock(side_effect=AssertionError("successful assets must stream")),
+    )
+    gateway.session = _Session(
+        contexts=[_Context(response=first), _Context(response=second)],
+        health_contexts=[
+            _Context(response=_health_response(status="degraded")),
+            _Context(response=_health_response(chrome=False, cdp=False)),
+        ],
+    )
+    monkeypatch.setattr(gateway_module.web, "StreamResponse", _Downstream)
+
+    first_task = asyncio.create_task(
+        gateway.proxy_asset(_request("/v1/assets/first"))
+    )
+    await asyncio.wait_for(first_started.wait(), timeout=1)
+    second_task = asyncio.create_task(
+        gateway.proxy_asset(_request("/v1/assets/second"))
+    )
+    await asyncio.sleep(0)
+
+    assert len(gateway.session.requests) == 1
+    assert gateway.active_asset_transfers == 1
+    health_response = await gateway.health(_request("/health"))
+    health = json.loads(health_response.body)
+    assert health_response.status == 503
+    assert health["status"] == "degraded"
+    assert health["active_asset_transfers"] == 1
+    assert health["busy"] is True
+    release_first.set()
+    first_downstream, second_downstream = await asyncio.gather(
+        first_task, second_task
+    )
+
+    assert len(gateway.session.requests) == 2
+    assert first_downstream.writes == [b"first"]
+    assert second_downstream.writes == [b"second"]
+    assert "Content-Length" not in first_downstream.headers
+    first.read.assert_not_awaited()
+    second.read.assert_not_awaited()
+    assert gateway.active_asset_transfers == 0
 
 
 @pytest.mark.asyncio
@@ -421,6 +548,69 @@ async def test_busy_gateway_queue_has_bounded_readable_timeout():
     assert b"both Web2API workers are busy" in response.body
     assert b"capacity_timeout" in response.body
     assert gateway.available.qsize() == 0
+
+
+def test_main_enables_aiohttp_handler_cancellation(monkeypatch):
+    captured = {}
+
+    def fake_run_app(app, **kwargs):
+        captured["app"] = app
+        captured.update(kwargs)
+
+    monkeypatch.setattr(sys, "argv", ["dual_tab_gateway.py"])
+    monkeypatch.delenv("W2A_GATEWAY_MAX_CONCURRENT_ASSETS", raising=False)
+    monkeypatch.setattr(gateway_module.web, "run_app", fake_run_app)
+
+    gateway_module.main()
+
+    assert captured["handler_cancellation"] is True
+
+
+@pytest.mark.asyncio
+async def test_disconnected_queued_socket_is_cancelled_before_backend_acquire():
+    gateway = gateway_module.DualTabGateway(
+        ["http://one", "http://two"], queue_timeout_seconds=10
+    )
+    gateway.session = object()
+    await gateway.available.get()
+    await gateway.available.get()
+
+    app = gateway_module.web.Application()
+    app.router.add_route("*", "/{tail:.*}", gateway.proxy)
+    runner = gateway_module.web.AppRunner(app, handler_cancellation=True)
+    await runner.setup()
+    site = gateway_module.web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    assert site._server is not None
+    port = site._server.sockets[0].getsockname()[1]
+    _reader, writer = await asyncio.open_connection("127.0.0.1", port)
+
+    async def wait_for_queue_size(expected: int) -> None:
+        async def poll() -> None:
+            while gateway.queued_requests != expected:
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(poll(), timeout=1)
+
+    try:
+        writer.write(
+            b"GET /v1/models HTTP/1.1\r\n"
+            + f"Host: 127.0.0.1:{port}\r\n".encode()
+            + b"\r\n"
+        )
+        await writer.drain()
+        await wait_for_queue_size(1)
+
+        writer.close()
+        await writer.wait_closed()
+        await wait_for_queue_size(0)
+
+        assert gateway.available.qsize() == 0
+    finally:
+        if not writer.is_closing():
+            writer.close()
+            await writer.wait_closed()
+        await runner.cleanup()
 
 
 @pytest.mark.asyncio

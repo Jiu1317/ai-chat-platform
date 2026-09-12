@@ -53,10 +53,11 @@ REASONING_REQUEST_TIMEOUT_SECONDS = 420
 SSE_HEARTBEAT_SECONDS = 15
 ASSET_TTL_SECONDS = 60 * 60
 ASSET_PREFETCH_TIMEOUT_SECONDS = 3 * 60
-MAX_ASSET_CACHE_ITEMS = 4
+MAX_ASSET_CACHE_ITEMS = 5
+ASSET_PREFETCH_CONCURRENCY = 2
 MAX_ASSET_CACHE_BYTES = 30 * 1024 * 1024
 MAX_ASSET_CACHE_TOTAL_BYTES = MAX_ASSET_CACHE_ITEMS * MAX_ASSET_CACHE_BYTES
-MAX_SHARED_ASSET_CACHE_ITEMS = MAX_ASSET_CACHE_ITEMS * 2
+MAX_SHARED_ASSET_CACHE_ITEMS = MAX_ASSET_CACHE_ITEMS * 4
 MAX_SHARED_ASSET_CACHE_TOTAL_BYTES = (
     MAX_SHARED_ASSET_CACHE_ITEMS * MAX_ASSET_CACHE_BYTES
 )
@@ -99,6 +100,57 @@ def _format_context_turn(turn: list[tuple[str, str, list[ImageReference]]]) -> s
     )
 
 
+def _unsupported_chat_feature(
+    body: dict, messages: list
+) -> tuple[str, str] | None:
+    """Return a clear error for Chat features this browser bridge cannot carry."""
+    if body.get("tools"):
+        return (
+            "tools are not supported by this ChatGPT web bridge",
+            "tools",
+        )
+    if body.get("tool_choice") not in (None, "none"):
+        return (
+            "tool_choice is not supported by this ChatGPT web bridge",
+            "tool_choice",
+        )
+    if body.get("parallel_tool_calls"):
+        return (
+            "parallel_tool_calls is not supported by this ChatGPT web bridge",
+            "parallel_tool_calls",
+        )
+
+    for message_index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "").lower()
+        if role in {"tool", "function"}:
+            return (
+                f"{role} messages are not supported by this ChatGPT web bridge",
+                f"messages[{message_index}].role",
+            )
+        if role == "assistant":
+            for field in ("tool_calls", "function_call"):
+                if message.get(field):
+                    return (
+                        f"assistant {field} is not supported by this ChatGPT web bridge",
+                        f"messages[{message_index}].{field}",
+                    )
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for part_index, part in enumerate(content):
+            if not isinstance(part, dict):
+                continue
+            part_type = str(part.get("type") or "").lower()
+            if part_type in {"input_file", "file"}:
+                return (
+                    "File content parts are not supported; send text or image_url content",
+                    f"messages[{message_index}].content[{part_index}]",
+                )
+    return None
+
+
 def _build_chat_context(
     messages: object, *, conversation_id: str | None = None
 ) -> tuple[str, list[ImageReference], str, bool, bool]:
@@ -121,7 +173,7 @@ def _build_chat_context(
         role = str(message.get("role") or "").lower()
         content, images = parse_content_parts(message.get("content", ""))
         content = _normalise_context_text(content)
-        if role == "system":
+        if role in {"system", "developer"}:
             if content:
                 system_parts.append(content)
         elif role in {"user", "assistant"}:
@@ -296,7 +348,7 @@ class APIServer:
         return None
 
     def _purge_expired_assets(self, now: float | None = None) -> None:
-        """Drop expired capabilities and their process-local cached bytes."""
+        """Drop expired capabilities and process-local cached bytes."""
         current = time.time() if now is None else now
         self._asset_tokens = {
             token: record
@@ -306,7 +358,7 @@ class APIServer:
         self._asset_cache = {
             token: record
             for token, record in self._asset_cache.items()
-            if record[0] > current and token in self._asset_tokens
+            if record[0] > current
         }
 
     @staticmethod
@@ -458,6 +510,13 @@ class APIServer:
                 ),
                 "filename": str(metadata.get("filename") or "attachment"),
             }
+            # Treat a successful cross-worker read as recent use so an active
+            # download batch is not selected as the oldest shared entry.
+            for path in (metadata_path, data_path):
+                try:
+                    path.touch()
+                except OSError:
+                    pass
             return expires_at, downloaded
         except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
             for path in (metadata_path, data_path):
@@ -487,19 +546,20 @@ class APIServer:
         return await asyncio.to_thread(self._load_asset_disk_sync, token)
 
     async def _prefetch_published_assets(self, assets: list[dict]) -> None:
-        """Fill the generated-image cache before capability URLs are exposed."""
+        """Fill the bounded generated-asset cache before URLs are exposed."""
+        semaphore = asyncio.Semaphore(ASSET_PREFETCH_CONCURRENCY)
+
         async def _prefetch(asset: dict) -> None:
-            if not self._is_image_asset(asset):
-                return
             token = str(asset.get("url") or "").rsplit("/", 1)[-1]
             record = self._asset_tokens.get(token)
             if not token or not record or record[0] <= time.time():
                 return
             try:
-                downloaded = await asyncio.wait_for(
-                    self._driver.download_response_asset(record[1]),
-                    timeout=ASSET_PREFETCH_TIMEOUT_SECONDS,
-                )
+                async with semaphore:
+                    downloaded = await asyncio.wait_for(
+                        self._driver.download_response_asset(record[1]),
+                        timeout=ASSET_PREFETCH_TIMEOUT_SECONDS,
+                    )
                 validated = self._validated_asset_download(record[1], downloaded)
                 await self._cache_asset(token, record[0], validated)
             except asyncio.CancelledError:
@@ -507,11 +567,9 @@ class APIServer:
             except Exception as exc:
                 # Keep the capability alive: _handle_asset retains its existing
                 # on-demand retry and human-readable 502 response.
-                logger.warning("Generated image prefetch failed: %s", exc)
+                logger.warning("Generated asset prefetch failed: %s", exc)
 
-        candidates = [
-            asset for asset in assets if self._is_image_asset(asset)
-        ][:MAX_ASSET_CACHE_ITEMS]
+        candidates = assets[:MAX_ASSET_CACHE_ITEMS]
         await asyncio.gather(*(_prefetch(asset) for asset in candidates))
 
     async def _prefetch_assets_with_heartbeat(
@@ -575,26 +633,29 @@ class APIServer:
         token = request.match_info.get("token", "")
         self._purge_expired_assets()
         record = self._asset_tokens.get(token)
-        disk_cached = await self._load_asset_disk(token)
-        if (not record or record[0] <= time.time()) and disk_cached is None:
-            self._asset_tokens.pop(token, None)
-            self._asset_cache.pop(token, None)
-            raise web.HTTPNotFound(text="Asset link is invalid or expired")
         cached = self._asset_cache.get(token)
         if cached and cached[0] > time.time():
             downloaded = cached[1]
-        elif disk_cached is not None:
-            expires_at, downloaded = disk_cached
-            self._cache_asset_memory(token, expires_at, downloaded)
         else:
-            assert record is not None
-            try:
-                downloaded = await self._driver.download_response_asset(record[1])
-                downloaded = self._validated_asset_download(record[1], downloaded)
-            except Exception as exc:
-                logger.warning("Asset proxy failed: %s", exc)
-                raise web.HTTPBadGateway(text="Could not retrieve ChatGPT asset") from exc
-            await self._cache_asset(token, record[0], downloaded)
+            disk_cached = await self._load_asset_disk(token)
+            if (not record or record[0] <= time.time()) and disk_cached is None:
+                self._asset_tokens.pop(token, None)
+                self._asset_cache.pop(token, None)
+                raise web.HTTPNotFound(text="Asset link is invalid or expired")
+            if disk_cached is not None:
+                expires_at, downloaded = disk_cached
+                self._cache_asset_memory(token, expires_at, downloaded)
+            else:
+                assert record is not None
+                try:
+                    downloaded = await self._driver.download_response_asset(record[1])
+                    downloaded = self._validated_asset_download(record[1], downloaded)
+                except Exception as exc:
+                    logger.warning("Asset proxy failed: %s", exc)
+                    raise web.HTTPBadGateway(
+                        text="Could not retrieve ChatGPT asset"
+                    ) from exc
+                await self._cache_asset(token, record[0], downloaded)
         content_type = str(downloaded.get("content_type") or "application/octet-stream")
         content_type = content_type.split(";", 1)[0]
         source_name = record[1].get("name") if record is not None else None
@@ -772,6 +833,21 @@ class APIServer:
                 status=400,
             )
 
+        unsupported = _unsupported_chat_feature(body, messages)
+        if unsupported is not None:
+            message, param = unsupported
+            return web.json_response(
+                {
+                    "error": {
+                        "message": message,
+                        "type": "invalid_request_error",
+                        "param": param,
+                        "code": "unsupported_feature",
+                    }
+                },
+                status=400,
+            )
+
         model = body.get("model", self._config.chatgpt.default_model)
         if not isinstance(model, str) or not model.strip():
             return web.json_response(
@@ -890,9 +966,19 @@ class APIServer:
         image_tempdir = None
         image_paths: list[str] = []
         try:
-            if image_references and not stream:
+            if image_references:
                 image_tempdir = tempfile.TemporaryDirectory(prefix="web2api-images-")
-                image_paths = await prepare_image_files(image_references, image_tempdir.name)
+                # A streaming response must commit an early byte before a slow
+                # remote image tunnel can consume the proxy's first-byte
+                # window. Its validation therefore happens inside
+                # _stream_response, with SSE heartbeats while it is pending.
+                # Non-streaming requests retain preflight validation so invalid
+                # inputs can still receive a proper HTTP 400.
+                if not stream:
+                    image_paths = await prepare_image_files(
+                        image_references,
+                        image_tempdir.name,
+                    )
         except ImageInputError as exc:
             if image_tempdir is not None:
                 image_tempdir.cleanup()
@@ -1010,6 +1096,9 @@ class APIServer:
                     return await self._stream_response(
                         request, model_slug, full_text, timeout,
                         image_paths=image_paths, image_references=image_references,
+                        image_directory=(
+                            image_tempdir.name if image_tempdir is not None else None
+                        ),
                         expect_non_text=expect_non_text,
                     )
                 else:
@@ -1192,6 +1281,7 @@ class APIServer:
 
         async def _send_and_collect() -> str:
             collected = ""
+            final_text = None
             send_kwargs = {"attachments": image_paths} if image_paths else {}
             if expect_non_text:
                 send_kwargs["expect_non_text"] = True
@@ -1199,7 +1289,9 @@ class APIServer:
                 text, timeout=timeout, budgets=budgets, model=model, **send_kwargs,
             ):
                 collected += chunk.delta
-            return collected
+                if chunk.final_text is not None:
+                    final_text = chunk.final_text
+            return final_text if final_text is not None else collected
 
         full_text = await retry_on_rate_limit(self._driver, _send_and_collect)
 
@@ -1238,6 +1330,7 @@ class APIServer:
         self, request: web.Request, model: str, text: str, timeout: float,
         image_paths: list[str] | None = None,
         image_references: list[ImageReference] | None = None,
+        image_directory: str | None = None,
         expect_non_text: bool = False,
     ) -> web.Response:
         """Streaming: SSE chunks as they arrive.
@@ -1329,13 +1422,55 @@ class APIServer:
             },
         )
 
-        stream_image_tempdir = None
-        try:
-            if image_references:
-                stream_image_tempdir = tempfile.TemporaryDirectory(prefix="web2api-images-")
+        if image_references and not image_paths:
+            try:
+                if not image_directory:
+                    raise ImageInputError(
+                        "Reference image workspace is unavailable"
+                    )
                 image_paths = await self._prepare_images_with_heartbeat(
-                    resp, image_references, stream_image_tempdir.name
+                    resp,
+                    image_references,
+                    image_directory,
                 )
+            except Exception as exc:
+                is_input_error = isinstance(exc, ImageInputError)
+                logger.warning("Streaming reference image preparation failed: %s", exc)
+                await self._send_sse(
+                    resp,
+                    {
+                        "id": cid,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "error": {
+                            "message": str(exc),
+                            "type": (
+                                "invalid_request_error"
+                                if is_input_error
+                                else "server_error"
+                            ),
+                            "code": (
+                                "invalid_image_input"
+                                if is_input_error
+                                else "image_prepare_failed"
+                            ),
+                        },
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {},
+                                "finish_reason": "error",
+                            }
+                        ],
+                    },
+                )
+                await resp.write(b"data: [DONE]\n\n")
+                await resp.write_eof()
+                return resp
+
+        authoritative_final_text: str | None = None
+        try:
             send_kwargs = {"attachments": image_paths} if image_paths else {}
             if expect_non_text:
                 send_kwargs["expect_non_text"] = True
@@ -1349,6 +1484,8 @@ class APIServer:
                     # a long Pro/search turn as an idle, broken connection.
                     await resp.write(b": keep-alive\n\n")
                     continue
+                if chunk.final_text is not None:
+                    authoritative_final_text = chunk.final_text
                 if chunk.delta:
                     await self._send_sse(
                         resp,
@@ -1392,19 +1529,23 @@ class APIServer:
                                 }],
                             },
                         )
-                    await self._send_sse(
-                        resp,
-                        {
-                            "id": cid,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model,
-                            "conversation_id": conv_id,
-                            "choices": [
-                                {"index": 0, "delta": {}, "finish_reason": chunk.finish_reason}
-                            ],
-                        },
-                    )
+                    terminal_chunk = {
+                        "id": cid,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "conversation_id": conv_id,
+                        "choices": [
+                            {"index": 0, "delta": {}, "finish_reason": chunk.finish_reason}
+                        ],
+                    }
+                    # Backward-compatible SSE extension: OpenAI-compatible
+                    # consumers ignore unknown top-level fields, while clients
+                    # that understand this bridge can replace an optimistic DOM
+                    # draft with the authoritative backend end_turn text.
+                    if authoritative_final_text is not None:
+                        terminal_chunk["final_text"] = authoritative_final_text
+                    await self._send_sse(resp, terminal_chunk)
         except RateLimitError as e:
             # Mid-stream throttle (rare after pre-flight). Status is locked at
             # 200, so we can't upgrade to 429; surface as an inline error chunk
@@ -1493,10 +1634,6 @@ class APIServer:
                     ],
                 },
             )
-        finally:
-            if stream_image_tempdir is not None:
-                stream_image_tempdir.cleanup()
-
         await resp.write(b"data: [DONE]\n\n")
         await resp.write_eof()
         return resp

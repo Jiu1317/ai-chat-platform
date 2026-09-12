@@ -13,8 +13,8 @@ ExecStart=/srv/ai-chat/venv/bin/uvicorn app:app --host 127.0.0.1 --port 13002 --
 Restart=on-failure
 RestartSec=3
 # Uvicorn stops accepting new requests on SIGTERM, then waits for active
-# streams to finish. Keep this above the website's 20-minute outer deadline.
-TimeoutStopSec=25min
+# streams to finish. Keep this above the website's 44-minute drain deadline.
+TimeoutStopSec=46min
 PrivateTmp=true
 NoNewPrivileges=true
 

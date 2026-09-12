@@ -6,6 +6,7 @@ $ErrorActionPreference = 'Stop'
 
 $WorkRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $TrayScript = Join-Path $WorkRoot 'dual-tab-tray.ps1'
+$WatchScript = Join-Path $WorkRoot 'watch-dual-tab.ps1'
 $ExitSignalFile = Join-Path $WorkRoot '.dual-tab-tray-exit'
 $RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $RunName = 'Web2ApiChromeTray'
@@ -15,6 +16,16 @@ function Get-ExistingTrayProcesses {
         Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
             $_.CommandLine -and
             $_.CommandLine.Contains($TrayScript) -and
+            $_.ProcessId -ne $PID
+        }
+    )
+}
+
+function Get-ExistingWatchdogProcesses {
+    return @(
+        Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+            $_.CommandLine -and
+            $_.CommandLine.Contains($WatchScript) -and
             $_.ProcessId -ne $PID
         }
     )
@@ -40,7 +51,10 @@ if ($Uninstall) {
     if (Get-ExistingTrayProcesses) {
         Write-Warning 'The tray controller is still closing. Its browser window will be restored when it exits.'
     }
-    Write-Output 'ChatGPT tray autostart was removed; API and watchdog processes were left unchanged.'
+    foreach ($watchdog in @(Get-ExistingWatchdogProcesses)) {
+        Stop-Process -Id $watchdog.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+    Write-Output 'ChatGPT tray autostart and its watchdog were removed; API and browser processes were left unchanged.'
     exit 0
 }
 
@@ -49,7 +63,7 @@ if (-not (Test-Path -LiteralPath $TrayScript)) {
 }
 
 $null = [scriptblock]::Create((Get-Content -Raw -LiteralPath $TrayScript))
-$runCommand = 'powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $TrayScript + '"'
+$runCommand = 'powershell.exe -NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $TrayScript + '"'
 
 # Clear an old uninstall signal only as part of an explicit installation. If an
 # uninstall raced with tray startup, leaving the signal in place lets that late
@@ -63,7 +77,7 @@ Set-ItemProperty -Path $RunKey -Name $RunName -Value $runCommand
 
 if (-not (Get-ExistingTrayProcesses)) {
     Start-Process -FilePath 'powershell.exe' -ArgumentList @(
-        '-NoProfile', '-WindowStyle', 'Hidden',
+        '-NoProfile', '-STA', '-WindowStyle', 'Hidden',
         '-ExecutionPolicy', 'Bypass', '-File', (ConvertTo-NativeArgument $TrayScript)
     ) -WindowStyle Hidden
 }

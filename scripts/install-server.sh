@@ -25,6 +25,7 @@ fi
 
 install -d -o "${service_user}" -g "${service_user}" -m 0750 \
   "${install_root}/current" "${install_root}/current/services" \
+  "${install_root}/current/scripts" \
   "${install_root}/data" "${install_root}/workspaces" "${install_root}/state" \
   /etc/ai-chat
 
@@ -33,6 +34,10 @@ rsync -a --delete \
   "${project_root}/website/" "${install_root}/current/website/"
 rsync -a --delete "${project_root}/services/image-bridge/" \
   "${install_root}/current/services/image-bridge/"
+install -m 0755 "${project_root}/scripts/cleanup-stale-uploads.py" \
+  "${install_root}/current/scripts/cleanup-stale-uploads.py"
+install -m 0755 "${project_root}/scripts/deployment-snapshot.py" \
+  "${install_root}/current/scripts/deployment-snapshot.py"
 chown -R "${service_user}:${service_user}" "${install_root}/current"
 
 python3 -m venv "${install_root}/venv"
@@ -67,6 +72,10 @@ EOF
 fi
 
 install -m 0644 "${project_root}/deploy/systemd/ai-chat.service" /etc/systemd/system/ai-chat.service
+install -m 0644 "${project_root}/deploy/systemd/ai-chat-upload-cleanup.service" \
+  /etc/systemd/system/ai-chat-upload-cleanup.service
+install -m 0644 "${project_root}/deploy/systemd/ai-chat-upload-cleanup.timer" \
+  /etc/systemd/system/ai-chat-upload-cleanup.timer
 sed "s/chat\.example\.com/${domain}/g" "${project_root}/deploy/nginx/ai-chat.conf" \
   > /etc/nginx/sites-available/ai-chat.conf
 ln -sfn /etc/nginx/sites-available/ai-chat.conf /etc/nginx/sites-enabled/ai-chat.conf
@@ -74,6 +83,7 @@ rm -f /etc/nginx/sites-enabled/default
 
 systemctl daemon-reload
 systemctl enable --now ai-chat.service
+systemctl enable --now ai-chat-upload-cleanup.timer
 nginx -t
 systemctl reload nginx
 
