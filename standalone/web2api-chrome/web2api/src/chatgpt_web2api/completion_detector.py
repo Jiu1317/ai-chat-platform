@@ -98,6 +98,13 @@ logger = logging.getLogger(__name__)
 # unchanged).
 PHASE_STALL_SECONDS = 90
 
+# A missing backend ``end_turn`` or action-button signal may leave an already
+# completed assistant turn in the stream-idle path. Before accepting the final
+# DOM as a terminal fallback, require the same non-empty text while every known
+# generation signal is continuously inactive for this grace window. This
+# rejects ordinary Stop-button flicker without extending the idle budget.
+DOM_TERMINAL_STABILITY_SECONDS = 2.0
+
 
 def append_only_delta(emitted: str, observed: str) -> str:
     """Return only a safe append-only suffix for an SSE text stream.
@@ -329,6 +336,7 @@ class CompletionDetector:
         self.last_dom_text: str = ""
         self.had_non_text_content: bool = False
         self.completed_via_exact_action: bool = False
+        self.completed_via_stable_dom: bool = False
         self.non_text_dom_assets: list[dict] = []
 
     async def _probe_non_text_dom_state(self, d) -> dict:
@@ -540,6 +548,7 @@ class CompletionDetector:
         self.last_dom_text = ""
         self.had_non_text_content = False
         self.completed_via_exact_action = False
+        self.completed_via_stable_dom = False
         self.non_text_dom_assets = []
 
         # Wait for a new assistant message. The full `timeout` governs (was
@@ -755,6 +764,8 @@ class CompletionDetector:
         # URL (cheap) until a conv_id is available, then the existing backend
         # check can fire. See _get_live_conversation_id_best_effort.
         last_conv_id_probe = 0.0
+        stable_terminal_text = ""
+        stable_terminal_since: float | None = None
         while time.monotonic() < deadline:
             try:
                 result = await d._js_strict(
@@ -765,7 +776,7 @@ class CompletionDetector:
                     # enter this loop just as ChatGPT removes it.  Never fall
                     # back to the pre-send last assistant: its text and action
                     # row belong to the previous request.
-                    "  if (msgs.length <= initialCount) return JSON.stringify({text:'', md_text:'', html_len:0, child_count:0, has_meaningful_non_text:false, has_action:false, has_exact_action:false, is_thinking:false, generation_active:false, assistant_count:msgs.length, current_assistant_present:false});"
+                    "  if (msgs.length <= initialCount) return JSON.stringify({text:'', md_text:'', html_len:0, child_count:0, has_meaningful_non_text:false, has_action:false, has_exact_action:false, has_error:false, is_thinking:false, generation_active:false, assistant_count:msgs.length, current_assistant_present:false});"
                     "  var last = msgs[msgs.length - 1];"
                     # Text: the clean answer lives in ``.markdown`` textContent.
                     # It's empty during streaming and populates as the turn
@@ -873,10 +884,15 @@ class CompletionDetector:
                     # so the stall clock treats it as active generation, not a stall.
                     "  var stopButton = document.querySelector('[data-testid=\"stop-button\"], button[aria-label*=\"Stop\" i], button[aria-label*=\"停止\"]');"
                     "  var stopVisible = !!(stopButton && (stopButton.offsetParent !== null || stopButton.getClientRects().length > 0));"
+                    "  var responseBusy = last.matches('[aria-busy=\"true\"]') || !!last.querySelector('[aria-busy=\"true\"]');"
+                    "  var errorScope = turn || last;"
+                    "  var errorElement = errorScope.querySelector('[data-testid*=\"error\" i], [data-testid*=\"retry\" i], button[aria-label*=\"Retry\" i], button[aria-label*=\"重试\"]');"
+                    "  var normalizedErrorText = rawText.replace(/\\s+/g, ' ').trim();"
+                    "  var has_error = !!errorElement || /^(something went wrong|there was an error generating (?:a |the )?response|生成回复时出错|出了点问题|发生错误)/i.test(normalizedErrorText);"
                     "  var hasThinkingEl = !!last.querySelector('.result-thinking, [data-testid*=\"thinking\"], [data-testid*=\"reasoning\"]');"
                     "  var visibleThinking = /^(thinking|reasoning)\\b/i.test(rawText.trim());"
-                    "  var is_thinking = (stopVisible && hasThinkingEl) || (visibleThinking && !mdText);"
-                    "  return JSON.stringify({text: text, md_text: mdText, html_len: html_len, child_count: child_count, has_meaningful_non_text: has_meaningful_non_text, has_action: has_action, has_exact_action: has_exact_action, is_thinking: is_thinking, generation_active: stopVisible, assistant_count:msgs.length, current_assistant_present:true});"
+                    "  var is_thinking = ((stopVisible || responseBusy) && hasThinkingEl) || (visibleThinking && !mdText);"
+                    "  return JSON.stringify({text: text, md_text: mdText, html_len: html_len, child_count: child_count, has_meaningful_non_text: has_meaningful_non_text, has_action: has_action, has_exact_action: has_exact_action, has_error:has_error, is_thinking: is_thinking, generation_active:(stopVisible || responseBusy), assistant_count:msgs.length, current_assistant_present:true});"
                     "})()",
                 )
                 data = json.loads(result)
@@ -918,6 +934,8 @@ class CompletionDetector:
                 )
             has_action = data.get("has_action", False)
             has_exact_action = data.get("has_exact_action", False)
+            has_page_error = data.get("has_error") is True
+            current_assistant_present = data.get("current_assistant_present") is True
             is_thinking = data.get("is_thinking", False)
             generation_active = bool(
                 data.get("generation_active", False)
@@ -1021,6 +1039,31 @@ class CompletionDetector:
             last_html_len = html_len
             last_child_count = child_count
             last_meaningful_non_text = meaningful_non_text
+
+            # A completed turn can occasionally miss both the backend end_turn
+            # projection and its exact action-button event. Build a conservative
+            # latest-assistant terminal candidate, but act on it only when an
+            # existing phase timeout is reached. Final media may coexist with a
+            # text answer, so it is not itself a blocker; active Stop/aria-busy,
+            # thinking, empty text, missing current-turn identity, explicit
+            # image-generation mode, and official page errors are blockers.
+            terminal_candidate = (
+                current_assistant_present
+                and bool(observed_progress_text)
+                and not generation_active
+                and not is_thinking
+                and not has_page_error
+                and not expect_non_text
+            )
+            if terminal_candidate:
+                if observed_progress_text != stable_terminal_text:
+                    stable_terminal_text = observed_progress_text
+                    stable_terminal_since = time.monotonic()
+                elif stable_terminal_since is None:
+                    stable_terminal_since = time.monotonic()
+            else:
+                stable_terminal_text = ""
+                stable_terminal_since = None
 
             # ── Completion detection ─────────────────────────────────────
             # Two signals, ordered by stability. Backend end_turn is PRIMARY
@@ -1333,6 +1376,40 @@ class CompletionDetector:
                             model_class, generation_active_signal,
                         )
                         return  # generation completed — return normally
+                    stable_dom_ready = (
+                        stable_terminal_since is not None
+                        and time.monotonic() - stable_terminal_since
+                        >= DOM_TERMINAL_STABILITY_SECONDS
+                        and stable_terminal_text == observed_progress_text
+                        and current_assistant_present
+                        and not generation_active
+                        and not is_thinking
+                        and not has_page_error
+                        and not expect_non_text
+                    )
+                    if stable_dom_ready:
+                        terminal_delta = append_only_delta(
+                            last_dom_text, stable_terminal_text
+                        )
+                        if terminal_delta:
+                            yield StreamChunk(delta=terminal_delta)
+                            last_dom_text += terminal_delta
+                            self.last_dom_text = last_dom_text
+                        if last_dom_text == stable_terminal_text:
+                            self.completed_via_stable_dom = True
+                            logger.info(
+                                "Stable inactive current-turn DOM accepted after "
+                                "missed completion signal (elapsed=%.0fs, kind=%s)",
+                                elapsed_total,
+                                stall_kind,
+                            )
+                            return
+                        logger.warning(
+                            "Stable terminal DOM rewrote an emitted SSE prefix; "
+                            "preserving the stall error (streamed=%d final=%d)",
+                            len(last_dom_text),
+                            len(stable_terminal_text),
+                        )
                     # Reconciliation found no completion — raise structured error.
                     raise GenerationStuckError(
                         "phase_2_stream",

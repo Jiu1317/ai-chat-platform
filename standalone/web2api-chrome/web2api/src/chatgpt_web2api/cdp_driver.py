@@ -1961,7 +1961,13 @@ class CDPDriver:
                 reconcile_attempts = (
                     0
                     if (
-                        (self._completion.completed_via_exact_action and last_dom_text)
+                        (
+                            (
+                                self._completion.completed_via_exact_action
+                                or self._completion.completed_via_stable_dom
+                            )
+                            and last_dom_text
+                        )
                         or (had_non_text_content and dom_non_text_assets)
                     )
                     else 60
@@ -2002,7 +2008,13 @@ class CDPDriver:
                     # not_ready → keep polling.
                     await asyncio.sleep(0.5)
                 else:
-                    if self._completion.completed_via_exact_action and last_dom_text:
+                    if (
+                        (
+                            self._completion.completed_via_exact_action
+                            or self._completion.completed_via_stable_dom
+                        )
+                        and last_dom_text
+                    ):
                         logger.info(
                             "Using complete current-turn DOM text; skipping lagging "
                             "backend reconciliation"

@@ -107,7 +107,8 @@ def test_detector_has_only_driver_and_transient_results():
     own = vars(detector)
     assert set(own) == {
         "_driver", "last_dom_text", "had_non_text_content",
-        "completed_via_exact_action", "non_text_dom_assets",
+        "completed_via_exact_action", "completed_via_stable_dom",
+        "non_text_dom_assets",
     }, (
         f"unexpected instance state on CompletionDetector: {set(own)}"
     )
@@ -120,6 +121,7 @@ def test_per_call_results_reset_on_each_call():
     # Pollute them; the first thing the method does is reset both to defaults.
     detector.last_dom_text = "stale"
     detector.had_non_text_content = True
+    detector.completed_via_stable_dom = True
 
     # The detector calls _js_strict with several distinct JS expressions:
     #   - the rate-limit body scan  -> JSON {"text": ...}
@@ -159,6 +161,7 @@ def test_per_call_results_reset_on_each_call():
     # the poll carrying text="hi", last_dom_text reflects THIS call ("hi").
     assert detector.last_dom_text == "hi"
     assert detector.last_dom_text != "stale"
+    assert detector.completed_via_stable_dom is False
 
 
 # ── 4. Back-compat re-exports from cdp_driver ─────────────────────────

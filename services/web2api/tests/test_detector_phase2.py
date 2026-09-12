@@ -45,16 +45,20 @@ def _make_detector(budgets=None, conv_id="conv-1"):
 
 
 def _phase2_poll_payload(*, text="", md_text="", is_thinking=False,
-                         has_action=False, html_len=0, child_count=0,
-                         has_meaningful_non_text=False,
-                         generation_active=False):
+                          has_action=False, html_len=0, child_count=0,
+                          has_meaningful_non_text=False,
+                          generation_active=False, has_exact_action=False,
+                          has_error=False, current_assistant_present=False):
     """Build the JSON the phase-2 poll JS returns."""
     return json.dumps({
         "text": text, "md_text": md_text, "html_len": html_len,
         "child_count": child_count, "has_action": has_action,
+        "has_exact_action": has_exact_action,
         "is_thinking": is_thinking,
         "has_meaningful_non_text": has_meaningful_non_text,
         "generation_active": generation_active,
+        "has_error": has_error,
+        "current_assistant_present": current_assistant_present,
     })
 
 
@@ -79,6 +83,19 @@ class _ScriptedPoll:
         if "innerText" in expr:
             return self.scan
         return "1"
+
+
+def _install_fast_clock(monkeypatch):
+    t = [0.0]
+    original_sleep = asyncio.sleep
+
+    async def fast_sleep(delay):
+        t[0] += delay
+        await original_sleep(0)
+
+    monkeypatch.setattr(time, "monotonic", lambda: t[0])
+    monkeypatch.setattr(asyncio, "sleep", fast_sleep)
+    return t
 
 
 # ── 1. Reasoning first-content does NOT fail at 90s ─────────────────────
@@ -258,6 +275,154 @@ async def test_stream_idle_uses_shorter_budget_after_first_content(monkeypatch):
     assert getattr(exc_info.value, "stall_kind", None) == "stream_idle_timeout", (
         f"Expected stall_kind='stream_idle_timeout', got {getattr(exc_info.value, 'stall_kind', None)}"
     )
+
+
+@pytest.mark.asyncio
+async def test_stable_latest_dom_completes_when_action_and_backend_miss(monkeypatch):
+    """A finished latest assistant must not become a false stream-idle error.
+
+    The broad action flag intentionally models the observed stale user-copy
+    match. It is not accepted early: completion occurs only at the idle budget
+    after the latest assistant text is continuously stable and inactive.
+    """
+    budgets = DetectorBudgets(
+        first_content_timeout_seconds=30,
+        stream_idle_timeout_seconds=3,
+        hard_timeout_seconds=100,
+    )
+    detector, driver = _make_detector(budgets=budgets)
+    driver._js_strict = _ScriptedPoll([
+        _phase2_poll_payload(
+            text="红色和蓝色。",
+            md_text="红色和蓝色。",
+            html_len=120,
+            child_count=1,
+            has_action=True,
+            has_exact_action=False,
+            generation_active=False,
+            current_assistant_present=True,
+        )
+    ])
+    driver._fetch_end_turn_for_turn = AsyncMock(
+        return_value=TurnEndResult(status="not_ready")
+    )
+    t = _install_fast_clock(monkeypatch)
+
+    chunks = []
+    async for chunk in detector.stream_until_complete(
+        initial_count=0,
+        timeout=100,
+        turn_anchor=TurnAnchor(sent_text="test", mode="fresh_chat"),
+        budgets=budgets,
+        model="auto",
+    ):
+        chunks.append(chunk.delta)
+
+    assert chunks == ["红色和蓝色。"]
+    assert t[0] > budgets.stream_idle_timeout_seconds
+    assert detector.completed_via_stable_dom is True
+    assert detector.completed_via_exact_action is False
+
+
+@pytest.mark.asyncio
+async def test_stable_reasoning_dom_emits_held_terminal_text_once(monkeypatch):
+    """Held reasoning text becomes one final append-only delta at fallback."""
+    budgets = DetectorBudgets(
+        first_content_timeout_seconds=3,
+        stream_idle_timeout_seconds=3,
+        hard_timeout_seconds=100,
+    )
+    detector, driver = _make_detector(budgets=budgets)
+    driver._js_strict = _ScriptedPoll([
+        _phase2_poll_payload(
+            text="红色和蓝色。",
+            md_text="红色和蓝色。",
+            html_len=120,
+            child_count=1,
+            generation_active=False,
+            current_assistant_present=True,
+        )
+    ])
+    driver._fetch_end_turn_for_turn = AsyncMock(
+        return_value=TurnEndResult(status="not_ready")
+    )
+    _install_fast_clock(monkeypatch)
+
+    chunks = []
+    async for chunk in detector.stream_until_complete(
+        initial_count=0,
+        timeout=100,
+        turn_anchor=TurnAnchor(sent_text="test", mode="fresh_chat"),
+        budgets=budgets,
+        model="gpt-5-6-thinking",
+        has_input_attachments=True,
+    ):
+        chunks.append(chunk.delta)
+
+    assert chunks == ["红色和蓝色。"]
+    assert detector.last_dom_text == "红色和蓝色。"
+    assert detector.completed_via_stable_dom is True
+
+
+@pytest.mark.parametrize(
+    "poll",
+    [
+        pytest.param(
+            _phase2_poll_payload(
+                text="partial",
+                generation_active=True,
+                current_assistant_present=True,
+            ),
+            id="still-generating",
+        ),
+        pytest.param(
+            _phase2_poll_payload(current_assistant_present=True),
+            id="empty-response",
+        ),
+        pytest.param(
+            _phase2_poll_payload(
+                text="Something went wrong",
+                has_error=True,
+                current_assistant_present=True,
+            ),
+            id="official-page-error",
+        ),
+        pytest.param(
+            _phase2_poll_payload(text="stale prior answer"),
+            id="missing-latest-assistant",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_stable_dom_fallback_rejects_non_terminal_shapes(
+    monkeypatch, poll,
+):
+    """Active, empty, error, and non-current DOM shapes remain real stalls."""
+    from chatgpt_web2api.cdp_driver import GenerationStuckError
+
+    budgets = DetectorBudgets(
+        first_content_timeout_seconds=3,
+        stream_idle_timeout_seconds=3,
+        hard_timeout_seconds=100,
+    )
+    detector, driver = _make_detector(budgets=budgets)
+    driver._js_strict = _ScriptedPoll([poll])
+    driver._fetch_end_turn_for_turn = AsyncMock(
+        return_value=TurnEndResult(status="not_ready")
+    )
+    _install_fast_clock(monkeypatch)
+
+    with pytest.raises(GenerationStuckError):
+        async for _ in detector.stream_until_complete(
+            initial_count=0,
+            timeout=100,
+            turn_anchor=TurnAnchor(sent_text="test", mode="fresh_chat"),
+            budgets=budgets,
+            model="auto",
+        ):
+            pass
+
+    assert detector.completed_via_stable_dom is False
 
 
 # ── 3. Hard cap wins over active DOM signal ─────────────────────────────
