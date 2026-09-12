@@ -385,8 +385,9 @@ async def _run_smoke(config: SmokeConfig) -> dict[str, Any]:
                 except httpx.RequestError as exc:
                     raise SmokeFailure("network request failed during login") from exc
                 _require_status(login, "login", 303)
-                if "ai_chat_session" not in client.cookies:
-                    raise SmokeFailure("login did not create a site session")
+                # Do not rely on CookieJar membership: a successful authenticated
+                # /api/models response is the proof that the login session works.
+                # Mark login now so every later failure still cleans up and logs out.
                 logged_in = True
 
                 try:

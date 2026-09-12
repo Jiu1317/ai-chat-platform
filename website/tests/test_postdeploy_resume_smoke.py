@@ -232,6 +232,41 @@ def test_smoke_interrupts_and_cleans_when_resume_fails(
     assert "POST /logout" in calls
 
 
+def test_model_listing_auth_failure_still_cleans_and_logs_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    real_async_client = httpx.AsyncClient
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        calls.append(f"{request.method} {path}")
+        if path == "/login":
+            # Intentionally omit Set-Cookie: the smoke test must not depend on
+            # direct CookieJar membership after a valid login redirect.
+            return _response(request, 303, headers={"location": "/"})
+        if path == "/api/models":
+            return _response(request, 401, json={"error": "unauthorized"})
+        if path == "/api/conversations/delete":
+            return _response(request, 200, json={"workspaceDeleted": True})
+        if path == "/logout":
+            return _response(request, 303, headers={"location": "/login"})
+        raise AssertionError(f"unexpected mocked route: {request.method} {path}")
+
+    def client_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(smoke.httpx, "AsyncClient", client_factory)
+
+    with pytest.raises(smoke.SmokeFailure, match="model listing returned HTTP 401"):
+        asyncio.run(smoke._run_smoke(_config()))
+
+    assert calls[:2] == ["POST /login", "GET /api/models"]
+    assert "POST /api/conversations/delete" in calls
+    assert "POST /logout" in calls
+
+
 def test_durable_cursor_must_increase() -> None:
     state = smoke.StreamState(cursor=2)
     with pytest.raises(smoke.SmokeFailure, match="strictly increasing"):
