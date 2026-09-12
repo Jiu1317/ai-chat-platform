@@ -15,6 +15,7 @@ import base64
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiohttp
 import pytest
 
 from chatgpt_web2api.backend_client import (
@@ -122,7 +123,9 @@ async def test_response_asset_prefers_direct_binary_download():
 
     assert result["data"] == b"image-bytes"
     assert result["content_type"] == "image/png"
-    direct_download.assert_awaited_once_with("https://cdn.example/image.png")
+    direct_download.assert_awaited_once_with(
+        "https://cdn.example/image.png", retry_connection_timeouts=False
+    )
     driver.ensure_token.assert_awaited_once()
 
 
@@ -142,6 +145,40 @@ async def test_response_asset_falls_back_to_browser_download():
 
     assert result == fallback
     client._download_response_asset_via_browser.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "source_url",
+    [
+        "https://chatgpt.com/backend-api/estuary/content?id=file_result",
+        "https://chat.openai.com/backend-api/files/file_result/download",
+    ],
+)
+async def test_chatgpt_owned_response_asset_uses_browser_without_direct_wait(
+    source_url,
+):
+    client, _ = _make_client()
+    asset = {"source_url": source_url, "name": "result.png"}
+    fallback = {
+        "data": b"browser-bytes",
+        "content_type": "image/png",
+        "content_disposition": "",
+        "filename": "result.png",
+    }
+    client._resolve_response_asset_url = AsyncMock()
+    client._download_response_asset_via_browser = AsyncMock(return_value=fallback)
+
+    with patch(
+        "chatgpt_web2api.backend_client._download_remote_image",
+        new=AsyncMock(),
+    ) as direct_download:
+        result = await client.download_response_asset(asset)
+
+    assert result == fallback
+    client._download_response_asset_via_browser.assert_awaited_once_with(asset)
+    client._resolve_response_asset_url.assert_not_awaited()
+    direct_download.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -174,7 +211,7 @@ async def test_response_asset_direct_timeout_reaches_browser_fallback():
         "filename": "result.png",
     }
 
-    async def stalled_download(_url):
+    async def stalled_download(_url, **_kwargs):
         try:
             await asyncio.Event().wait()
         except asyncio.CancelledError:
@@ -199,6 +236,37 @@ async def test_response_asset_direct_timeout_reaches_browser_fallback():
 
     assert result == fallback
     assert direct_cancelled.is_set()
+    client._download_response_asset_via_browser.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_response_asset_connection_timeout_skips_direct_retry():
+    client, _ = _make_client()
+    attempts = 0
+    fallback = {
+        "data": b"fallback-bytes",
+        "content_type": "image/png",
+        "content_disposition": "",
+        "filename": "result.png",
+    }
+
+    async def connection_timeout(_url):
+        nonlocal attempts
+        attempts += 1
+        raise aiohttp.ConnectionTimeoutError("connect timed out")
+
+    client._resolve_response_asset_url = AsyncMock(
+        return_value={"url": "https://cdn.example/image.png", "filename": "result.png"}
+    )
+    client._download_response_asset_via_browser = AsyncMock(return_value=fallback)
+    with patch(
+        "chatgpt_web2api.multimodal._download_remote_image_once",
+        new=connection_timeout,
+    ):
+        result = await client.download_response_asset({"file_id": "file_result"})
+
+    assert result == fallback
+    assert attempts == 1
     client._download_response_asset_via_browser.assert_awaited_once()
 
 

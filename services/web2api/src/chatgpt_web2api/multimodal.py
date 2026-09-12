@@ -18,6 +18,15 @@ import aiohttp
 
 logger = logging.getLogger(__name__)
 
+# ``ConnectionTimeoutError`` was split out from ``ServerTimeoutError`` after
+# aiohttp 3.9, which remains our minimum supported version.  On 3.9 the empty
+# tuple simply matches nothing and retains the legacy retry behavior.
+_CONNECTION_TIMEOUT_ERRORS: tuple[type[BaseException], ...] = tuple(
+    error_type
+    for error_type in (getattr(aiohttp, "ConnectionTimeoutError", None),)
+    if isinstance(error_type, type) and issubclass(error_type, BaseException)
+)
+
 
 MAX_IMAGE_COUNT = 8
 MAX_IMAGE_BYTES = 30 * 1024 * 1024
@@ -564,25 +573,34 @@ async def _download_remote_image_once(url: str) -> tuple[bytes, str, str]:
     raise ImageInputError("Image download failed")
 
 
-async def _download_remote_image(url: str) -> tuple[bytes, str, str]:
+async def _download_remote_image(
+    url: str, *, retry_connection_timeouts: bool = True
+) -> tuple[bytes, str, str]:
     last_error: Exception | None = None
     for attempt in range(IMAGE_DOWNLOAD_ATTEMPTS):
         try:
             return await _download_remote_image_once(url)
         except ImageInputError:
             raise
+        except _CONNECTION_TIMEOUT_ERRORS as exc:
+            # A response asset can use the authenticated browser as a second
+            # transport. Let that caller opt out of repeating the same long
+            # direct-connect timeout before it switches to its fallback.
+            if not retry_connection_timeouts:
+                raise ImageInputError("Image download connection timed out") from exc
+            last_error = exc
         except (TimeoutError, _RetryableImageDownload, aiohttp.ClientError) as exc:
             last_error = exc
-            if attempt + 1 >= IMAGE_DOWNLOAD_ATTEMPTS:
-                break
-            logger.warning(
-                "Reference image download attempt %d/%d failed (%s): %s",
-                attempt + 1,
-                IMAGE_DOWNLOAD_ATTEMPTS,
-                type(exc).__name__,
-                exc,
-            )
-            await asyncio.sleep(IMAGE_DOWNLOAD_RETRY_DELAYS[attempt])
+        if attempt + 1 >= IMAGE_DOWNLOAD_ATTEMPTS:
+            break
+        logger.warning(
+            "Reference image download attempt %d/%d failed (%s): %s",
+            attempt + 1,
+            IMAGE_DOWNLOAD_ATTEMPTS,
+            type(last_error).__name__,
+            last_error,
+        )
+        await asyncio.sleep(IMAGE_DOWNLOAD_RETRY_DELAYS[attempt])
     raise ImageInputError(
         f"Image download failed after {IMAGE_DOWNLOAD_ATTEMPTS} attempts"
     ) from last_error

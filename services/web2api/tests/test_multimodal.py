@@ -309,6 +309,52 @@ async def test_remote_reference_image_retries_transient_failures(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_remote_response_image_does_not_retry_connection_timeout(monkeypatch):
+    attempts = 0
+
+    async def connection_timeout(_url):
+        nonlocal attempts
+        attempts += 1
+        raise multimodal.aiohttp.ConnectionTimeoutError("connect timed out")
+
+    sleep = AsyncMock()
+    monkeypatch.setattr(multimodal, "_download_remote_image_once", connection_timeout)
+    monkeypatch.setattr(multimodal.asyncio, "sleep", sleep)
+
+    with pytest.raises(ImageInputError, match="connection timed out"):
+        await multimodal._download_remote_image(
+            "https://example.com/image.png", retry_connection_timeouts=False
+        )
+
+    assert attempts == 1
+    sleep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_remote_reference_image_still_retries_connection_timeout(monkeypatch):
+    attempts = 0
+
+    async def flaky_connection(_url):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise multimodal.aiohttp.ConnectionTimeoutError("connect timed out")
+        return PNG_1X1, "image/png", "https://example.com/image.png"
+
+    monkeypatch.setattr(multimodal, "_download_remote_image_once", flaky_connection)
+    monkeypatch.setattr(multimodal, "IMAGE_DOWNLOAD_RETRY_DELAYS", (0, 0))
+
+    data, mime_type, final_url = await multimodal._download_remote_image(
+        "https://example.com/image.png"
+    )
+
+    assert attempts == 3
+    assert data == PNG_1X1
+    assert mime_type == "image/png"
+    assert final_url.endswith("/image.png")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "url",
     [

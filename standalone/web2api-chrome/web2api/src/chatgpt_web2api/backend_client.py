@@ -67,6 +67,10 @@ class _Transient404(Exception):
 TOKEN_TTL_SECONDS = 3600
 DIRECT_ASSET_DOWNLOAD_TIMEOUT_SECONDS = 45
 MAX_BROWSER_ASSET_BYTES = 30 * 1024 * 1024
+CHATGPT_ASSET_URL_PREFIXES = (
+    "https://chatgpt.com/",
+    "https://chat.openai.com/",
+)
 
 
 class BackendClient:
@@ -457,10 +461,18 @@ class BackendClient:
         source_url = str(asset.get("source_url") or "")
         if not file_id and not source_url:
             raise ValueError("Asset has no file id or source URL")
+        if source_url.startswith(CHATGPT_ASSET_URL_PREFIXES):
+            # ChatGPT-owned asset URLs commonly require the page's cookies in
+            # addition to its bearer token. A Python fetch cannot supply that
+            # browser session, so avoid waiting for a predictable connect/auth
+            # failure and use the authenticated page transport immediately.
+            return await self._download_response_asset_via_browser(asset)
         try:
             resolved = await self._resolve_response_asset_url(asset)
             data, content_type, _ = await asyncio.wait_for(
-                _download_remote_image(resolved["url"]),
+                _download_remote_image(
+                    resolved["url"], retry_connection_timeouts=False
+                ),
                 timeout=DIRECT_ASSET_DOWNLOAD_TIMEOUT_SECONDS,
             )
             return {
