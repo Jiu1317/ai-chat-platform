@@ -70,7 +70,7 @@ function requestJson(port, pathname) {
   });
 }
 
-function generateRequest(port) {
+function generateRequest(port, authorizationToken = token) {
   const body = Buffer.from(JSON.stringify({
     requestId: "0123456789abcdef0123456789abcdef",
     prompt: "生成测试图片",
@@ -81,7 +81,7 @@ function generateRequest(port) {
     path: "/generate",
     method: "POST",
     headers: {
-      authorization: `Bearer ${token}`,
+      authorization: `Bearer ${authorizationToken}`,
       "content-type": "application/json",
       "content-length": body.length,
     },
@@ -104,7 +104,7 @@ function collectResponse(request) {
   });
 }
 
-async function startBridge(t, mode) {
+async function startBridge(t, mode, environmentNamespace = "ai-chat") {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "image-bridge-test-"));
   const port = await unusedPort();
   const fakeAgentPath = path.join(directory, "agent");
@@ -137,22 +137,33 @@ async function startBridge(t, mode) {
 
   const stdout = [];
   const stderr = [];
+  const bridgeEnvironment = {
+    ...process.env,
+    AI_CHAT_SERVICE_HOME: directory,
+    AI_CHAT_IMAGE_ROOT: imageRoot,
+    AI_CHAT_CODEX_IMAGE_ROOT: path.join(directory, "codex-images"),
+    AI_CHAT_AGENT_SESSIONS_ROOT: path.join(directory, "sessions"),
+    OPENCLAW_BIN: process.execPath,
+    FAKE_AGENT_MODE: mode,
+    FAKE_AGENT_PID_PATH: fakePidPath,
+    FAKE_IMAGE_PATH: imagePath,
+    FAKE_IMAGE_BASE64: onePixelPng.toString("base64"),
+  };
+  delete bridgeEnvironment.AI_CHAT_IMAGE_BRIDGE_PORT;
+  delete bridgeEnvironment.AI_CHAT_IMAGE_BRIDGE_TOKEN;
+  delete bridgeEnvironment.QUEENER_IMAGE_BRIDGE_PORT;
+  delete bridgeEnvironment.QUEENER_IMAGE_BRIDGE_TOKEN;
+  if (environmentNamespace === "queener") {
+    bridgeEnvironment.QUEENER_IMAGE_BRIDGE_PORT = String(port);
+    bridgeEnvironment.QUEENER_IMAGE_BRIDGE_TOKEN = token;
+  } else {
+    bridgeEnvironment.AI_CHAT_IMAGE_BRIDGE_PORT = String(port);
+    bridgeEnvironment.AI_CHAT_IMAGE_BRIDGE_TOKEN = token;
+  }
+
   const bridge = spawn(process.execPath, [bridgePath], {
     cwd: directory,
-    env: {
-      ...process.env,
-      AI_CHAT_IMAGE_BRIDGE_PORT: String(port),
-      AI_CHAT_IMAGE_BRIDGE_TOKEN: token,
-      AI_CHAT_SERVICE_HOME: directory,
-      AI_CHAT_IMAGE_ROOT: imageRoot,
-      AI_CHAT_CODEX_IMAGE_ROOT: path.join(directory, "codex-images"),
-      AI_CHAT_AGENT_SESSIONS_ROOT: path.join(directory, "sessions"),
-      OPENCLAW_BIN: process.execPath,
-      FAKE_AGENT_MODE: mode,
-      FAKE_AGENT_PID_PATH: fakePidPath,
-      FAKE_IMAGE_PATH: imagePath,
-      FAKE_IMAGE_BASE64: onePixelPng.toString("base64"),
-    },
+    env: bridgeEnvironment,
     stdio: ["ignore", "pipe", "pipe"],
   });
   bridge.stdout.on("data", (chunk) => stdout.push(chunk));
@@ -179,6 +190,21 @@ async function startBridge(t, mode) {
   });
   return { port, fakePidPath, bridge, stdout, stderr };
 }
+
+test("private deployment port and token variables are accepted as fallbacks", async (t) => {
+  const fixture = await startBridge(t, "success", "queener");
+  const request = generateRequest(fixture.port);
+  const responsePromise = collectResponse(request);
+  request.end(JSON.stringify({
+    requestId: "0123456789abcdef0123456789abcdef",
+    prompt: "生成测试图片",
+  }));
+  const response = await responsePromise;
+
+  assert.equal(response.status, 200);
+  assert.equal(response.contentType, "image/png");
+  assert.deepEqual(response.body, onePixelPng);
+});
 
 test("client disconnect terminates the agent and releases capacity", async (t) => {
   const fixture = await startBridge(t, "hang");

@@ -5,8 +5,10 @@ import path from "node:path";
 import { pipeline } from "node:stream/promises";
 
 const host = "127.0.0.1";
-const port = Number(process.env.AI_CHAT_IMAGE_BRIDGE_PORT || 13003);
-const token = process.env.AI_CHAT_IMAGE_BRIDGE_TOKEN || "";
+const port = Number(
+  process.env.AI_CHAT_IMAGE_BRIDGE_PORT || process.env.QUEENER_IMAGE_BRIDGE_PORT || 13003,
+);
+const token = process.env.AI_CHAT_IMAGE_BRIDGE_TOKEN || process.env.QUEENER_IMAGE_BRIDGE_TOKEN || "";
 const serviceHome = path.resolve(process.env.AI_CHAT_SERVICE_HOME || process.env.HOME || "/srv/ai-chat");
 const imageAgent = process.env.AI_CHAT_IMAGE_AGENT || "image-generator";
 const openclawBin = process.env.OPENCLAW_BIN || "openclaw";
