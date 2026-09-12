@@ -461,11 +461,15 @@ class BackendClient:
         source_url = str(asset.get("source_url") or "")
         if not file_id and not source_url:
             raise ValueError("Asset has no file id or source URL")
-        if source_url.startswith(CHATGPT_ASSET_URL_PREFIXES):
+        if (file_id and not source_url) or source_url.startswith(
+            CHATGPT_ASSET_URL_PREFIXES
+        ):
             # ChatGPT-owned asset URLs commonly require the page's cookies in
             # addition to its bearer token. A Python fetch cannot supply that
-            # browser session, so avoid waiting for a predictable connect/auth
-            # failure and use the authenticated page transport immediately.
+            # browser session. A file-id-only response is also necessarily a
+            # ChatGPT-owned asset. Avoid waiting for a predictable
+            # connect/auth failure and use the authenticated page transport
+            # immediately.
             return await self._download_response_asset_via_browser(asset)
         try:
             resolved = await self._resolve_response_asset_url(asset)
@@ -579,7 +583,7 @@ class BackendClient:
             "data": data,
             "content_type": payload.get("content_type") or "application/octet-stream",
             "content_disposition": payload.get("disposition") or "",
-            "filename": payload.get("filename") or "",
+            "filename": payload.get("filename") or asset.get("name") or "",
         }
 
 

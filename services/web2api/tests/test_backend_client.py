@@ -117,6 +117,7 @@ async def test_response_asset_prefers_direct_binary_download():
         new=AsyncMock(return_value=(b"image-bytes", "image/png", "https://cdn.example/image.png")),
     ) as direct_download:
         result = await client.download_response_asset({
+            "file_id": "file_result",
             "source_url": "https://cdn.example/image.png",
             "name": "result.png",
         })
@@ -130,9 +131,9 @@ async def test_response_asset_prefers_direct_binary_download():
 
 
 @pytest.mark.asyncio
-async def test_response_asset_falls_back_to_browser_download():
+async def test_file_id_only_response_asset_uses_browser_without_direct_wait():
     client, _ = _make_client()
-    client._resolve_response_asset_url = AsyncMock(side_effect=RuntimeError("direct unavailable"))
+    client._resolve_response_asset_url = AsyncMock()
     fallback = {
         "data": b"fallback-bytes",
         "content_type": "image/png",
@@ -144,7 +145,10 @@ async def test_response_asset_falls_back_to_browser_download():
     result = await client.download_response_asset({"file_id": "file_result"})
 
     assert result == fallback
-    client._download_response_asset_via_browser.assert_awaited_once()
+    client._download_response_asset_via_browser.assert_awaited_once_with(
+        {"file_id": "file_result"}
+    )
+    client._resolve_response_asset_url.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -193,11 +197,13 @@ async def test_browser_asset_download_uses_thirty_mib_guard():
     result = await client._download_response_asset_via_browser({
         "file_id": "file_result",
         "mime_type": "application/pdf",
+        "name": "report.pdf",
     })
 
     script = driver._js_with_data_strict.await_args.args[0]
     assert f"b.byteLength>{MAX_BROWSER_ASSET_BYTES}" in script
     assert result["data"] == b"file-bytes"
+    assert result["filename"] == "report.pdf"
 
 
 @pytest.mark.asyncio
@@ -263,7 +269,10 @@ async def test_response_asset_connection_timeout_skips_direct_retry():
         "chatgpt_web2api.multimodal._download_remote_image_once",
         new=connection_timeout,
     ):
-        result = await client.download_response_asset({"file_id": "file_result"})
+        result = await client.download_response_asset({
+            "source_url": "https://cdn.example/image.png",
+            "name": "result.png",
+        })
 
     assert result == fallback
     assert attempts == 1
