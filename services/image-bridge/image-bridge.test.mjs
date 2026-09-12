@@ -206,6 +206,29 @@ test("private deployment port and token variables are accepted as fallbacks", as
   assert.deepEqual(response.body, onePixelPng);
 });
 
+test("authorized requests with invalid input return a client error", async (t) => {
+  const fixture = await startBridge(t, "success");
+  const body = Buffer.from("{}");
+  const request = http.request({
+    host: "127.0.0.1",
+    port: fixture.port,
+    path: "/generate",
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+      "content-length": body.length,
+    },
+  });
+  const responsePromise = collectResponse(request);
+  request.end(body);
+  const response = await responsePromise;
+
+  assert.equal(response.status, 400);
+  assert.equal(JSON.parse(response.body).error, "任务标识无效");
+  await waitUntil(async () => (await requestJson(fixture.port, "/healthz")).body.busy === false);
+});
+
 test("client disconnect terminates the agent and releases capacity", async (t) => {
   const fixture = await startBridge(t, "hang");
   const request = generateRequest(fixture.port);

@@ -90,6 +90,12 @@ function replyJson(response, status, payload) {
   response.end(body);
 }
 
+function clientInputError(message) {
+  const error = new Error(message);
+  error.httpStatus = 400;
+  return error;
+}
+
 function readBody(request) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -407,8 +413,8 @@ const server = http.createServer(async (request, response) => {
     const payload = JSON.parse(await readBody(request));
     const requestId = String(payload.requestId || "");
     const prompt = String(payload.prompt || "").trim();
-    if (!/^[a-f0-9]{32}$/.test(requestId)) throw new Error("任务标识无效");
-    if (!prompt || prompt.length > 6000) throw new Error("图片描述应为 1–6000 个字符");
+    if (!/^[a-f0-9]{32}$/.test(requestId)) throw clientInputError("任务标识无效");
+    if (!prompt || prompt.length > 6000) throw clientInputError("图片描述应为 1–6000 个字符");
     const startedAt = Date.now();
     sessionKey = `agent:${imageAgent}:web-${requestId}`;
     const result = await runAgent(requestId, prompt, controller.signal);
@@ -424,7 +430,9 @@ const server = http.createServer(async (request, response) => {
     if (controller.signal.aborted || response.destroyed) {
       if (!response.destroyed) response.destroy();
     } else if (response.headersSent) response.destroy(error);
-    else replyJson(response, 502, { error: String(error?.message || "图片生成失败").slice(0, 500) });
+    else replyJson(response, error?.httpStatus || 502, {
+      error: String(error?.message || "图片生成失败").slice(0, 500),
+    });
   } finally {
     if (sessionKey) cleanupSessionLater(sessionKey);
     request.removeListener("aborted", cancelRequest);
