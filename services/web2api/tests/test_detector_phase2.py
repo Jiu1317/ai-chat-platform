@@ -17,6 +17,7 @@ Timing is controlled via a fake clock to keep tests deterministic and fast.
 """
 
 import asyncio
+import hashlib
 import json
 import time
 from unittest.mock import AsyncMock, MagicMock
@@ -48,7 +49,8 @@ def _phase2_poll_payload(*, text="", md_text="", is_thinking=False,
                           has_action=False, html_len=0, child_count=0,
                           has_meaningful_non_text=False,
                           generation_active=False, has_exact_action=False,
-                          has_error=False, current_assistant_present=False):
+                          has_error=False, current_assistant_present=False,
+                          stop_visible=False, aria_busy=False):
     """Build the JSON the phase-2 poll JS returns."""
     return json.dumps({
         "text": text, "md_text": md_text, "html_len": html_len,
@@ -57,6 +59,8 @@ def _phase2_poll_payload(*, text="", md_text="", is_thinking=False,
         "is_thinking": is_thinking,
         "has_meaningful_non_text": has_meaningful_non_text,
         "generation_active": generation_active,
+        "stop_visible": stop_visible,
+        "aria_busy": aria_busy,
         "has_error": has_error,
         "current_assistant_present": current_assistant_present,
     })
@@ -96,6 +100,24 @@ def _install_fast_clock(monkeypatch):
     monkeypatch.setattr(time, "monotonic", lambda: t[0])
     monkeypatch.setattr(asyncio, "sleep", fast_sleep)
     return t
+
+
+def _strict_end_result(
+    node="a-final", text="red and blue", *, current_node=None,
+    status="finished_successfully", recipient="all", finish_type="stop",
+    children_count=0, strict_terminal=True,
+):
+    return TurnEndResult(status="matched", diagnostic={
+        "assistant_node": node,
+        "current_node": current_node or node,
+        "status": status,
+        "recipient": recipient,
+        "finish_type": finish_type,
+        "children_count": children_count,
+        "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        "text_length": len(text),
+        "strict_terminal": strict_terminal,
+    })
 
 
 # ── 1. Reasoning first-content does NOT fail at 90s ─────────────────────
@@ -423,6 +445,280 @@ async def test_stable_dom_fallback_rejects_non_terminal_shapes(
             pass
 
     assert detector.completed_via_stable_dom is False
+
+
+@pytest.mark.asyncio
+async def test_reasoning_strict_backend_terminal_ignores_stale_aria_busy(monkeypatch):
+    """Three anchored final projections beat sticky aria-busy well before 90s."""
+    budgets = DetectorBudgets(
+        first_content_timeout_seconds=90,
+        stream_idle_timeout_seconds=90,
+        hard_timeout_seconds=120,
+    )
+    detector, driver = _make_detector(budgets=budgets)
+    driver._js_strict = _ScriptedPoll([
+        _phase2_poll_payload(
+            is_thinking=True,
+            generation_active=True,
+            aria_busy=True,
+            stop_visible=False,
+            current_assistant_present=True,
+        )
+    ])
+    driver._fetch_end_turn_for_turn = AsyncMock(
+        return_value=_strict_end_result()
+    )
+    t = _install_fast_clock(monkeypatch)
+
+    chunks = []
+    async for chunk in detector.stream_until_complete(
+        initial_count=0,
+        timeout=120,
+        turn_anchor=TurnAnchor(
+            sent_text="test",
+            mode="captured_id",
+            captured_user_message_id="u-current",
+        ),
+        budgets=budgets,
+        model="gpt-5-6-thinking",
+        has_input_attachments=True,
+    ):
+        chunks.append(chunk.delta)
+
+    assert chunks == []
+    assert driver._fetch_end_turn_for_turn.await_count == 3
+    assert 6 <= t[0] < 15
+
+
+@pytest.mark.asyncio
+async def test_default_model_strict_backend_terminal_completes_without_dom_text(
+    monkeypatch,
+):
+    """Captured default-model turns can finish from strict backend text alone."""
+    budgets = DetectorBudgets(
+        first_content_timeout_seconds=90,
+        stream_idle_timeout_seconds=90,
+        hard_timeout_seconds=120,
+    )
+    detector, driver = _make_detector(budgets=budgets)
+    driver._js_strict = _ScriptedPoll([
+        _phase2_poll_payload(current_assistant_present=True)
+    ])
+    driver._fetch_end_turn_for_turn = AsyncMock(
+        return_value=_strict_end_result(text="multimodal final")
+    )
+    t = _install_fast_clock(monkeypatch)
+
+    chunks = []
+    async for chunk in detector.stream_until_complete(
+        initial_count=0,
+        timeout=120,
+        turn_anchor=TurnAnchor(
+            sent_text="test",
+            mode="captured_id",
+            captured_user_message_id="u-current",
+        ),
+        budgets=budgets,
+        model="auto",
+        has_input_attachments=True,
+    ):
+        chunks.append(chunk.delta)
+
+    assert chunks == []
+    assert driver._fetch_end_turn_for_turn.await_count == 3
+    assert 6 <= t[0] < 15
+
+
+@pytest.mark.asyncio
+async def test_tool_preamble_resets_before_three_final_confirmations(monkeypatch):
+    """A preamble must not borrow confirmations from the later final node."""
+    budgets = DetectorBudgets(
+        first_content_timeout_seconds=40,
+        stream_idle_timeout_seconds=40,
+        hard_timeout_seconds=60,
+    )
+    detector, driver = _make_detector(budgets=budgets)
+    driver._js_strict = _ScriptedPoll([
+        _phase2_poll_payload(
+            is_thinking=True,
+            generation_active=True,
+            aria_busy=True,
+            stop_visible=False,
+            current_assistant_present=True,
+        )
+    ])
+    driver._fetch_end_turn_for_turn = AsyncMock(side_effect=[
+        _strict_end_result(node="a-preamble", text="I'll check that."),
+        _strict_end_result(node="a-preamble", text="I'll check that."),
+        TurnEndResult(
+            status="not_ready",
+            diagnostic={
+                "reason": "text_end_turn_not_current_node",
+                "assistant_node": "a-preamble",
+                "current_node": "tool-1",
+            },
+        ),
+        _strict_end_result(node="a-final", text="final answer"),
+        _strict_end_result(node="a-final", text="final answer"),
+        _strict_end_result(node="a-final", text="final answer"),
+    ])
+    t = _install_fast_clock(monkeypatch)
+
+    async for _ in detector.stream_until_complete(
+        initial_count=0,
+        timeout=60,
+        turn_anchor=TurnAnchor(
+            sent_text="search",
+            mode="captured_id",
+            captured_user_message_id="u-current",
+        ),
+        budgets=budgets,
+        model="gpt-5-6-thinking",
+    ):
+        pass
+
+    assert driver._fetch_end_turn_for_turn.await_count == 6
+    assert 18 <= t[0] < 30
+
+
+@pytest.mark.asyncio
+async def test_changed_backend_text_hash_restarts_strict_confirmation(monkeypatch):
+    budgets = DetectorBudgets(
+        first_content_timeout_seconds=40,
+        stream_idle_timeout_seconds=40,
+        hard_timeout_seconds=60,
+    )
+    detector, driver = _make_detector(budgets=budgets)
+    driver._js_strict = _ScriptedPoll([
+        _phase2_poll_payload(current_assistant_present=True)
+    ])
+    driver._fetch_end_turn_for_turn = AsyncMock(side_effect=[
+        _strict_end_result(text="draft"),
+        _strict_end_result(text="draft"),
+        _strict_end_result(text="final"),
+        _strict_end_result(text="final"),
+        _strict_end_result(text="final"),
+    ])
+    t = _install_fast_clock(monkeypatch)
+
+    async for _ in detector.stream_until_complete(
+        initial_count=0,
+        timeout=60,
+        turn_anchor=TurnAnchor(
+            sent_text="test",
+            mode="captured_id",
+            captured_user_message_id="u-current",
+        ),
+        budgets=budgets,
+        model="auto",
+    ):
+        pass
+
+    assert driver._fetch_end_turn_for_turn.await_count == 5
+    assert 15 <= t[0] < 25
+
+
+@pytest.mark.parametrize(
+    ("case", "poll_kwargs", "captured", "expect_non_text", "end_result"),
+    [
+        (
+            "missing-metadata", {}, True, False,
+            TurnEndResult(
+                status="matched",
+                diagnostic={"assistant_node": "a-final"},
+            ),
+        ),
+        (
+            "no-captured-id", {"aria_busy": True}, False, False,
+            _strict_end_result(),
+        ),
+        (
+            "stop-visible", {"stop_visible": True}, True, False,
+            _strict_end_result(),
+        ),
+        (
+            "official-error", {"has_error": True}, True, False,
+            _strict_end_result(),
+        ),
+        (
+            "expected-non-text", {}, True, True,
+            _strict_end_result(),
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_unsafe_backend_evidence_never_uses_fast_path(
+    monkeypatch, case, poll_kwargs, captured, expect_non_text, end_result,
+):
+    """Unsafe evidence may reconcile at timeout, but never before it."""
+    budgets = DetectorBudgets(
+        first_content_timeout_seconds=8,
+        stream_idle_timeout_seconds=8,
+        hard_timeout_seconds=20,
+    )
+    detector, driver = _make_detector(budgets=budgets)
+    driver._js_strict = _ScriptedPoll([
+        _phase2_poll_payload(
+            current_assistant_present=True,
+            **poll_kwargs,
+        )
+    ])
+    driver._fetch_end_turn_for_turn = AsyncMock(return_value=end_result)
+    t = _install_fast_clock(monkeypatch)
+    anchor = TurnAnchor(
+        sent_text=case,
+        mode="captured_id" if captured else "fresh_chat",
+        captured_user_message_id="u-current" if captured else None,
+    )
+
+    async for _ in detector.stream_until_complete(
+        initial_count=0,
+        timeout=20,
+        turn_anchor=anchor,
+        budgets=budgets,
+        model="gpt-5-6-thinking",
+        expect_non_text=expect_non_text,
+    ):
+        pass
+
+    assert t[0] > budgets.first_content_timeout_seconds, case
+
+
+@pytest.mark.asyncio
+async def test_fetch_failure_between_matches_restarts_confirmation(monkeypatch):
+    budgets = DetectorBudgets(
+        first_content_timeout_seconds=40,
+        stream_idle_timeout_seconds=40,
+        hard_timeout_seconds=60,
+    )
+    detector, driver = _make_detector(budgets=budgets)
+    driver._js_strict = _ScriptedPoll([
+        _phase2_poll_payload(current_assistant_present=True)
+    ])
+    driver._fetch_end_turn_for_turn = AsyncMock(side_effect=[
+        _strict_end_result(),
+        TurnEndResult(status="fetch_failed", diagnostic={"error": "reset"}),
+        _strict_end_result(),
+        _strict_end_result(),
+        _strict_end_result(),
+    ])
+    t = _install_fast_clock(monkeypatch)
+
+    async for _ in detector.stream_until_complete(
+        initial_count=0,
+        timeout=60,
+        turn_anchor=TurnAnchor(
+            sent_text="test",
+            mode="captured_id",
+            captured_user_message_id="u-current",
+        ),
+        budgets=budgets,
+        model="auto",
+    ):
+        pass
+
+    assert driver._fetch_end_turn_for_turn.await_count == 5
+    assert 15 <= t[0] < 25
 
 
 # ── 3. Hard cap wins over active DOM signal ─────────────────────────────

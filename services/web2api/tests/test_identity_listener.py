@@ -235,6 +235,70 @@ async def test_scope_close_unblocks_waiter():
 
 
 @pytest.mark.asyncio
+async def test_capture_timeout_keeps_future_alive_for_late_identity():
+    """The bounded wait must not cancel a scope that is still armed."""
+    driver = _make_driver()
+    listener = IdentityListener(driver)
+    await listener.attach()
+
+    text = "late identity"
+    captured_uuid = "33333333-3333-4333-8333-333333333333"
+    scope = listener.arm_capture_scope(
+        expected_text_hash=hash_sent_text(text),
+        conversation_id="conv-1",
+        target_id="tgt-1",
+    )
+    try:
+        assert await listener.wait_for_captured_uuid(timeout=0.001) is None
+        assert scope.future is not None
+        assert not scope.future.done()
+        assert not scope.future.cancelled()
+
+        await listener._process_send_post(
+            scope,
+            _make_send_event(
+                uuid=captured_uuid,
+                text=text,
+                conversation_id="conv-1",
+            ),
+            "https://chatgpt.com/backend-api/f/conversation",
+        )
+
+        assert listener.captured_uuid_nowait(scope) == captured_uuid
+    finally:
+        scope.close()
+
+
+@pytest.mark.asyncio
+async def test_nowait_identity_is_bound_to_exact_scope():
+    """A replacement scope cannot make an old scope report its UUID."""
+    driver = _make_driver()
+    listener = IdentityListener(driver)
+    await listener.attach()
+    old_scope = listener.arm_capture_scope(
+        expected_text_hash=hash_sent_text("old"),
+        conversation_id=None,
+        target_id="tgt-1",
+    )
+    new_scope = listener.arm_capture_scope(
+        expected_text_hash=hash_sent_text("new"),
+        conversation_id=None,
+        target_id="tgt-1",
+    )
+    try:
+        await listener._process_send_post(
+            new_scope,
+            _make_send_event(text="new", conversation_id=None),
+            "https://chatgpt.com/backend-api/f/conversation",
+        )
+        assert listener.captured_uuid_nowait(old_scope) is None
+        assert listener.captured_uuid_nowait(new_scope) is not None
+    finally:
+        old_scope.close()
+        new_scope.close()
+
+
+@pytest.mark.asyncio
 async def test_handler_prefilter_rejects_non_post():
     """The synchronous prefilter rejects non-POST events without scheduling."""
     driver = _make_driver()

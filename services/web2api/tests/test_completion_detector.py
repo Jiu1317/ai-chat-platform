@@ -22,8 +22,10 @@ file guards the wiring:
     rule); error classes / StreamChunk are imported lazily inside the method.
 """
 
+import asyncio
 import inspect
 import json
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -603,9 +605,18 @@ async def test_attachment_expected_non_text_ignores_text_before_asset():
 
 
 @pytest.mark.asyncio
-async def test_pro_search_progress_waits_for_backend_terminal_answer():
+async def test_pro_search_progress_waits_for_backend_terminal_answer(monkeypatch):
     """Mutable Pro web-search narration must never terminate or enter SSE."""
     detector, driver = _make_detector()
+    clock = [0.0]
+    original_sleep = asyncio.sleep
+
+    async def fast_sleep(delay):
+        clock[0] += delay
+        await original_sleep(0)
+
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(asyncio, "sleep", fast_sleep)
     process_poll = (
         '{"text":"我查一下官方最新说明。","md_text":"","html_len":90,'
         '"child_count":2,"has_action":true,"has_exact_action":true,'
@@ -630,22 +641,22 @@ async def test_pro_search_progress_waits_for_backend_terminal_answer():
 
     driver._js_strict = fake_js
     driver._get_live_conversation_id_best_effort = AsyncMock(return_value="conv-pro-search")
-    driver._fetch_end_turn_for_turn = AsyncMock(side_effect=[
-        TurnEndResult(
-            status="matched", diagnostic={"assistant_node": "a-preamble"},
-        ),
-        TurnEndResult(
-            status="matched", diagnostic={"assistant_node": "a-final"},
-        ),
-        TurnEndResult(
-            status="matched", diagnostic={"assistant_node": "a-final"},
-        ),
-    ])
+    async def backend_terminal(*_args, **_kwargs):
+        node = (
+            "a-preamble"
+            if driver._fetch_end_turn_for_turn.await_count == 1
+            else "a-final"
+        )
+        return TurnEndResult(
+            status="matched", diagnostic={"assistant_node": node},
+        )
+
+    driver._fetch_end_turn_for_turn = AsyncMock(side_effect=backend_terminal)
 
     chunks = []
     async for chunk in detector.stream_until_complete(
         initial_count=0,
-        timeout=10,
+        timeout=12,
         turn_anchor=TurnAnchor(sent_text="查询最新说明", mode="fresh_chat"),
         model="gpt-5-5-pro",
     ):
@@ -653,7 +664,11 @@ async def test_pro_search_progress_waits_for_backend_terminal_answer():
 
     assert chunks == []
     assert detector.last_dom_text == ""
-    assert driver._fetch_end_turn_for_turn.await_count == 3
+    # No captured UUID means the new strict backend proof is unavailable.
+    # Repeated bare end_turn observations must therefore never complete the
+    # held Pro narration early; the detector observes through its deadline.
+    assert driver._fetch_end_turn_for_turn.await_count >= 3
+    assert clock[0] >= 12
 
 
 @pytest.mark.asyncio

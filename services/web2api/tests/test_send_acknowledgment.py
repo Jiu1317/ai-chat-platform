@@ -194,6 +194,103 @@ async def test_send_acknowledged_when_user_count_increases(monkeypatch):
         chunks.append(chunk)
     assert len(chunks) > 0
 
+
+@pytest.mark.asyncio
+async def test_late_captured_uuid_is_added_to_anchor_after_ack_probe():
+    """A UUID arriving during the ack probe strengthens the final anchor."""
+    from chatgpt_web2api.cdp_driver import StreamChunk
+    from chatgpt_web2api.turn_anchor import TurnAnchor
+
+    driver = _make_driver()
+    driver.type_message = AsyncMock()
+    driver.click_send = AsyncMock()
+    driver._read_assistant_count_baseline = AsyncMock(return_value=0)
+    driver._assert_owned_tab_required = MagicMock()
+    # Even a negative DOM probe must be rescued by a UUID that arrived while
+    # the probe was running.
+    driver._verify_send_acknowledged = AsyncMock(return_value=False)
+    driver._capture_pre_send_fallback_anchor = AsyncMock(
+        return_value=TurnAnchor(sent_text="test message", mode="fresh_chat")
+    )
+
+    late_uuid = "44444444-4444-4444-8444-444444444444"
+    scope = MagicMock()
+    listener = MagicMock()
+    listener.reenable_if_stale = AsyncMock(return_value=True)
+    listener.is_alive.return_value = True
+    listener.arm_capture_scope.return_value = scope
+    listener.wait_for_captured_uuid = AsyncMock(return_value=None)
+    listener.captured_uuid_nowait.return_value = late_uuid
+    driver._identity_listener = listener
+
+    observed = {}
+
+    async def fake_stream(**kwargs):
+        observed["anchor"] = kwargs["turn_anchor"]
+        yield StreamChunk(delta="ok")
+
+    driver._completion = MagicMock()
+    driver._completion.stream_until_complete = fake_stream
+    driver._completion.last_dom_text = "ok"
+    driver._completion.had_non_text_content = False
+    driver._completion.non_text_dom_assets = []
+    driver._completion.completed_via_exact_action = True
+    driver._completion.completed_via_stable_dom = False
+    driver._js_strict = AsyncMock(return_value="https://chatgpt.com/c/conv-1")
+
+    chunks = []
+    async for chunk in driver.send_and_stream("test message", timeout=10):
+        chunks.append(chunk)
+
+    assert observed["anchor"].captured_user_message_id == late_uuid
+    listener.captured_uuid_nowait.assert_called_once_with(scope)
+    driver._verify_send_acknowledged.assert_awaited_once()
+    scope.close.assert_called_once()
+    assert chunks[-1].finish_reason == "stop"
+
+
+@pytest.mark.asyncio
+async def test_late_capture_probe_skipped_when_listener_did_not_arm_scope():
+    """An attached-but-stale listener may legitimately arm no scope."""
+    from chatgpt_web2api.cdp_driver import StreamChunk
+    from chatgpt_web2api.turn_anchor import TurnAnchor
+
+    driver = _make_driver()
+    driver.type_message = AsyncMock()
+    driver.click_send = AsyncMock()
+    driver._read_assistant_count_baseline = AsyncMock(return_value=0)
+    driver._assert_owned_tab_required = MagicMock()
+    driver._verify_send_acknowledged = AsyncMock(return_value=True)
+    driver._capture_pre_send_fallback_anchor = AsyncMock(
+        return_value=TurnAnchor(sent_text="test message", mode="fresh_chat")
+    )
+
+    listener = MagicMock()
+    listener.reenable_if_stale = AsyncMock(return_value=False)
+    listener.is_alive.return_value = False
+    driver._identity_listener = listener
+    observed = {}
+
+    async def fake_stream(**kwargs):
+        observed["anchor"] = kwargs["turn_anchor"]
+        yield StreamChunk(delta="ok")
+
+    driver._completion = MagicMock()
+    driver._completion.stream_until_complete = fake_stream
+    driver._completion.last_dom_text = "ok"
+    driver._completion.had_non_text_content = False
+    driver._completion.non_text_dom_assets = []
+    driver._completion.completed_via_exact_action = True
+    driver._completion.completed_via_stable_dom = False
+    driver._js_strict = AsyncMock(return_value="https://chatgpt.com/c/conv-1")
+
+    async for _ in driver.send_and_stream("test message", timeout=10):
+        pass
+
+    assert observed["anchor"].captured_user_message_id is None
+    listener.arm_capture_scope.assert_not_called()
+    listener.captured_uuid_nowait.assert_not_called()
+
 @pytest.mark.asyncio
 async def test_send_acknowledged_when_generation_starts_before_dom_updates():
     """Image generation may start before UUID/count/composer probes update."""

@@ -41,6 +41,7 @@ from __future__ import annotations
 # nodes but NOT rapid same-text repeats (a previous turn sent up to ~13s prior
 # can still pass). For rapid same-text repeats, the selector returns ``ambiguous``
 # or ``not_ready`` rather than silently picking. Env-overridable for canary tuning.
+import hashlib
 import os as _os
 import unicodedata
 from dataclasses import dataclass, field, replace
@@ -283,12 +284,87 @@ def _node_content_type(node: dict) -> str:
     return ((node.get("message") or {}).get("content") or {}).get("content_type", "")
 
 
+def _node_is_textual(node: dict) -> bool:
+    """Return whether a node carries usable text response content.
+
+    ``multimodal_text`` often contains image/file objects alongside a final
+    string part.  It is text-like only when that projected string is non-empty;
+    an object-only multimodal node remains on the guarded non-text path.
+    """
+    content_type = _node_content_type(node)
+    return content_type == "text" or (
+        content_type == "multimodal_text" and bool(_node_text(node).strip())
+    )
+
+
+def _node_status(node: dict) -> str:
+    value = node.get("status")
+    if value is not None:
+        return str(value)
+    return str((node.get("message") or {}).get("status") or "")
+
+
+def _node_recipient(node: dict) -> str:
+    value = node.get("recipient")
+    if value is not None:
+        return str(value)
+    return str((node.get("message") or {}).get("recipient") or "")
+
+
+def _node_finish_type(node: dict) -> str:
+    value = node.get("finish_type")
+    if value is not None:
+        return str(value)
+    metadata = (node.get("message") or {}).get("metadata") or {}
+    finish_details = metadata.get("finish_details") or {}
+    return str(finish_details.get("type") or "")
+
+
 def _node_id(node: dict) -> str:
     """id from projected (node.id) or raw (node.message.id)."""
     nid = node.get("id")
     if nid:
         return nid
     return (node.get("message") or {}).get("id") or ""
+
+
+def _terminal_diagnostic(
+    mapping: dict, user_node_id: str, node_id: str, node: dict, reason: str,
+) -> dict:
+    """Return content-free evidence for a correlated terminal text node."""
+    text = _node_text(node)
+    children = node.get("children")
+    children_count = len(children) if isinstance(children, list) else -1
+    assistant_node = _node_id(node) or node_id
+    current_node = str(mapping.get("current_node") or "")
+    status = _node_status(node)
+    recipient = _node_recipient(node)
+    finish_type = _node_finish_type(node)
+    text_sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    strict_terminal = bool(
+        current_node
+        and current_node in {node_id, assistant_node}
+        and children_count == 0
+        and _node_is_textual(node)
+        and text.strip()
+        and _node_end_turn(node)
+        and status == "finished_successfully"
+        and recipient == "all"
+        and finish_type == "stop"
+    )
+    return {
+        "reason": reason,
+        "user_node": user_node_id,
+        "assistant_node": assistant_node,
+        "current_node": current_node,
+        "status": status,
+        "recipient": recipient,
+        "finish_type": finish_type,
+        "children_count": children_count,
+        "text_sha256": text_sha256,
+        "text_length": len(text),
+        "strict_terminal": strict_terminal,
+    }
 
 
 def _is_current_terminal_node(
@@ -511,7 +587,7 @@ def select_text_for_turn(mapping: dict, anchor: TurnAnchor) -> TurnTextResult:
     # Terminal selection: NEWEST end_turn=true assistant TEXT descendant.
     text_candidates = [
         (nid, node) for nid, node in descendants
-        if _node_content_type(node) == "text" and _node_text(node).strip()
+        if _node_is_textual(node) and _node_text(node).strip()
     ]
     if text_candidates:
         end_turn_text = [
@@ -529,8 +605,10 @@ def select_text_for_turn(mapping: dict, anchor: TurnAnchor) -> TurnTextResult:
                 })
             return TurnTextResult(
                 "matched", text=_node_text(best[1]),
-                diagnostic={"user_node": user_nid, "assistant_node": best[0],
-                            "reason": "terminal_text_end_turn"},
+                diagnostic=_terminal_diagnostic(
+                    mapping, user_nid, best[0], best[1],
+                    "terminal_text_end_turn",
+                ),
             )
         # Text candidates exist but none end_turn yet.
         return TurnTextResult("not_ready", diagnostic={
@@ -541,7 +619,7 @@ def select_text_for_turn(mapping: dict, anchor: TurnAnchor) -> TurnTextResult:
     # No text candidates — check for non-text assistant (image/tool-use).
     non_text = [
         (nid, node) for nid, node in descendants
-        if _node_content_type(node) != "text"
+        if not _node_is_textual(node)
     ]
     if non_text:
         return TurnTextResult("non_text", diagnostic={
@@ -585,7 +663,7 @@ def select_end_turn_for_turn(
     # Text completion: newest end_turn=true text descendant with non-empty text.
     text_end_turn = [
         (nid, node) for nid, node in descendants
-        if _node_content_type(node) == "text"
+        if _node_is_textual(node)
         and _node_text(node).strip()
         and _node_end_turn(node)
     ]
@@ -598,17 +676,18 @@ def select_end_turn_for_turn(
                 "current_node": mapping.get("current_node"),
                 "reason": "text_end_turn_not_current_node",
             })
-        return TurnEndResult("matched", diagnostic={
-            "user_node": user_nid,
-            "assistant_node": best[0],
-            "reason": "text_end_turn",
-        })
+        return TurnEndResult(
+            "matched",
+            diagnostic=_terminal_diagnostic(
+                mapping, user_nid, best[0], best[1], "text_end_turn",
+            ),
+        )
 
     # Non-text completion: correlated non-text assistant with end_turn=true,
     # gated by DOM had_non_text_content.
     non_text_end_turn = [
         (nid, node) for nid, node in descendants
-        if _node_content_type(node) != "text" and _node_end_turn(node)
+        if not _node_is_textual(node) and _node_end_turn(node)
     ]
     if non_text_end_turn and had_non_text_content:
         best = max(non_text_end_turn, key=lambda pair: _node_create_time(pair[1]))

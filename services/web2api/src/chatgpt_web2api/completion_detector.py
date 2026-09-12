@@ -105,6 +105,13 @@ PHASE_STALL_SECONDS = 90
 # rejects ordinary Stop-button flicker without extending the idle budget.
 DOM_TERMINAL_STABILITY_SECONDS = 2.0
 
+# A current, metadata-complete backend node can safely override a stale DOM
+# aria-busy/thinking flag, but only after several fresh projections agree.
+# With the normal 3-second backend poll cadence this is three observations
+# spanning at least six seconds.
+STRICT_TERMINAL_CONFIRMATIONS = 3
+STRICT_TERMINAL_STABILITY_SECONDS = 6.0
+
 
 def append_only_delta(emitted: str, observed: str) -> str:
     """Return only a safe append-only suffix for an SSE text stream.
@@ -748,11 +755,12 @@ class CompletionDetector:
         # (so it never races the primary DOM signal). Never the sole signal.
         last_backend_check = 0.0
         # A Pro/tool turn may briefly expose an end_turn=true preamble before
-        # the tool chain and final answer are appended.  Require the same
-        # terminal node twice on reasoning models so that transient branch-tip
-        # races cannot end the public SSE response early.
-        backend_terminal_node = ""
-        backend_terminal_confirmations = 0
+        # the tool chain and final answer are appended.  The strict proof
+        # below therefore binds repeated observations to the same branch tip
+        # and final-text hash rather than trusting a bare end_turn flag.
+        strict_terminal_signature: tuple | None = None
+        strict_terminal_confirmations = 0
+        strict_terminal_first_seen: float | None = None
         conv_id_for_check = d._current_conv_id or ""
         last_global_non_text_asset_ids: set[str] = set()
         # Mid-loop conv_id probe throttle. On a NEW chat (REST /health path or
@@ -776,7 +784,7 @@ class CompletionDetector:
                     # enter this loop just as ChatGPT removes it.  Never fall
                     # back to the pre-send last assistant: its text and action
                     # row belong to the previous request.
-                    "  if (msgs.length <= initialCount) return JSON.stringify({text:'', md_text:'', html_len:0, child_count:0, has_meaningful_non_text:false, has_action:false, has_exact_action:false, has_error:false, is_thinking:false, generation_active:false, assistant_count:msgs.length, current_assistant_present:false});"
+                    "  if (msgs.length <= initialCount) return JSON.stringify({text:'', md_text:'', html_len:0, child_count:0, has_meaningful_non_text:false, has_action:false, has_exact_action:false, has_error:false, is_thinking:false, stop_visible:false, aria_busy:false, generation_active:false, assistant_count:msgs.length, current_assistant_present:false});"
                     "  var last = msgs[msgs.length - 1];"
                     # Text: the clean answer lives in ``.markdown`` textContent.
                     # It's empty during streaming and populates as the turn
@@ -892,7 +900,7 @@ class CompletionDetector:
                     "  var hasThinkingEl = !!last.querySelector('.result-thinking, [data-testid*=\"thinking\"], [data-testid*=\"reasoning\"]');"
                     "  var visibleThinking = /^(thinking|reasoning)\\b/i.test(rawText.trim());"
                     "  var is_thinking = ((stopVisible || responseBusy) && hasThinkingEl) || (visibleThinking && !mdText);"
-                    "  return JSON.stringify({text: text, md_text: mdText, html_len: html_len, child_count: child_count, has_meaningful_non_text: has_meaningful_non_text, has_action: has_action, has_exact_action: has_exact_action, has_error:has_error, is_thinking: is_thinking, generation_active:(stopVisible || responseBusy), assistant_count:msgs.length, current_assistant_present:true});"
+                    "  return JSON.stringify({text: text, md_text: mdText, html_len: html_len, child_count: child_count, has_meaningful_non_text: has_meaningful_non_text, has_action: has_action, has_exact_action: has_exact_action, has_error:has_error, is_thinking: is_thinking, stop_visible:stopVisible, aria_busy:responseBusy, generation_active:(stopVisible || responseBusy), assistant_count:msgs.length, current_assistant_present:true});"
                     "})()",
                 )
                 data = json.loads(result)
@@ -936,6 +944,8 @@ class CompletionDetector:
             has_exact_action = data.get("has_exact_action", False)
             has_page_error = data.get("has_error") is True
             current_assistant_present = data.get("current_assistant_present") is True
+            stop_visible = data.get("stop_visible") is True
+            aria_busy = data.get("aria_busy") is True
             is_thinking = data.get("is_thinking", False)
             generation_active = bool(
                 data.get("generation_active", False)
@@ -1104,6 +1114,10 @@ class CompletionDetector:
                     or is_thinking
                     or had_non_text_content
                     or hold_dom_text_until_terminal
+                    or (
+                        bool(turn_anchor.captured_user_message_id)
+                        and not expect_non_text
+                    )
                 )
                 and time.monotonic() - last_backend_check > 3.0
             ):
@@ -1121,42 +1135,95 @@ class CompletionDetector:
                         had_non_text_content=had_non_text_content,
                     )
                     status = collapse_to_end_turn_status(end_result)
+                    diagnostic = end_result.diagnostic or {}
+                    assistant_node = str(diagnostic.get("assistant_node") or "")
+                    current_node = str(diagnostic.get("current_node") or "")
+                    node_status = str(diagnostic.get("status") or "")
+                    recipient = str(diagnostic.get("recipient") or "")
+                    finish_type = str(diagnostic.get("finish_type") or "")
+                    text_sha256 = str(diagnostic.get("text_sha256") or "")
+                    text_length = diagnostic.get("text_length")
+                    children_count = diagnostic.get("children_count")
+                    strict_candidate = bool(
+                        status == "complete"
+                        and turn_anchor.captured_user_message_id
+                        and not expect_non_text
+                        and diagnostic.get("strict_terminal") is True
+                        and assistant_node
+                        and assistant_node == current_node
+                        and children_count == 0
+                        and node_status == "finished_successfully"
+                        and recipient == "all"
+                        and finish_type == "stop"
+                        and text_sha256
+                        and isinstance(text_length, int)
+                        and text_length > 0
+                        and not stop_visible
+                        and not has_page_error
+                    )
+                    strict_terminal_confirmed = False
+                    if strict_candidate:
+                        signature = (
+                            assistant_node,
+                            current_node,
+                            node_status,
+                            recipient,
+                            finish_type,
+                            children_count,
+                            text_sha256,
+                            text_length,
+                        )
+                        now = time.monotonic()
+                        if signature == strict_terminal_signature:
+                            strict_terminal_confirmations += 1
+                        else:
+                            strict_terminal_signature = signature
+                            strict_terminal_confirmations = 1
+                            strict_terminal_first_seen = now
+                        strict_terminal_confirmed = bool(
+                            strict_terminal_confirmations
+                            >= STRICT_TERMINAL_CONFIRMATIONS
+                            and strict_terminal_first_seen is not None
+                            and now - strict_terminal_first_seen
+                            >= STRICT_TERMINAL_STABILITY_SECONDS
+                        )
+                    else:
+                        strict_terminal_signature = None
+                        strict_terminal_confirmations = 0
+                        strict_terminal_first_seen = None
                     if status == "complete":
-                        # STRICT: end_turn AND usable content. The saw_thinking
-                        # unlock lets us CONSULT the backend during thinking, but
-                        # we must not finish on a bare end_turn with no answer.
+                        if strict_terminal_confirmed:
+                            logger.info(
+                                "Strict anchored backend terminal confirmed "
+                                "(%d observations, aria_busy=%s, thinking=%s)",
+                                strict_terminal_confirmations,
+                                aria_busy,
+                                is_thinking,
+                            )
+                            break
+                        # The legacy completion path remains available when
+                        # actual DOM/non-text response content is present.  A
+                        # held reasoning snapshot is deliberately *not* usable
+                        # content: only the strict, metadata-complete proof
+                        # above may finish a text turn whose DOM answer is not
+                        # safe to stream yet.
                         usable_content = (
                             last_dom_text
                             or had_non_text_content
-                            or hold_dom_text_until_terminal
                         )
                         terminal_confirmed = True
-                        if hold_dom_text_until_terminal:
+                        if hold_dom_text_until_terminal and not had_non_text_content:
                             terminal_node = str(
                                 (end_result.diagnostic or {}).get("assistant_node") or ""
                             )
-                            if generation_active or is_thinking or not terminal_node:
-                                backend_terminal_node = ""
-                                backend_terminal_confirmations = 0
-                                terminal_confirmed = False
-                            elif terminal_node == backend_terminal_node:
-                                backend_terminal_confirmations += 1
-                            else:
-                                backend_terminal_node = terminal_node
-                                backend_terminal_confirmations = 1
-                            terminal_confirmed = (
-                                terminal_confirmed
-                                and backend_terminal_confirmations >= 2
+                            terminal_confirmed = False
+                            logger.debug(
+                                "Held reasoning terminal requires strict backend "
+                                "proof (node=%s active=%s thinking=%s)",
+                                terminal_node,
+                                generation_active,
+                                is_thinking,
                             )
-                            if not terminal_confirmed:
-                                logger.debug(
-                                    "Reasoning terminal candidate awaiting confirmation "
-                                    "(node=%s confirmations=%d active=%s thinking=%s)",
-                                    terminal_node,
-                                    backend_terminal_confirmations,
-                                    generation_active,
-                                    is_thinking,
-                                )
                         if usable_content and terminal_confirmed:
                             logger.info(
                                 "Backend end_turn=true (primary completion) for %s",
@@ -1168,10 +1235,6 @@ class CompletionDetector:
                             "not completing (strict content guard)",
                             conv_id_for_check,
                         )
-                    else:
-                        if hold_dom_text_until_terminal:
-                            backend_terminal_node = ""
-                            backend_terminal_confirmations = 0
                     if status == "fetch_failed":
                         backend_fetch_failed = True
                         backend_error = str(
@@ -1194,6 +1257,9 @@ class CompletionDetector:
                 except Exception as e:
                     # Transport/backend failure — treat as fetch_failed so the
                     # DOM fallback unlocks for this poll.
+                    strict_terminal_signature = None
+                    strict_terminal_confirmations = 0
+                    strict_terminal_first_seen = None
                     backend_fetch_failed = True
                     backend_error = str(e).lower()
                     backend_rate_limited = (

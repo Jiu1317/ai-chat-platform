@@ -12,7 +12,7 @@ Design (peer-reviewed, conv ``6a482cfd``):
     assets), NOT the nodes themselves. Intermediary nodes (reasoning_recap,
     tool, system, unknown) must remain traversable.
   - Schema: {nodes: {id: {id, parent, children, role, create_time, end_turn,
-    content_type, text}}, current_node}.
+    content_type, text, status, recipient, finish_type}}, current_node}.
 
 The JS is executed via ``driver._js_with_data_strict(CONVERSATION_PROJECTION_JS, ...)``.
 The ``__D.conv_id`` and ``__D.token`` data slots are threaded by the caller
@@ -42,7 +42,8 @@ CONVERSATION_PROJECTION_JS = """
 (async function() {
   try {
     var r = await fetch('/backend-api/conversation/' + __D.conv_id + '?offset=0&limit=' + __D.limit, {
-      headers: {'Authorization': 'Bearer ' + __D.token}
+      headers: {'Authorization': 'Bearer ' + __D.token},
+      cache: 'no-store'
     });
     if (!r.ok) return JSON.stringify({__status: r.status});
     var conv = await r.json();
@@ -54,9 +55,13 @@ CONVERSATION_PROJECTION_JS = """
       var author = msg.author || {};
       var content = msg.content || {};
       var parts = content.parts || [];
-      // Join non-empty string parts for text nodes; drop for non-text.
+      var metadata = msg.metadata || {};
+      var finishDetails = metadata.finish_details || {};
+      // Join only non-empty string parts for textual nodes. A
+      // multimodal_text response can also carry object parts; those remain
+      // intentionally excluded from this compact projection.
       var text = '';
-      if (content.content_type === 'text') {
+      if (content.content_type === 'text' || content.content_type === 'multimodal_text') {
         var textParts = [];
         for (var i = 0; i < parts.length; i++) {
           if (typeof parts[i] === 'string' && parts[i].trim()) {
@@ -73,7 +78,10 @@ CONVERSATION_PROJECTION_JS = """
         create_time: msg.create_time || 0,
         end_turn: !!msg.end_turn,
         content_type: content.content_type || 'unknown',
-        text: text
+        text: text,
+        status: (typeof msg.status === 'string') ? msg.status : '',
+        recipient: (typeof msg.recipient === 'string') ? msg.recipient : '',
+        finish_type: (typeof finishDetails.type === 'string') ? finishDetails.type : ''
       };
     }
     return JSON.stringify({
@@ -97,4 +105,7 @@ PROJECTED_SCHEMA_FIELDS = {
     "end_turn": "bool — terminal flag on assistant nodes",
     "content_type": "str — text | reasoning_recap | tool_use | tool_result | multimodal_text | unknown",
     "text": "str — joined non-empty text parts (text nodes only; empty for non-text)",
+    "status": "str — backend message lifecycle status",
+    "recipient": "str — message recipient such as all or a tool name",
+    "finish_type": "str — metadata.finish_details.type, compacted to a string",
 }

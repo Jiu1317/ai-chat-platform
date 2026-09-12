@@ -56,9 +56,14 @@ class TestProjectionConstant:
         assert "children" in CONVERSATION_PROJECTION_JS
         assert "role" in CONVERSATION_PROJECTION_JS
 
-    def test_js_drops_heavy_text_for_non_text(self):
-        # Non-text nodes should have empty text (heavy payload dropped).
+    def test_js_keeps_only_string_text_parts(self):
+        # Text and multimodal text retain strings; object payloads stay out.
         assert "content_type" in CONVERSATION_PROJECTION_JS
+        assert "multimodal_text" in CONVERSATION_PROJECTION_JS
+        assert "typeof parts[i] === 'string'" in CONVERSATION_PROJECTION_JS
+
+    def test_js_disables_fetch_cache(self):
+        assert "cache: 'no-store'" in CONVERSATION_PROJECTION_JS
 
 
 class TestProjectionLimit:
@@ -81,7 +86,8 @@ class TestProjectionLimit:
 class TestSchemaFields:
     def test_all_required_fields_documented(self):
         required = {"id", "parent", "children", "role", "create_time",
-                    "end_turn", "content_type", "text"}
+                    "end_turn", "content_type", "text", "status",
+                    "recipient", "finish_type"}
         assert required == set(PROJECTED_SCHEMA_FIELDS.keys())
 
 
@@ -95,7 +101,7 @@ class TestProjectedOutputSelectability:
 
     def _projected_mapping_with_reasoning(self) -> dict:
         """Simulated projection output for: user → reasoning → draft → final."""
-        return {
+        mapping = {
             "nodes": {
                 "u-1": {
                     "id": "u-1", "parent": None, "children": ["r-1"],
@@ -120,6 +126,16 @@ class TestProjectedOutputSelectability:
             },
             "current_node": "a-final",
         }
+        for node in mapping["nodes"].values():
+            node.setdefault("status", "")
+            node.setdefault("recipient", "")
+            node.setdefault("finish_type", "")
+        mapping["nodes"]["a-final"].update(
+            status="finished_successfully",
+            recipient="all",
+            finish_type="stop",
+        )
+        return mapping
 
     def test_selector_finds_terminal_through_intermediary(self):
         mapping = self._projected_mapping_with_reasoning()
@@ -152,6 +168,46 @@ class TestProjectedOutputSelectability:
         reasoning = mapping["nodes"]["r-1"]
         assert reasoning["content_type"] == "reasoning_recap"
         assert reasoning["text"] == ""  # heavy payload dropped, node preserved
+
+    def test_multimodal_string_text_is_selectable_and_strict_terminal(self):
+        mapping = {
+            "nodes": {
+                "u-1": {
+                    "id": "u-1", "parent": None, "children": ["a-1"],
+                    "role": "user", "create_time": 100.0,
+                    "end_turn": False, "content_type": "text",
+                    "text": "describe attachments", "status": "",
+                    "recipient": "", "finish_type": "",
+                },
+                "a-1": {
+                    "id": "a-1", "parent": "u-1", "children": [],
+                    "role": "assistant", "create_time": 101.0,
+                    "end_turn": True, "content_type": "multimodal_text",
+                    "text": "The red and blue images represent contrast.",
+                    "status": "finished_successfully", "recipient": "all",
+                    "finish_type": "stop",
+                },
+            },
+            "current_node": "a-1",
+        }
+        anchor = TurnAnchor(
+            sent_text="describe attachments",
+            mode="captured_id",
+            captured_user_message_id="u-1",
+        )
+
+        text_result = select_text_for_turn(mapping, anchor)
+        end_result = select_end_turn_for_turn(
+            mapping, anchor, had_non_text_content=False
+        )
+
+        assert text_result.status == "matched"
+        assert text_result.text == (
+            "The red and blue images represent contrast."
+        )
+        assert text_result.diagnostic["strict_terminal"] is True
+        assert end_result.status == "matched"
+        assert end_result.diagnostic["strict_terminal"] is True
 
 
 class TestTargetOutsideOldLimit:

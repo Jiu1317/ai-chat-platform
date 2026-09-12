@@ -249,7 +249,14 @@ class IdentityListener:
         if scope is None or scope.future is None:
             return None
         try:
-            result = await asyncio.wait_for(scope.future, timeout=timeout)
+            # ``wait_for`` cancels the awaited future on timeout unless it is
+            # shielded.  Network.requestWillBeSent can arrive just after this
+            # bounded wait; keep the per-send future alive so the driver can
+            # consume that late (but still in-scope) identity after its
+            # acknowledgement probe.
+            result = await asyncio.wait_for(
+                asyncio.shield(scope.future), timeout=timeout
+            )
             return result.uuid
         except TimeoutError:
             self.capture_missed_count += 1
@@ -258,6 +265,21 @@ class IdentityListener:
                 "identity_capture_missed: timeout after %.1fs (seq=%d)",
                 timeout, scope.send_sequence_id,
             )
+            return None
+
+    def captured_uuid_nowait(self, scope: CaptureScope) -> str | None:
+        """Return an already-resolved UUID for *scope* without waiting.
+
+        The exact scope is required so a late event from this send can never
+        be confused with a subsequently armed send.  Pending, cancelled, and
+        scope-closed results all return ``None``.
+        """
+        future = scope.future
+        if future is None or not future.done() or future.cancelled():
+            return None
+        try:
+            return future.result().uuid
+        except asyncio.CancelledError:
             return None
 
     def _clear_active_scope(self, scope: CaptureScope) -> None:

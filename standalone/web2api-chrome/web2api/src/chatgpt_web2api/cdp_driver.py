@@ -1882,18 +1882,6 @@ class CDPDriver:
                     acknowledged = await self._verify_send_acknowledged(
                         initial_assistant_count=initial_count
                     )
-                    if acknowledged is False:  # explicitly False, not None
-                        if self._breakers:
-                            self._breakers.record_failure(
-                                BreakerKind.COMPOSER_SEND_READINESS
-                            )
-                        raise SendReadinessError(
-                            "Send not acknowledged — click dispatched but no user "
-                            "message or generation appeared (no UUID captured, counts "
-                            "unchanged, composer not cleared, no generation signal). "
-                            "The page may be overloaded or the "
-                            "send was rejected. Do NOT retry automatically."
-                        )
                 except SendReadinessError:
                     raise
                 except Exception as ack_err:
@@ -1901,6 +1889,42 @@ class CDPDriver:
                     # the send — let completion detection proceed. Log so the
                     # failure is traceable.
                     logger.debug("Send acknowledgment probe failed (non-blocking): %s", ack_err)
+
+                # The Network event may arrive just after the bounded UUID
+                # wait while the acknowledgement probe is running.  Re-read
+                # this exact still-armed scope without waiting before freezing
+                # the turn anchor, so the stronger captured-ID correlation is
+                # not unnecessarily lost.
+                if (
+                    capture_scope is not None
+                    and self._identity_listener is not None
+                ):
+                    captured_uuid = self._identity_listener.captured_uuid_nowait(
+                        capture_scope
+                    )
+                    if captured_uuid:
+                        acknowledged = True
+                        logger.info(
+                            "identity_capture_late: recovered after "
+                            "acknowledgment probe"
+                        )
+
+                # An explicitly negative DOM probe is conclusive only after
+                # giving the still-armed Network scope the no-wait late read
+                # above.  A captured UUID proves React accepted the send even
+                # when the DOM acknowledgement signals lag behind it.
+                if acknowledged is False and not captured_uuid:
+                    if self._breakers:
+                        self._breakers.record_failure(
+                            BreakerKind.COMPOSER_SEND_READINESS
+                        )
+                    raise SendReadinessError(
+                        "Send not acknowledged — click dispatched but no user "
+                        "message or generation appeared (no UUID captured, counts "
+                        "unchanged, composer not cleared, no generation signal). "
+                        "The page may be overloaded or the "
+                        "send was rejected. Do NOT retry automatically."
+                    )
 
             if acknowledged is True and self._breakers:
                 self._breakers.record_success(

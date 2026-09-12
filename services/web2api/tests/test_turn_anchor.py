@@ -371,6 +371,40 @@ class TestTerminalSelection:
 # ── Selector: non-text completion ─────────────────────────────────────────
 
 class TestNonTextCompletion:
+    def test_multimodal_string_part_is_textual_terminal(self):
+        user = _user_node(
+            "u-1", "describe image", 100.0, children=["a-mixed"]
+        )
+        mixed = _assistant_node(
+            "a-mixed", "A red square beside a blue square.", 101.0,
+            end_turn=True, content_type="multimodal_text", parent="u-1",
+        )
+        mixed["message"].update(
+            status="finished_successfully",
+            recipient="all",
+            metadata={"finish_details": {"type": "stop"}},
+        )
+        mapping = _mapping(
+            ("u-1", user), ("a-mixed", mixed), current_node="a-mixed"
+        )
+        anchor = TurnAnchor(
+            sent_text="describe image", mode="captured_id",
+            captured_user_message_id="u-1",
+        )
+
+        result = select_text_for_turn(mapping, anchor)
+
+        assert result.status == "matched"
+        assert result.text == "A red square beside a blue square."
+        assert result.diagnostic["strict_terminal"] is True
+        assert result.diagnostic["current_node"] == "a-mixed"
+        assert result.diagnostic["status"] == "finished_successfully"
+        assert result.diagnostic["recipient"] == "all"
+        assert result.diagnostic["finish_type"] == "stop"
+        assert result.diagnostic["children_count"] == 0
+        assert result.diagnostic["text_length"] == len(result.text)
+        assert len(result.diagnostic["text_sha256"]) == 64
+
     def test_non_text_assistant_no_text_match(self):
         user = _user_node("u-1", "gen image", 100.0, children=["a-img"])
         img = _assistant_node("a-img", "", 101.0, end_turn=True,
